@@ -1,4 +1,4 @@
-# Last modified: 2026-09-15--0509
+# Last modified: 2026-10-09--1459
 #
 # CalibReader Sync — Calibre plugin
 # Reads CalibReader_sync.json from the Calibre library folder (synced via
@@ -15,6 +15,8 @@
 # which imports nothing from calibre and is unit-tested standalone:
 #     python3 sidecar_merge.py
 #
+# v1.1.1: GPL v3 licence; minimum calibre raised to 9.0 (the only line it is tested on).
+#
 # Installation:
 #   1. Zip this file + sidecar_merge.py + plugin-import-name-calibreader_sync.txt
 #      → CalibReaderSync.zip
@@ -26,6 +28,14 @@
 #   Column lookup name : read_status   (creates #read_status)
 #   Column type        : Yes/No
 #   Column heading     : Read Status
+#
+# Copyright (C) 2026 CalibReader
+# This program is free software: you can redistribute it and/or modify it under the terms of the GNU General
+# Public License as published by the Free Software Foundation, either version 3 of the License, or (at your
+# option) any later version. It is distributed WITHOUT ANY WARRANTY; see the LICENSE file for details.
+
+__license__   = 'GPL v3'
+__copyright__ = '2026, CalibReader'
 
 from calibre.customize import InterfaceActionBase
 
@@ -39,8 +49,8 @@ class CalibReaderSyncPlugin(InterfaceActionBase):
     description           = 'Sync read status from CalibReader mobile app via CalibReader_sync.json'
     supported_platforms   = ['windows', 'osx', 'linux']
     author                = 'CalibReader'
-    version               = (1, 1, 0)
-    minimum_calibre_version = (5, 0, 0)
+    version               = (1, 1, 1)
+    minimum_calibre_version = (9, 0, 0)
 
     #: Points Calibre at the InterfaceAction class in this same module.
     actual_plugin = 'calibre_plugins.calibreader_sync:CalibReaderSyncAction'

@@ -12,10 +12,11 @@ column in Calibre's `metadata.db`.
 | | |
 |---|---|
 | **Name** | CalibReader Sync |
-| **Version** | 1.1.0 |
+| **Version** | 1.1.1 |
 | **Author** | CalibReader |
 | **Platforms** | Windows, macOS, Linux |
-| **Minimum Calibre** | 5.0.0 |
+| **Minimum Calibre** | 9.0.0 |
+| **License** | GPL v3 (see `LICENSE`) |
 | **Dependencies** | None beyond Calibre itself (stdlib `json` / `os` / `datetime` / `re` only) |
 | **Network access** | None — reads a local file only |
 

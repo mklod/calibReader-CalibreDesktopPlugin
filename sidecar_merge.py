@@ -1,4 +1,4 @@
-# Last modified: 2026-09-15--0509
+# Last modified: 2026-10-09--1459
 #
 # sidecar_merge.py — pure decision logic for CalibReader_sync.json.
 #
@@ -35,8 +35,17 @@
 # September could re-un-read a book the user finished in November, and a write
 # about book Y could revert an explicit later toggle on book X. Per-entry
 # stamps + a per-book record of what this desktop last applied fix both.
+#
+# Copyright (C) 2026 CalibReader
+# This program is free software: you can redistribute it and/or modify it under the terms of the GNU General
+# Public License as published by the Free Software Foundation, either version 3 of the License, or (at your
+# option) any later version. It is distributed WITHOUT ANY WARRANTY; see the LICENSE file for details.
+
 
 from __future__ import annotations
+
+__license__   = 'GPL v3'
+__copyright__ = '2026, CalibReader'
 
 import datetime
 import json
