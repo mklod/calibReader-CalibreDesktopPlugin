@@ -1,4 +1,4 @@
-# Last modified: 2026-10-09--1459
+# Last modified: 2026-10-12--1345
 #
 # sidecar_merge.py — pure decision logic for CalibReader_sync.json.
 #
@@ -49,12 +49,20 @@ __copyright__ = '2026, CalibReader'
 
 import datetime
 import json
+import math
 import re
 
 # Objects in `books` use these keys. Kept as constants so the reader and any
 # future writer can't drift apart.
 KEY_VALUE = 'value'
 KEY_UPDATED_AT = 'updated_at'
+
+# CalibReader_positions.json: `positions[uuid] = {progress (0-1), updated_at,
+# chapter, page, scrollY, deviceId, textAnchor?}`. Both apps write it for EPUB
+# and PDF (PDF progress = (page + 1) / pageCount). Only these two keys matter
+# to the desktop.
+KEY_POSITIONS = 'positions'
+KEY_PROGRESS = 'progress'
 
 UTC = datetime.timezone.utc
 
@@ -108,6 +116,15 @@ def format_iso(dt):
     dt = dt.astimezone(UTC)
     return dt.strftime('%Y-%m-%dT%H:%M:%S.') + '{:03d}Z'.format(dt.microsecond // 1000)
 
+
+def trunc_ms(dt):
+    '''Drop sub-millisecond precision. The bookkeeping stores `last_modified`
+    via `format_iso` (milliseconds) while calibre hands back microseconds, so
+    an untouched book would otherwise look up to 999 µs "newer" than the value
+    recorded after our own write, i.e. like a desktop edit.'''
+    if dt is None:
+        return None
+    return dt.replace(microsecond=dt.microsecond // 1000 * 1000)
 
 class Entry(object):
     '''One `books[uuid]` entry, normalised.
@@ -167,6 +184,97 @@ def parse_sidecar(data):
     return out
 
 
+class Target(object):
+    '''A value the sidecars say should be in calibre, plus the stamp that
+    decides whether it may be written. `Entry` is the read-flag case; this is
+    the general one (`value` is not coerced), used for reading progress.'''
+
+    __slots__ = ('value', 'stamp', 'dated')
+
+    def __init__(self, value, stamp=None, dated=False):
+        self.value = value
+        self.stamp = stamp
+        self.dated = bool(dated)
+
+
+class Position(object):
+    '''One `positions[uuid]` entry, reduced to what the desktop uses.'''
+
+    __slots__ = ('progress', 'stamp', 'dated')
+
+    def __init__(self, progress, stamp=None, dated=False):
+        self.progress = progress
+        self.stamp = stamp
+        self.dated = bool(dated)
+
+
+def parse_positions(data, threshold_percent=1):
+    '''`CalibReader_positions.json` (decoded) -> `({lowercased uuid: Position}, below)`.
+
+    Entries under `threshold_percent` % read are left out (`below` counts
+    them): opening a book to look at it must not make it "in progress". An
+    entry without a usable 0-1 `progress` is dropped, as `parse_sidecar` drops
+    a flag without a bool. Stamps follow the read-flag rule: the entry's own
+    `updated_at`, else the file-level one (then `dated` is False), else None.
+    '''
+    if not isinstance(data, dict):
+        return {}, 0
+    file_stamp = parse_iso(data.get(KEY_UPDATED_AT))
+    positions = data.get(KEY_POSITIONS)
+    if not isinstance(positions, dict):
+        return {}, 0
+    threshold = max(0.0, float(threshold_percent)) / 100.0
+    out, below = {}, 0
+    for uuid, raw in positions.items():
+        if not isinstance(uuid, str) or not uuid or not isinstance(raw, dict):
+            continue
+        progress = raw.get(KEY_PROGRESS)
+        # bool is an int subclass; a flag is not a progress value
+        if isinstance(progress, bool) or not isinstance(progress, (int, float)):
+            continue
+        progress = float(progress)
+        if math.isnan(progress) or progress < 0 or progress > 1:
+            continue
+        if progress < threshold or progress == 0:
+            below += 1
+            continue
+        own = parse_iso(raw.get(KEY_UPDATED_AT))
+        if own is None:
+            out[uuid.lower()] = Position(progress, file_stamp, dated=False)
+        else:
+            out[uuid.lower()] = Position(progress, own, dated=True)
+    return out, below
+
+
+_FRACTION_FORMAT_RE = re.compile(r'\{[^}]*%\}')
+
+
+def percent_for_column(progress, datatype, number_format=None):
+    '''Progress (0-1) as the value a calibre column of `datatype` should hold.
+
+    - Integer: 0-100, rounded half up (Kobo Utilities' "Percent Read" style).
+    - Float shown with a percent format type such as `{:.0%}`: 0-1, because
+      Python's `%` format multiplies by 100 itself (KOReader Sync's
+      `#ko_progfloat` style).
+    - Any other float: 0-100 with one decimal.
+    '''
+    if datatype == 'int':
+        return min(100, max(0, int(math.floor(progress * 100 + 0.5))))
+    if datatype == 'float':
+        if number_format and _FRACTION_FORMAT_RE.search(number_format):
+            return round(progress, 4)
+        return round(progress * 100, 1)
+    raise ValueError('not a number column: {!r}'.format(datatype))
+
+
+def last_read_value(stamp):
+    '''The value for a "last read" Date column: the position's stamp, whole
+    seconds, UTC. None when the entry carried no usable stamp at all.'''
+    if stamp is None:
+        return None
+    return stamp.astimezone(UTC).replace(microsecond=0)
+
+
 # --- decisions -------------------------------------------------------------
 
 APPLY = 'apply'        # write the value into #read_status, then record
@@ -178,9 +286,13 @@ def decide(entry, current_value, applied_stamp, applied_last_modified,
            book_last_modified):
     '''The one rule the plugin applies, per book. Returns APPLY/RECORD/SKIP.
 
+    The same rule serves reading progress: there `entry` is a `Target` whose
+    value is the tuple of column values to write, and `current_value` is the
+    matching tuple read from calibre.
+
     Arguments
     ---------
-    entry                  : Entry from the sidecar (never None).
+    entry                  : Entry (or Target) from the sidecar (never None).
     current_value          : current `#read_status` (True/False/None-if-unset).
     applied_stamp          : stamp of the entry this plugin last applied to
                              this book, or None if it never has.
@@ -217,7 +329,9 @@ def decide(entry, current_value, applied_stamp, applied_last_modified,
     if book_last_modified is not None:
         desktop_touched = (
             applied_last_modified is None                      # never applied
-            or book_last_modified > applied_last_modified      # edited since
+            # edited since (compared at the millisecond precision the
+            # bookkeeping is stored at; see trunc_ms)
+            or trunc_ms(book_last_modified) > trunc_ms(applied_last_modified)
         )
         if desktop_touched and entry.stamp <= book_last_modified:
             return SKIP
@@ -277,6 +391,24 @@ def store_applied(prefs_blob, uuid, entry_stamp, book_last_modified):
         'lm': format_iso(book_last_modified),
     }
     return prefs_blob
+
+
+def refresh_lm(prefs_blob, uuid, lm_before, lm_after):
+    '''Carry a book's record over one of OUR OWN writes made for another kind
+    of entry (writing % read bumps the same `last_modified` the read-flag
+    record is keyed on, and vice versa).
+
+    Only when the record still holds `lm_before`, i.e. nothing changed the
+    book between our previous write and this one. If the book was edited in
+    calibre in between, the record is left alone so that edit keeps counting
+    as a desktop edit. Returns True when the record was moved on.'''
+    rec = prefs_blob.get(uuid.lower())
+    if not isinstance(rec, dict) or lm_before is None or lm_after is None:
+        return False
+    if rec.get('lm') != format_iso(lm_before):
+        return False
+    rec['lm'] = format_iso(lm_after)
+    return True
 
 
 def build_entry_object(value, stamp):
@@ -420,5 +552,83 @@ if __name__ == '__main__':  # pragma: no cover
         def test_writer_object_shape(self):
             self.assertEqual(build_entry_object(True, NOV),
                              {'value': True, 'updated_at': '2026-11-02T18:31:12.482Z'})
+
+        def test_refresh_lm_moves_on_only_over_our_own_write(self):
+            blob = {}
+            store_applied(blob, 'abc', SEP, OCT)
+            self.assertTrue(refresh_lm(blob, 'ABC', OCT, NOV))
+            self.assertEqual(load_applied(blob)['abc'], (SEP, NOV))
+            # a desktop edit happened since (lm_before is not what we recorded)
+            self.assertFalse(refresh_lm(blob, 'abc', OCT, NOV + datetime.timedelta(days=1)))
+            self.assertEqual(load_applied(blob)['abc'], (SEP, NOV))
+            self.assertFalse(refresh_lm(blob, 'missing', OCT, NOV))
+
+        def test_refresh_lm_compares_at_millisecond_precision(self):
+            blob = {}
+            store_applied(blob, 'abc', SEP, OCT)
+            self.assertTrue(refresh_lm(blob, 'abc', OCT.replace(microsecond=400), NOV))
+
+    class PrecisionTests(unittest.TestCase):
+        def test_sub_millisecond_lm_is_not_a_desktop_edit(self):
+            # Recorded lm went through format_iso (ms); calibre reports µs.
+            # A late-arriving entry older than our last write must still apply.
+            recorded = parse_iso(format_iso(OCT.replace(microsecond=123456)))
+            now = OCT.replace(microsecond=123999)
+            self.assertEqual(
+                decide(Entry(True, OCT - datetime.timedelta(hours=1), True),
+                       False, SEP, recorded, now), APPLY)
+
+    class PositionTests(unittest.TestCase):
+        DOC = {'updated_at': '2026-09-15T05:00:00Z', 'positions': {
+            'Read':   {'progress': 0.47395, 'updated_at': '2026-11-02T18:31:12.482Z'},
+            'peek':   {'progress': 0.0023, 'updated_at': '2026-11-02T18:31:12.482Z'},
+            'zero':   {'progress': 0, 'updated_at': '2026-11-02T18:31:12.482Z'},
+            'old':    {'progress': 0.5},
+            'bad':    {'progress': 'half'},
+            'flag':   {'progress': True},
+            'over':   {'progress': 1.5},
+            'list':   [0.5],
+        }}
+
+        def test_threshold_and_garbage(self):
+            got, below = parse_positions(self.DOC, 1)
+            self.assertEqual(sorted(got), ['old', 'read'])
+            self.assertEqual(below, 2)          # 'peek' and 'zero'
+            self.assertEqual((got['read'].stamp, got['read'].dated), (NOV, True))
+            self.assertEqual((got['old'].stamp, got['old'].dated), (SEP, False))
+
+        def test_threshold_is_configurable(self):
+            got, below = parse_positions(self.DOC, 0.1)
+            self.assertIn('peek', got)
+            got, below = parse_positions(self.DOC, 50)
+            self.assertEqual(sorted(got), ['old'])
+
+        def test_no_positions_section(self):
+            self.assertEqual(parse_positions({'books': {}}), ({}, 0))
+            self.assertEqual(parse_positions(None), ({}, 0))
+
+        def test_percent_for_int_column(self):
+            self.assertEqual(percent_for_column(0.47395, 'int'), 47)
+            self.assertEqual(percent_for_column(0.995, 'int'), 100)
+            self.assertEqual(percent_for_column(0.005, 'int'), 1)
+            self.assertEqual(percent_for_column(1.0, 'int'), 100)
+
+        def test_percent_for_float_columns(self):
+            self.assertEqual(percent_for_column(0.47391, 'float', '{:.0%}'), 0.4739)
+            self.assertEqual(percent_for_column(0.47391, 'float', '{0:.1%}'), 0.4739)
+            self.assertEqual(percent_for_column(0.47395, 'float', '{:.1f}%'), 47.4)
+            self.assertEqual(percent_for_column(0.47395, 'float', None), 47.4)
+            with self.assertRaises(ValueError):
+                percent_for_column(0.5, 'datetime')
+
+        def test_last_read_value(self):
+            self.assertEqual(last_read_value(NOV), NOV.replace(microsecond=0))
+            self.assertIsNone(last_read_value(None))
+
+        def test_target_decides_like_entry(self):
+            t = Target((47, NOV.replace(microsecond=0)), NOV, True)
+            self.assertEqual(decide(t, (None, None), None, None, SEP), APPLY)
+            self.assertEqual(decide(t, t.value, None, None, SEP), RECORD)
+            self.assertEqual(decide(t, (10, None), NOV, NOV, NOV), SKIP)
 
     unittest.main(verbosity=2)

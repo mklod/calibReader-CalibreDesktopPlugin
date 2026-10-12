@@ -1,9 +1,12 @@
-# Last modified: 2026-10-09--1459
+# Last modified: 2026-10-12--1345
 #
 # CalibReader Sync — Calibre plugin
-# Reads CalibReader_sync.json from the Calibre library folder (synced via
-# Dropbox) and updates the #read_status custom column for each book whose UUID
-# appears in the file.
+# Reads the sidecars the CalibReader apps keep in the Calibre library folder
+# (synced by Dropbox, Google Drive, OneDrive or a network share) and writes
+# them into the library:
+#   CalibReader_sync.json      -> the #read_status column (Yes/No)
+#   CalibReader_positions.json -> % read and last-read date, into columns the
+#                                 user picks in Settings (v1.2.0)
 #
 # v1.1.0: the sidecar now carries PER-ENTRY timestamps
 # (`books[uuid] = {"value": bool, "updated_at": "<ISO-8601 UTC>"}`; legacy bare
@@ -17,14 +20,21 @@
 #
 # v1.1.1: GPL v3 licence; minimum calibre raised to 9.0 (the only line it is tested on).
 #
+# v1.2.0: reading progress. % read and last read go into columns chosen in a
+# settings dialog (config.py), saved in the library's metadata.db preferences.
+# Positions under a threshold (1 % by default) are ignored. One run is
+# sync_core.run_sync (no GUI; `python3 sync_core.py` runs its tests). Also:
+# a wrong-type #read_status is now refused, and a missing one no longer stops
+# progress from syncing.
+#
 # Installation:
-#   1. Zip this file + sidecar_merge.py + plugin-import-name-calibreader_sync.txt
-#      → CalibReaderSync.zip
-#      (files must be at the zip root, not inside a subfolder)
+#   1. Zip __init__.py, config.py, sync_core.py, sidecar_merge.py,
+#      plugin-import-name-calibreader_sync.txt, images/icon.png and LICENSE
+#      → CalibReaderSync.zip (files at the zip root, not inside a subfolder)
 #   2. Calibre → Preferences → Plugins → Load plugin from file → select zip
 #   3. Restart Calibre. Add "Sync Read Status" to the toolbar if desired.
 #
-# Required custom column in Calibre:
+# Read status needs this custom column in Calibre:
 #   Column lookup name : read_status   (creates #read_status)
 #   Column type        : Yes/No
 #   Column heading     : Read Status
@@ -46,47 +56,74 @@ class CalibReaderSyncPlugin(InterfaceActionBase):
     The actual toolbar action is CalibReaderSyncAction defined below.
     '''
     name                  = 'CalibReader Sync'
-    description           = 'Sync read status from CalibReader mobile app via CalibReader_sync.json'
+    description           = ('Sync read status, % read and last-read date from the CalibReader '
+                             'mobile apps')
     supported_platforms   = ['windows', 'osx', 'linux']
     author                = 'CalibReader'
-    version               = (1, 1, 1)
+    version               = (1, 2, 0)
     minimum_calibre_version = (9, 0, 0)
 
     #: Points Calibre at the InterfaceAction class in this same module.
     actual_plugin = 'calibre_plugins.calibreader_sync:CalibReaderSyncAction'
 
     def is_customizable(self):
-        return False
+        return True
+
+    def config_widget(self):
+        from calibre.gui2.ui import get_gui
+        gui = get_gui()
+        if gui is None or getattr(gui, 'current_db', None) is None:
+            return ('Open calibre first',
+                    'The settings belong to a library, so open them from calibre\'s main window.')
+        from calibre_plugins.calibreader_sync.config import ConfigWidget
+        return ConfigWidget(gui)
+
+    def save_settings(self, config_widget):
+        config_widget.save_settings()
 
 
 # ---------------------------------------------------------------------------
 # Actual GUI action — only imported when the GUI is running.
 # ---------------------------------------------------------------------------
 
+import importlib
+import sys
+
 from calibre.gui2.actions import InterfaceAction
 from calibre.gui2 import error_dialog, info_dialog
 from calibre.utils.config import JSONConfig
-import json
-import os
+from qt.core import QMenu, QToolButton
 
-# Pure merge logic — no calibre imports, so it can be unit-tested outside the
-# GUI. Inside calibre the plugin is loaded as the package `calibreader_sync`
-# (see plugin-import-name-calibreader_sync.txt); the bare import is the
-# fallback used when the module is exercised from this folder directly.
+# Installing a new version over an old one in a running calibre reloads ONLY
+# this module (calibre.customize.zipplugin.load); the old submodules stay in
+# sys.modules, and the new code then imports names the old ones lack (the
+# 1.1.1 -> 1.2.0 upgrade failed with "cannot import name 'Target'"). Reload
+# them from the new zip first, dependencies before their users.
+for _name in ('sidecar_merge', 'sync_core', 'config'):
+    _module = sys.modules.get('calibre_plugins.calibreader_sync.' + _name)
+    if _module is not None:
+        importlib.reload(_module)
+
+# Pure logic — no calibre imports, so it can be unit-tested outside the GUI.
+# Inside calibre the plugin is loaded as the package `calibreader_sync` (see
+# plugin-import-name-calibreader_sync.txt); the bare import is the fallback
+# used when the module is exercised from this folder directly.
 try:
-    from calibre_plugins.calibreader_sync.sidecar_merge import (
-        parse_sidecar, plan, load_applied, store_applied, parse_iso,
+    from calibre_plugins.calibreader_sync.sync_core import (
+        POSITIONS_FILE, SETTINGS_KEY, SYNC_FILE, normalise_settings, run_sync,
     )
 except ImportError:  # pragma: no cover - standalone / test import
-    from sidecar_merge import (
-        parse_sidecar, plan, load_applied, store_applied, parse_iso,
+    from sync_core import (
+        POSITIONS_FILE, SETTINGS_KEY, SYNC_FILE, normalise_settings, run_sync,
     )
 
 # Per-book bookkeeping lives in the plugin's OWN prefs, never in the user's
 # library: adding a column to someone's library to track sync state is not
 # ours to do, and this file has to survive switching libraries anyway.
+# 'applied' is the read flag's record, 'applied_pos' reading progress's.
 PREFS = JSONConfig('plugins/calibreader_sync')
 PREFS.defaults['applied'] = {}
+PREFS.defaults['applied_pos'] = {}
 
 
 class CalibReaderSyncAction(InterfaceAction):
@@ -94,159 +131,65 @@ class CalibReaderSyncAction(InterfaceAction):
     action_spec = (
         'Sync Read Status',
         None,
-        'Sync read status from CalibReader mobile app',
+        'Sync read status and reading progress from the CalibReader mobile app',
         None,
     )
-    popup_type        = 0
+    # Click = sync now; the arrow opens the menu (Sync now, Settings…).
+    popup_type        = QToolButton.ToolButtonPopupMode.MenuButtonPopup
     allowed_in_toolbar = True
     allowed_in_menu   = True
 
     def genesis(self):
         # get_icons is injected by Calibre's plugin loader at runtime.
         # It looks for the file inside the plugin zip's images/ directory.
-        self.qaction.setIcon(get_icons('images/icon.png'))
+        icon = get_icons('images/icon.png')
+        self.qaction.setIcon(icon)
         self.qaction.triggered.connect(self.sync_read_status)
+        self.menu = QMenu(self.gui)
+        self.menu.addAction(icon, 'Sync now', self.sync_read_status)
+        self.menu.addAction('Settings…', self.show_settings)
+        self.qaction.setMenu(self.menu)
+
+    def show_settings(self):
+        self.interface_action_base_plugin.do_user_config(self.gui)
 
     def sync_read_status(self):
         library_path = self.gui.library_path
-        sync_file = os.path.join(library_path, 'CalibReader_sync.json')
-
-        if not os.path.exists(sync_file):
-            error_dialog(
-                self.gui,
-                'CalibReader Sync',
-                (
-                    'Sync file not found:\n{}\n\n'
-                    'Make sure:\n'
-                    '  1. Dropbox has finished syncing\n'
-                    '  2. At least one book has been marked as read in the '
-                    'CalibReader mobile app'
-                ).format(sync_file),
-                show=True,
-            )
-            return
-
-        try:
-            with open(sync_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-        except Exception as exc:
-            error_dialog(
-                self.gui, 'CalibReader Sync',
-                'Failed to read sync file:\n{}'.format(exc),
-                show=True,
-            )
-            return
-
-        entries = parse_sidecar(data)
-        if not entries:
-            info_dialog(
-                self.gui, 'CalibReader Sync',
-                'No usable book entries found in CalibReader_sync.json.',
-                show=True,
-            )
-            return
-
         db = self.gui.current_db.new_api
+        settings = normalise_settings(db.pref(SETTINGS_KEY, None))
 
-        # Verify the #read_status custom column exists.
-        custom_columns = db.field_metadata.custom_field_metadata()
-        if '#read_status' not in custom_columns:
+        res, flag_blob, pos_blob = run_sync(
+            db, library_path, settings,
+            PREFS.get('applied', {}), PREFS.get('applied_pos', {}))
+
+        if not res.found_any_file:
             error_dialog(
                 self.gui,
                 'CalibReader Sync',
                 (
-                    'Custom column "#read_status" not found in this library.\n\n'
-                    'Create it in Calibre → Preferences → Add your own columns:\n'
-                    '  Column lookup name : read_status\n'
-                    '  Column type        : Yes/No\n'
-                    '  Column heading     : Read Status\n\n'
-                    'Then restart Calibre and try again.'
-                ),
+                    'No CalibReader files in this library\'s folder:\n{}\n\n'
+                    'Looked for {} (read status) and {} (reading progress).\n\n'
+                    'Make sure:\n'
+                    '  1. Your cloud app has finished syncing\n'
+                    '  2. This is the same library the CalibReader app opens\n'
+                    '  3. You have read a book, or marked one read, in the app'
+                ).format(library_path, SYNC_FILE, POSITIONS_FILE),
                 show=True,
             )
             return
 
-        # Build UUID → book_id map (lowercased; sidecar keys are lowercased by
-        # parse_sidecar, so matching stays case-insensitive as before).
-        uuid_to_id = {}
-        for book_id in db.all_book_ids():
-            uuid = db.field_for('uuid', book_id)
-            if uuid:
-                uuid_to_id[uuid.lower()] = book_id
+        # Assignment is what commits a JSONConfig. Stored even when nothing was
+        # written: a RECORD verdict must persist so a retired entry is never
+        # reconsidered.
+        PREFS['applied'] = flag_blob
+        PREFS['applied_pos'] = pos_blob
 
-        applied = load_applied(PREFS.get('applied', {}))
+        if res.columns_written:
+            self.gui.library_view.model().refresh()
 
-        # Current state of every book the sidecar mentions AND this library has.
-        book_state = {}
-        for uuid in entries:
-            book_id = uuid_to_id.get(uuid)
-            if book_id is None:
-                continue
-            applied_stamp, applied_lm = applied.get(uuid, (None, None))
-            book_state[uuid] = (
-                self._read_status(db, book_id),
-                applied_stamp,
-                applied_lm,
-                parse_iso(db.field_for('last_modified', book_id)),
-            )
-
-        updates_by_uuid, records, skipped, unmatched = plan(entries, book_state)
-
-        if not updates_by_uuid:
-            # Nothing to write, but RECORD verdicts still need persisting so a
-            # retired entry is never reconsidered.
-            self._persist(db, uuid_to_id, records)
-            info_dialog(
-                self.gui,
-                'CalibReader Sync',
-                self._summary(0, len(skipped), len(unmatched)),
-                show=True,
-            )
-            return
-
-        db.set_field(
-            '#read_status',
-            {uuid_to_id[uuid]: value for uuid, value in updates_by_uuid.items()},
-        )
-        # set_field bumps each book's last_modified; record the NEW value so
-        # our own write is not mistaken for a desktop edit next time round.
-        self._persist(db, uuid_to_id, records)
-        self.gui.library_view.model().refresh()
-
-        info_dialog(
-            self.gui, 'CalibReader Sync',
-            self._summary(len(updates_by_uuid), len(skipped), len(unmatched)),
-            show=True,
-        )
-
-    # -- helpers ------------------------------------------------------------
-
-    @staticmethod
-    def _read_status(db, book_id):
-        '''Current #read_status as True / False / None (unset).'''
-        value = db.field_for('#read_status', book_id)
-        return None if value is None else bool(value)
-
-    @staticmethod
-    def _persist(db, uuid_to_id, records):
-        '''Store, per book, the stamp we just honoured plus the book's
-        last_modified as it stands AFTER the write.'''
-        if not records:
-            return
-        blob = dict(PREFS.get('applied', {}))
-        for uuid, entry in records.items():
-            book_id = uuid_to_id.get(uuid)
-            lm = parse_iso(db.field_for('last_modified', book_id)) if book_id else None
-            store_applied(blob, uuid, entry.stamp, lm)
-        PREFS['applied'] = blob   # assignment is what commits a JSONConfig
-
-    @staticmethod
-    def _summary(updated, skipped, unmatched):
-        msg = 'Updated {} book(s).'.format(updated)
-        if skipped:
-            msg += ('\n\n{} entr(y/ies) were already applied, or older than '
-                    'this library\'s own change — left alone.'.format(skipped))
-        if unmatched:
-            msg += ('\n\n{} UUID(s) were not found in this library.'
-                    .format(unmatched))
-        return msg
+        message = res.summary()
+        if res.found_positions_file and not (settings['percent_column']
+                                             or settings['last_read_column']):
+            message += ('\n\nTo copy % read and last read into calibre too, choose columns in '
+                        'Settings (the arrow next to this button).')
+        info_dialog(self.gui, 'CalibReader Sync', message, show=True)
