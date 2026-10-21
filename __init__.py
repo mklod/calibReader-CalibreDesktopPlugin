@@ -1,4 +1,4 @@
-# Last modified: 2026-10-21--1601
+# Last modified: 2026-10-21--1618
 #
 # CalibReader Sync — Calibre plugin
 # Reads the sidecars the CalibReader apps keep in the Calibre library folder
@@ -30,6 +30,10 @@
 # v1.2.1: the toolbar action moved to ui.py, so this module imports no GUI code
 # and non-GUI calibre processes (calibredb, calibre-server, ebook-convert) no
 # longer load Qt because the plugin is installed.
+#
+# v1.2.2: when #read_status is missing but the library has a Yes/No column that
+# looks like a read flag (#read, #finished...), the summary and Settings name it
+# and explain how to copy it into #read_status once (sync_core.read_column_copy_hint).
 #
 # Installation:
 #   1. Zip __init__.py, ui.py, config.py, sync_core.py, sidecar_merge.py,
@@ -64,7 +68,7 @@ class CalibReaderSyncPlugin(InterfaceActionBase):
                              'app for iPhone and iPad')
     supported_platforms   = ['windows', 'osx', 'linux']
     author                = 'CalibReader'
-    version               = (1, 2, 1)
+    version               = (1, 2, 2)
     minimum_calibre_version = (9, 0, 0)
 
     #: Points Calibre at the InterfaceAction class, in ui.py so that only the GUI imports it.

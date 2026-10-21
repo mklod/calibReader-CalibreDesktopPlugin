@@ -1,4 +1,4 @@
-# Last modified: 2026-10-12--1345
+# Last modified: 2026-10-21--1618
 #
 # sync_core.py — one sync run, without the GUI.
 #
@@ -134,6 +134,57 @@ def suggest_column(custom_columns, kind):
     return ''
 
 
+# --- a read column the user already has (v1.2.2) -----------------------------
+#
+# Many libraries already track read status in their own Yes/No column (#read,
+# #finished, KOReader Sync's #ko_statusbool). The apps read #read_status only,
+# until a later release lets the user choose a column and the apps follow that
+# choice. Until then, when #read_status is missing, the plugin names the column
+# it found and explains how to copy it over once with calibre's bulk edit.
+# Search terms are :yes / :no, never :true / :false: on a Yes/No column
+# ":true" matches every book with a value, No included (calibre manual).
+
+_READ_FLAG_RE = re.compile(r'read|finish|done|complete|statusbool', re.I)
+_NOT_READ_RE = re.compile(r'unread|not.?read|to.?read|want|tbr|wish', re.I)
+
+
+def existing_read_columns(custom_columns):
+    '''[(lookup, heading)] of Yes/No columns, other than #read_status, whose
+    lookup name or heading looks like a read flag (not "unread" / "to read").'''
+    out = []
+    for lookup, meta in (custom_columns or {}).items():
+        if lookup == READ_COLUMN or not isinstance(meta, dict) or meta.get('datatype') != 'bool':
+            continue
+        heading = meta.get('name') or lookup
+        names = lookup + ' ' + heading
+        if _READ_FLAG_RE.search(names) and not _NOT_READ_RE.search(names):
+            out.append((lookup, heading))
+    return sorted(out, key=lambda x: (x[0] != '#read', x[1].lower(), x[0]))
+
+
+def read_column_copy_hint(custom_columns):
+    '''Plain-English steps to copy an existing read column into #read_status
+    once, or "" when the library has no such column.'''
+    cols = existing_read_columns(custom_columns)
+    if not cols:
+        return ''
+    lookup, heading = cols[0]
+    also = ''
+    if len(cols) > 1:
+        also = ' (also: {})'.format(', '.join('{} ({})'.format(h, l) for l, h in cols[1:]))
+    return (
+        'This library already has a Yes/No column that looks like a read flag: {heading} '
+        '({lookup}){also}. CalibReader uses {col} for now; choosing your own column is coming '
+        'in the next update. To copy yours over once:\n'
+        '1. Preferences > Add your own columns: lookup name read_status, type Yes/No. '
+        'Restart calibre.\n'
+        '2. Search for {lookup}:yes and select all the books. Right-click Edit metadata and '
+        'choose Edit metadata in bulk. On the Custom metadata tab set Read Status to Yes, '
+        'tick Apply changes, then OK.\n'
+        '3. Do the same with {lookup}:no and No.'
+    ).format(heading=heading, lookup=lookup, also=also, col=READ_COLUMN)
+
+
 # --- one run ------------------------------------------------------------------
 
 class SyncResult(object):
@@ -235,6 +286,9 @@ def run_sync(db, library_path, settings, flag_blob, pos_blob):
                 'Read status was not synced: this library has no {0} column. Create it in '
                 'calibre: Preferences > Add your own columns, lookup name read_status, type '
                 'Yes/No, then restart calibre.'.format(READ_COLUMN))
+            hint = read_column_copy_hint(custom)
+            if hint:
+                res.notes.append(hint)
         elif meta.get('datatype') != 'bool':
             res.notes.append(
                 'Read status was not synced: {} is a {} column, and it needs to be '
@@ -598,6 +652,44 @@ if __name__ == '__main__':  # pragma: no cover
             self.assertIs(self.v('#read_status', 2), False)
             self.assertEqual(res.flags_updated, 2)
             self.assertEqual(self.sync().flags_updated, 0)
+
+        def test_missing_read_column_explains_copying_an_existing_one(self):
+            custom = {k: v for k, v in COLS.items() if k != '#read_status'}
+            custom['#read'] = {'datatype': 'bool', 'name': 'Read'}
+            custom['#finished'] = {'datatype': 'bool', 'name': 'Finished'}
+            self.db.field_metadata = FakeFieldMetadata(custom)
+            self.flags(**{'uuid-a': True})
+            res = self.sync()
+            self.assertIsNone(self.v('#read', 1))            # never written
+            self.assertEqual(len(res.notes), 2)
+            hint = res.notes[1]
+            self.assertIn('Read (#read)', hint)
+            self.assertIn('also: Finished (#finished)', hint)
+            self.assertIn('#read:yes', hint)
+            self.assertIn('#read:no', hint)
+            self.assertNotIn(':true', hint)
+            self.assertIn('next update', hint)
+
+        def test_no_hint_without_a_likely_column(self):
+            custom = {k: v for k, v in COLS.items() if k != '#read_status'}
+            custom['#unread'] = {'datatype': 'bool', 'name': 'Unread'}
+            custom['#to_read'] = {'datatype': 'bool', 'name': 'To read'}
+            custom['#read_text'] = {'datatype': 'text', 'name': 'Read'}
+            self.db.field_metadata = FakeFieldMetadata(custom)
+            self.flags(**{'uuid-a': True})
+            res = self.sync()
+            self.assertEqual(len(res.notes), 1)
+            self.assertEqual(read_column_copy_hint(custom), '')
+
+        def test_existing_read_columns(self):
+            cols = {'#read_status': {'datatype': 'bool', 'name': 'Read Status'},
+                    '#ko_statusbool': {'datatype': 'bool', 'name': 'KOReader status'},
+                    '#done': {'datatype': 'bool', 'name': 'Done'},
+                    '#read': {'datatype': 'bool', 'name': 'Have read'},
+                    '#tbr': {'datatype': 'bool', 'name': 'TBR'},
+                    '#owned': {'datatype': 'bool', 'name': 'Owned'}}
+            self.assertEqual([c for c, _ in existing_read_columns(cols)],
+                             ['#read', '#done', '#ko_statusbool'])
 
     class SettingsTests(unittest.TestCase):
         def test_normalise(self):

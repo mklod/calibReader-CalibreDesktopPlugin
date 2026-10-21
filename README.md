@@ -16,7 +16,7 @@ them and updates `metadata.db`.
 | | |
 |---|---|
 | **Name** | CalibReader Sync |
-| **Version** | 1.2.1 |
+| **Version** | 1.2.2 |
 | **Author** | CalibReader |
 | **Platforms** | Windows, macOS, Linux |
 | **Minimum Calibre** | 9.0.0 |
@@ -222,6 +222,21 @@ Read status goes into a custom **Yes/No** column. Create it once:
 column is missing, or isn't Yes/No, the sync says so and leaves read status
 alone; reading progress still syncs.
 
+**Already track read status in your own column?** (for example `#read` or
+`#finished`, Yes/No.) Choosing your own column is coming in the next update.
+Until then, copy it into `#read_status` once; the plugin spots a likely column
+and shows these steps in its summary and in Settings:
+
+1. Create `#read_status` as above and restart Calibre.
+2. Search for `#read:yes` (use your column's lookup name) and select all the
+   books. Right-click **Edit metadata** and choose **Edit metadata in bulk**.
+   On the **Custom metadata** tab set **Read Status** to **Yes**, tick
+   **Apply changes**, then **OK**.
+3. Do the same with `#read:no` and **No**.
+
+Search with `:yes` and `:no`. On a Yes/No column `:true` matches every book
+that has a value, **No** included.
+
 ### Reading progress
 
 Choose the columns in **Settings** (see **Reading progress** above). Without
@@ -279,7 +294,9 @@ Every failure path shows a Calibre dialog rather than crashing:
 - **A file can't be read** (a cloud client may leave it half-written): that
   file is skipped for this run and the other one still syncs.
 - **Missing or wrong-type `#read_status`**: read status is skipped with the
-  exact column setup.
+  exact column setup. If the library already has a Yes/No column that looks
+  like a read flag (`#read`, `#finished`…), the message names it and explains
+  how to copy it into `#read_status` once.
 - **A chosen progress column is missing or the wrong type**: skipped, with a
   note (usually "restart calibre" after creating it).
 - **Books not in this library**: informational only.
@@ -291,7 +308,8 @@ Every failure path shows a Calibre dialog rather than crashing:
 - **One-directional.** Marking a book read in Calibre does not reach the app.
   A desktop edit is *protected* from being reverted, but it doesn't flow back.
 - **The read-status column is fixed** to `#read_status`. Choosing your own
-  read column needs the apps to read that choice first (planned).
+  read column needs the apps to read that choice first; it's coming in the
+  next update. Until then, copy an existing column once (see One-time setup).
 - **Manual.** The sync runs when you click it.
 - **Current library only.** Operates on whatever library is open.
 - **Sync bookkeeping is per installation.** The applied-stamp records live in
@@ -316,6 +334,14 @@ project):
 ---
 
 ## Changelog
+
+### 1.2.2 — 2026-10-21
+
+- If the library has no `#read_status` but already has a Yes/No column that
+  looks like a read flag (`#read`, `#finished`, KOReader Sync's
+  `#ko_statusbool`…), the sync summary and Settings name it and explain how to
+  copy it into `#read_status` once with Calibre's bulk edit. Nothing is
+  written to your column.
 
 ### 1.2.1 — 2026-10-21
 

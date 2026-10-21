@@ -1,4 +1,4 @@
-# Last modified: 2026-10-12--1345
+# Last modified: 2026-10-21--1618
 #
 # config.py — the plugin's settings dialog (Preferences > Plugins > CalibReader
 # Sync > Customize, or the "Settings…" item in the toolbar button's menu).
@@ -27,12 +27,12 @@ from qt.core import (
 try:
     from calibre_plugins.calibreader_sync.sync_core import (
         MAX_THRESHOLD, POSITIONS_FILE, READ_COLUMN, SETTINGS_KEY, eligible_columns,
-        normalise_settings, settings_to_store, suggest_column,
+        normalise_settings, read_column_copy_hint, settings_to_store, suggest_column,
     )
 except ImportError:  # pragma: no cover - standalone / test import
     from sync_core import (
         MAX_THRESHOLD, POSITIONS_FILE, READ_COLUMN, SETTINGS_KEY, eligible_columns,
-        normalise_settings, settings_to_store, suggest_column,
+        normalise_settings, read_column_copy_hint, settings_to_store, suggest_column,
     )
 
 # What "Create column…" proposes. The user can rename both in calibre's dialog.
@@ -111,6 +111,9 @@ class ConfigWidget(QWidget):
             status = ('Read status goes into {0}, which this library does not have yet. Add it '
                       'in Preferences > Add your own columns: lookup name read_status, type '
                       'Yes/No. Then restart calibre.'.format(READ_COLUMN))
+            hint = read_column_copy_hint(self.custom)
+            if hint:
+                status += '\n\n' + hint
         v.addWidget(self._text(status))
 
         v.addWidget(self._text(
