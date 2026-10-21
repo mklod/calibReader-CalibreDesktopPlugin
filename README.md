@@ -1,21 +1,22 @@
 # CalibReader Sync — Calibre Desktop Plugin
 
 A small, focused [Calibre](https://calibre-ebook.com/) plugin that brings what
-you do in the **CalibReader** mobile apps (iOS & Android) back into your
-desktop Calibre library:
+you do in the **CalibReader** app for iPhone and iPad back into your
+desktop Calibre library. Get the app: [calibreader.com](https://calibreader.com)
+(public beta on TestFlight: https://testflight.apple.com/join/PVW2VU9c).
 
 - **Read status**: read / unread, into a `#read_status` Yes/No column.
 - **Reading progress** (new in 1.2.0): **% read** and the **last-read date**,
   into columns you choose.
 
-The mobile app keeps two small files in your library folder,
+The app keeps two small files in your library folder,
 `CalibReader_sync.json` and `CalibReader_positions.json`. This plugin reads
 them and updates `metadata.db`.
 
 | | |
 |---|---|
 | **Name** | CalibReader Sync |
-| **Version** | 1.2.0 |
+| **Version** | 1.2.1 |
 | **Author** | CalibReader |
 | **Platforms** | Windows, macOS, Linux |
 | **Minimum Calibre** | 9.0.0 |
@@ -30,7 +31,7 @@ them and updates `metadata.db`.
 ```
    ┌─────────────────────┐  marks read, reads     ┌───────────────────────────┐
    │  CalibReader mobile  │ ─────────────────────► │ CalibReader_sync.json      │
-   │  (iOS / Android)     │  writes by book UUID    │ CalibReader_positions.json │
+   │  (iPhone / iPad)     │  writes by book UUID    │ CalibReader_positions.json │
    └─────────────────────┘                          └─────────────┬─────────────┘
                                                                   │ Dropbox / Google Drive /
                                                                   │ OneDrive / network share
@@ -90,7 +91,7 @@ A read-status entry is **either** a legacy bare boolean **or** an object with
 its own `value` + `updated_at`. `schema` stays `1`: the two forms may mix in
 one file, because a device still on an older build keeps writing bare bools.
 A bare bool carries the **file-level** `updated_at`; an object carries its own.
-Fractional seconds are allowed (Android writes microseconds, iOS milliseconds).
+Fractional seconds are allowed (milliseconds or microseconds).
 Both apps write `progress` for EPUB and PDF (a PDF's is `(page + 1) / pages`).
 
 ### Reading progress (1.2.0)
@@ -180,6 +181,7 @@ python3 sync_core.py          # 20 tests: whole sync runs against an in-memory l
 1. Get `CalibReaderSync.zip` (shipped in this folder). To rebuild it, zip these
    items **at the root of the archive** (not inside a subfolder):
    - `__init__.py`
+   - `ui.py`
    - `config.py`
    - `sync_core.py`
    - `sidecar_merge.py`
@@ -228,7 +230,7 @@ them, only read status syncs, and the summary reminds you where to set them up.
 Also make sure:
 
 - Your Calibre library folder is the **same folder** your cloud client syncs
-  and the **same library** the mobile app reads.
+  and the **same library** the app reads.
 - Your cloud client has finished syncing, so the two files are present.
 
 ---
@@ -254,7 +256,8 @@ Click **Sync Read Status**. Its arrow opens a menu with **Sync now** and
 
 | File | Purpose |
 |---|---|
-| `__init__.py` | The Calibre-facing part: `CalibReaderSyncPlugin` (the `InterfaceActionBase` wrapper, which opens the settings) and `CalibReaderSyncAction` (the toolbar button, its menu and the summary dialog). |
+| `__init__.py` | The Calibre-facing wrapper, `CalibReaderSyncPlugin` (`InterfaceActionBase`): name, version, and the settings. It imports no GUI code, so non-GUI Calibre processes don't load Qt because of this plugin. |
+| `ui.py` | `CalibReaderSyncAction`, the toolbar button, its menu and the summary dialog. Calibre imports it only in its main window. |
 | `config.py` | The settings dialog: column pickers with suggestions, **Create column…** through Calibre's API, the threshold. Saves to the library's preferences. |
 | `sync_core.py` | One sync run (`run_sync`), the settings schema and the column suggestions. No Calibre imports; `python3 sync_core.py` runs its tests. |
 | `sidecar_merge.py` | Parsing both files, timestamps, the per-book conflict rules and the bookkeeping. No Calibre imports; `python3 sidecar_merge.py` runs its tests. |
@@ -283,7 +286,7 @@ Every failure path shows a Calibre dialog rather than crashing:
 
 ---
 
-## Scope & limitations (1.2.0)
+## Scope & limitations (1.2.x)
 
 - **One-directional.** Marking a book read in Calibre does not reach the app.
   A desktop edit is *protected* from being reverted, but it doesn't flow back.
@@ -313,6 +316,14 @@ project):
 ---
 
 ## Changelog
+
+### 1.2.1 — 2026-10-21
+
+- The toolbar action moved into `ui.py` (Calibre's two-class plugin pattern).
+  Calibre's command-line tools and server (`calibredb`, `calibre-server`,
+  `ebook-convert`) no longer import Qt because this plugin is installed.
+  No change to what a sync does.
+- Tested on Calibre 9.16.
 
 ### 1.2.0 — 2026-10-12
 
