@@ -1,4 +1,4 @@
-# Last modified: 2026-10-21--2001
+# Last modified: 2026-10-21--2257
 #
 # CalibReader Sync — Calibre plugin
 # Reads the sidecars the CalibReader apps keep in the Calibre library folder
@@ -44,6 +44,10 @@
 # apps' sidecar write protocol), so the app follows it; a future last_modified
 # is capped at now.
 #
+# v1.2.5: automatic sync (ui.py): after calibre starts or a library opens, and
+# when the app's sync files change (checked every 5 minutes); status-bar note,
+# no pop-ups; a Settings switch, on by default.
+#
 # Installation:
 #   1. Zip __init__.py, ui.py, config.py, sync_core.py, sidecar_merge.py,
 #      plugin-import-name-calibreader_sync.txt, images/icon.png and LICENSE
@@ -77,7 +81,7 @@ class CalibReaderSyncPlugin(InterfaceActionBase):
                              'app for iPhone and iPad')
     supported_platforms   = ['windows', 'osx', 'linux']
     author                = 'CalibReader'
-    version               = (1, 2, 4)
+    version               = (1, 2, 5)
     minimum_calibre_version = (9, 0, 0)
 
     #: Points Calibre at the InterfaceAction class, in ui.py so that only the GUI imports it.

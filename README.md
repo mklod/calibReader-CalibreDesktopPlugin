@@ -16,7 +16,7 @@ them and updates `metadata.db`.
 | | |
 |---|---|
 | **Name** | CalibReader Sync |
-| **Version** | 1.2.4 |
+| **Version** | 1.2.5 |
 | **Author** | CalibReader |
 | **Platforms** | Windows, macOS, Linux |
 | **Minimum Calibre** | 9.0.0 |
@@ -48,7 +48,9 @@ them and updates `metadata.db`.
    Both files sit next to `metadata.db`.
 2. **Folder → desktop.** Your cloud client (or the network share) brings those
    files to the computer that runs Calibre.
-3. **Plugin → metadata.db.** You click **Sync Read Status**. The plugin sets
+3. **Plugin → metadata.db.** The plugin syncs by itself (1.2.5) a few seconds
+   after Calibre starts or a library opens, and whenever the app's files change
+   (checked every 5 minutes); **Sync Read Status** syncs on demand. It sets
    `#read_status` to Yes or No, and writes % read and last read into the
    columns you picked in **Settings**.
 
@@ -179,7 +181,7 @@ The rules live in two modules that import nothing from Calibre:
 
 ```bash
 python3 sidecar_merge.py      # 33 tests: parsing, timestamps, the conflict rules
-python3 sync_core.py          # 33 tests: whole sync runs against an in-memory library
+python3 sync_core.py          # 34 tests: whole sync runs against an in-memory library
 ```
 
 ---
@@ -262,8 +264,16 @@ Also make sure:
 
 ## Using it
 
-Click **Sync Read Status**. Its arrow opens a menu with **Sync now** and
-**Settings…**. The plugin will:
+**Automatic sync (1.2.5, on by default):** a few seconds after Calibre starts,
+after you open a library, and whenever `CalibReader_sync.json` or
+`CalibReader_positions.json` changes (checked every 5 minutes). An automatic
+run never pops anything up: it leaves one short note in Calibre's status bar
+("CalibReader Sync: updated 2 read status.") and says nothing when nothing
+changed. A library with neither file is left alone. Turn it off in **Settings**
+(**Sync automatically**); the switch is saved with the library.
+
+**On demand:** click **Sync Read Status**. Its arrow opens a menu with
+**Sync now** and **Settings…**. Either way, the plugin will:
 
 1. Look for `CalibReader_sync.json` and `CalibReader_positions.json` in the
    current library folder (`gui.library_path`).
@@ -323,7 +333,8 @@ Every failure path shows a Calibre dialog rather than crashing:
 - **The read-status column is fixed** to `#read_status`. Choosing your own
   read column needs the apps to read that choice first; it's coming in the
   next update. Until then, copy an existing column once (see One-time setup).
-- **Manual.** The sync runs when you click it.
+- **Automatic sync polls.** Changes from the app are checked every 5 minutes
+  while Calibre is open (cloud folders don't reliably report file changes).
 - **Current library only.** Operates on whatever library is open.
 - **Sync bookkeeping is per installation.** The applied-stamp records live in
   this Calibre install's plugin prefs, not in the library, so a second desktop
@@ -347,6 +358,14 @@ project):
 ---
 
 ## Changelog
+
+### 1.2.5 — 2026-10-21
+
+- **Automatic sync.** The plugin syncs by itself a few seconds after Calibre
+  starts or a library opens, and when the app's files in the library folder
+  change (checked every 5 minutes). It leaves a short note in the status bar
+  and never pops up a dialog; the button still syncs on demand. On by default;
+  **Settings → Sync automatically** turns it off for a library.
 
 ### 1.2.4 — 2026-10-21
 

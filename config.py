@@ -1,4 +1,4 @@
-# Last modified: 2026-10-21--1618
+# Last modified: 2026-10-21--2257
 #
 # config.py — the plugin's settings dialog (Preferences > Plugins > CalibReader
 # Sync > Customize, or the "Settings…" item in the toolbar button's menu).
@@ -21,7 +21,7 @@ __license__   = 'GPL v3'
 __copyright__ = '2026, CalibReader'
 
 from qt.core import (
-    QComboBox, QFrame, QGridLayout, QLabel, QPushButton, QSpinBox, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QFrame, QGridLayout, QLabel, QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
 try:
@@ -116,6 +116,18 @@ class ConfigWidget(QWidget):
                 status += '\n\n' + hint
         v.addWidget(self._text(status))
 
+        line2 = QFrame(self)
+        line2.setFrameShape(QFrame.Shape.HLine)
+        v.addWidget(line2)
+        v.addWidget(self._heading('Automatic sync'))
+        self.auto_sync = QCheckBox('Sync automatically', self)
+        self.auto_sync.setChecked(settings['auto_sync'])
+        v.addWidget(self.auto_sync)
+        v.addWidget(self._text(
+            'When calibre starts, when you open this library, and when the app\'s files in the '
+            'library folder change (checked every 5 minutes). A short note appears in the status '
+            'bar; nothing pops up. The Sync Read Status button still works any time.'))
+
         v.addWidget(self._text(
             'These settings are saved in this library, so they follow it to other computers.'))
         v.addStretch(1)
@@ -177,7 +189,8 @@ class ConfigWidget(QWidget):
     def settings(self):
         return settings_to_store(self.combos['percent'].currentData(),
                                  self.combos['last_read'].currentData(),
-                                 self.threshold.value())
+                                 self.threshold.value(),
+                                 self.auto_sync.isChecked())
 
     def save_settings(self):
         self.db.set_pref(SETTINGS_KEY, self.settings())

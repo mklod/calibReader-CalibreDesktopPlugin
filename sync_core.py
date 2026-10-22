@@ -1,4 +1,4 @@
-# Last modified: 2026-10-21--2001
+# Last modified: 2026-10-21--2257
 #
 # sync_core.py — one sync run, without the GUI.
 #
@@ -85,7 +85,10 @@ def normalise_settings(raw):
         'percent_column': '',
         'last_read_column': '',
         'progress_threshold': DEFAULT_THRESHOLD,
+        'auto_sync': True,              # 1.2.5: on unless the user turned it off
     }
+    if isinstance(raw.get('auto_sync'), bool):
+        out['auto_sync'] = raw['auto_sync']
     for key in ('percent_column', 'last_read_column'):
         value = raw.get(key)
         if isinstance(value, str) and _LOOKUP_RE.match(value):
@@ -96,12 +99,13 @@ def normalise_settings(raw):
     return out
 
 
-def settings_to_store(percent_column, last_read_column, progress_threshold):
+def settings_to_store(percent_column, last_read_column, progress_threshold, auto_sync=True):
     return normalise_settings({
         'version': SETTINGS_VERSION,
         'percent_column': percent_column or '',
         'last_read_column': last_read_column or '',
         'progress_threshold': progress_threshold,
+        'auto_sync': bool(auto_sync),
     })
 
 
@@ -213,6 +217,21 @@ class SyncResult(object):
     @property
     def found_any_file(self):
         return self.found_sync_file or self.found_positions_file
+
+    def status_line(self):
+        '''(1.2.5) One short line for calibre's status bar after an AUTOMATIC run,
+        or "" when nothing changed and nothing needs attention (a quiet run).'''
+        parts = []
+        if self.flags_updated:
+            parts.append('{} read status'.format(self.flags_updated))
+        if self.progress_updated:
+            parts.append('{} reading progress'.format(self.progress_updated))
+        if self.flags_sent_back:
+            parts.append('{} passed back to the app'.format(self.flags_sent_back))
+        line = ('updated ' + ', '.join(parts) + '.') if parts else ''
+        if self.notes:
+            line = (line + ' ' if line else '') + 'Something needs attention: click Sync Read Status for details.'
+        return line
 
     def summary(self):
         lines = []
@@ -911,7 +930,18 @@ if __name__ == '__main__':  # pragma: no cover
             self.assertIsNone(s['version'])
             self.assertEqual(settings_to_store('#read_percent', None, 2),
                              {'version': 1, 'percent_column': '#read_percent',
-                              'last_read_column': '', 'progress_threshold': 2})
+                              'last_read_column': '', 'progress_threshold': 2, 'auto_sync': True})
+            self.assertIs(normalise_settings(None)['auto_sync'], True)
+            self.assertIs(normalise_settings({'auto_sync': False})['auto_sync'], False)
+            self.assertIs(normalise_settings({'auto_sync': 'no'})['auto_sync'], True)
+
+        def test_status_line(self):
+            r = SyncResult()
+            self.assertEqual(r.status_line(), '')                      # a quiet run says nothing
+            r.flags_updated, r.progress_updated = 2, 1
+            self.assertEqual(r.status_line(), 'updated 2 read status, 1 reading progress.')
+            r.notes.append('x')
+            self.assertIn('needs attention', r.status_line())
 
         def test_eligible_and_suggested(self):
             self.assertEqual([c for c, _ in eligible_columns(COLS, 'percent')],
