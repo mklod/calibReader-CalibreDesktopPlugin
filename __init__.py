@@ -1,4 +1,4 @@
-# Last modified: 2026-10-21--1751
+# Last modified: 2026-10-21--2001
 #
 # CalibReader Sync — Calibre plugin
 # Reads the sidecars the CalibReader apps keep in the Calibre library folder
@@ -39,6 +39,11 @@
 # not by last_modified (which moves on every metadata edit), so a rating or tag
 # edit no longer drops a pending phone toggle (sidecar_merge.decide_flag).
 #
+# v1.2.4: when a calibre edit of the read flag beats a phone entry, calibre's
+# value is written into CalibReader_sync.json (sync_core.write_back_flags, the
+# apps' sidecar write protocol), so the app follows it; a future last_modified
+# is capped at now.
+#
 # Installation:
 #   1. Zip __init__.py, ui.py, config.py, sync_core.py, sidecar_merge.py,
 #      plugin-import-name-calibreader_sync.txt, images/icon.png and LICENSE
@@ -72,7 +77,7 @@ class CalibReaderSyncPlugin(InterfaceActionBase):
                              'app for iPhone and iPad')
     supported_platforms   = ['windows', 'osx', 'linux']
     author                = 'CalibReader'
-    version               = (1, 2, 3)
+    version               = (1, 2, 4)
     minimum_calibre_version = (9, 0, 0)
 
     #: Points Calibre at the InterfaceAction class, in ui.py so that only the GUI imports it.

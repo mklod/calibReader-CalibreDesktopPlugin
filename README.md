@@ -16,7 +16,7 @@ them and updates `metadata.db`.
 | | |
 |---|---|
 | **Name** | CalibReader Sync |
-| **Version** | 1.2.3 |
+| **Version** | 1.2.4 |
 | **Author** | CalibReader |
 | **Platforms** | Windows, macOS, Linux |
 | **Minimum Calibre** | 9.0.0 |
@@ -52,9 +52,12 @@ them and updates `metadata.db`.
    `#read_status` to Yes or No, and writes % read and last read into the
    columns you picked in **Settings**.
 
-The plugin is **one-directional**: it never writes either file and never
-touches the internet. It changes only `#read_status` and the progress columns
-you chose.
+The plugin never touches the internet. In Calibre it changes only
+`#read_status` and the progress columns you chose. It writes to
+`CalibReader_sync.json` in one case only (1.2.4): when you changed a book's read
+status in Calibre after the app's change, it records Calibre's value there,
+stamped with the time of your edit, so the app follows it on its next sync.
+`CalibReader_positions.json` is never written.
 
 ### File formats
 
@@ -175,8 +178,8 @@ limitation (1.2.3, see rule 3).
 The rules live in two modules that import nothing from Calibre:
 
 ```bash
-python3 sidecar_merge.py      # 32 tests: parsing, timestamps, the conflict rules
-python3 sync_core.py          # 28 tests: whole sync runs against an in-memory library
+python3 sidecar_merge.py      # 33 tests: parsing, timestamps, the conflict rules
+python3 sync_core.py          # 33 tests: whole sync runs against an in-memory library
 ```
 
 ---
@@ -312,8 +315,11 @@ Every failure path shows a Calibre dialog rather than crashing:
 
 ## Scope & limitations (1.2.x)
 
-- **One-directional.** Marking a book read in Calibre does not reach the app.
-  A desktop edit is *protected* from being reverted, but it doesn't flow back.
+- **Read status goes both ways; progress goes one way.** The app reads
+  `#read_status` from your library when it syncs. When both sides changed a
+  book, the newer change wins, and the plugin passes a newer Calibre change back
+  through `CalibReader_sync.json` (1.2.4). % read and last read go from the app
+  to Calibre only.
 - **The read-status column is fixed** to `#read_status`. Choosing your own
   read column needs the apps to read that choice first; it's coming in the
   next update. Until then, copy an existing column once (see One-time setup).
@@ -341,6 +347,18 @@ project):
 ---
 
 ## Changelog
+
+### 1.2.4 — 2026-10-21
+
+- **Read status stays in step both ways.** If you change a book's read status
+  in Calibre after the plugin applied a change from the app, but before the app
+  synced again, the two could disagree for good. The plugin now writes
+  Calibre's value into `CalibReader_sync.json`, stamped with the time of your
+  edit, and the app follows it. It uses the apps' own safe-write rules: it
+  writes only when the file reads cleanly, changes only those books' entries,
+  never removes any, and swaps the file in atomically.
+- A book's `last_modified` in the future (a computer clock running ahead) is
+  treated as now.
 
 ### 1.2.3 — 2026-10-21
 

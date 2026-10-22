@@ -1,4 +1,4 @@
-# Last modified: 2026-10-21--1751
+# Last modified: 2026-10-21--2001
 #
 # sync_core.py — one sync run, without the GUI.
 #
@@ -8,7 +8,10 @@
 #   CalibReader_positions.json -> % read and last-read date, into columns the
 #                                 user picked (plugin settings, stored in the
 #                                 library's own metadata.db preferences)
-# One way only: app -> calibre. The sidecars are never written.
+# From the app to calibre, plus one write the other way (1.2.4): when a calibre
+# edit of the read flag beats a phone entry, calibre's value goes into
+# CalibReader_sync.json (write_back_flags) so the app follows it.
+# CalibReader_positions.json is never written.
 #
 # Like sidecar_merge.py this imports nothing from calibre. `db` is anything
 # with calibre's Cache API (gui.current_db.new_api): field_metadata,
@@ -33,14 +36,17 @@ try:
     from calibre_plugins.calibreader_sync.sidecar_merge import (
         APPLY, NOT_SEEN, RECORD, UTC, Target, decide_flag, format_iso, last_read_value,
         load_applied, load_flag_records, parse_iso, parse_positions, parse_sidecar,
-        percent_for_column, plan, refresh_lm, store_applied, store_flag_record,
+        percent_for_column, plan, refresh_lm, store_applied, store_flag_record, writeback_for,
     )
 except ImportError:  # pragma: no cover - standalone / test import
     from sidecar_merge import (
         APPLY, NOT_SEEN, RECORD, UTC, Target, decide_flag, format_iso, last_read_value,
         load_applied, load_flag_records, parse_iso, parse_positions, parse_sidecar,
-        percent_for_column, plan, refresh_lm, store_applied, store_flag_record,
+        percent_for_column, plan, refresh_lm, store_applied, store_flag_record, writeback_for,
     )
+import datetime as _dt
+import time as _time
+import uuid as _uuid
 
 SYNC_FILE = 'CalibReader_sync.json'
 POSITIONS_FILE = 'CalibReader_positions.json'
@@ -195,6 +201,7 @@ class SyncResult(object):
         self.found_positions_file = False
         self.flags_updated = 0
         self.flags_skipped = 0
+        self.flags_sent_back = 0       # 1.2.4: calibre edits written back for the app
         self.progress_updated = 0
         self.progress_skipped = 0
         self.below_threshold = 0
@@ -217,6 +224,9 @@ class SyncResult(object):
         if skipped:
             lines.append('{} entr(y/ies) were already applied, or older than a change '
                          'made in calibre: left alone.'.format(skipped))
+        if self.flags_sent_back:
+            lines.append('{} read status change(s) made in calibre were passed back to the app.'.format(
+                self.flags_sent_back))
         if self.unmatched:
             lines.append('{} book(s) in the files are not in this library.'.format(len(self.unmatched)))
         lines.extend(self.notes)
@@ -255,6 +265,60 @@ def _column_check(custom_columns, lookup, types, what):
 def _norm_date(value):
     dt = parse_iso(value)
     return None if dt is None else dt.astimezone(UTC).replace(microsecond=0)
+
+
+def write_back_flags(library_path, writebacks):
+    '''(1.2.4) Put calibre's newer read values into CalibReader_sync.json, following
+    the apps' sidecar protocol (docs/PARITY.md, 2026-10-13): re-read the file right
+    before writing and write only if it parses cleanly; replace only these books'
+    entries, and only when ours is strictly newer; never remove a key; never touch
+    the file-level updated_at (legacy bare entries inherit it); write a temp file
+    and rename it in, with the backup swap when rename-over is refused.
+    `writebacks` = {uuid: (value, stamp)}. Returns ({uuid: stamp written}, note).'''
+    path = os.path.join(library_path, SYNC_FILE)
+    retry = ('Read status set in calibre could not be passed back to the app this time '
+             '({}); it will be tried again next sync.')
+    if not writebacks or not os.path.exists(path):
+        return {}, None
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception:
+        return {}, retry.format('the file is being written, or damaged')
+    books = data.get('books') if isinstance(data, dict) else None
+    if not isinstance(books, dict):
+        return {}, retry.format('the file has no books table')
+    current = parse_sidecar(data)
+    keys = {k.lower(): k for k in books if isinstance(k, str)}
+    written = {}
+    for uuid, (value, stamp) in writebacks.items():
+        have = current.get(uuid)
+        if have is not None and have.stamp is not None and have.stamp >= stamp:
+            continue                        # someone wrote a newer entry meanwhile
+        books[keys.get(uuid, uuid)] = {'value': bool(value), 'updated_at': format_iso(stamp)}
+        written[uuid] = stamp
+    if not written:
+        return {}, None
+    tmp = '{}.crtmp.{}'.format(path, _uuid.uuid4().hex)
+    try:
+        with open(tmp, 'w', encoding='utf-8', newline='\n') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write('\n')
+        try:
+            os.replace(tmp, path)
+        except OSError:
+            bak = '{}.crbak.{}.{}-1'.format(path, int(_time.time()), _uuid.uuid4().hex)
+            os.rename(path, bak)
+            os.rename(tmp, path)
+            os.remove(bak)
+    except OSError as exc:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return {}, retry.format(exc)
+    return written, None
 
 
 def run_sync(db, library_path, settings, flag_blob, pos_blob):
@@ -325,7 +389,8 @@ def run_sync(db, library_path, settings, flag_blob, pos_blob):
     # Read flags (1.2.3): a calibre-side edit of the flag is a change of its VALUE
     # since the last run (sidecar_merge.decide_flag), so every book's value is
     # remembered, not only the books with a phone entry.
-    flag_updates, flag_records, flag_state = {}, {}, {}
+    flag_updates, flag_records, flag_state, writebacks = {}, {}, {}, {}
+    now = _dt.datetime.now(UTC)
     if flag_col:
         entries = parse_sidecar(flags_data)
         records = load_flag_records(flag_blob)
@@ -338,7 +403,10 @@ def run_sync(db, library_path, settings, flag_blob, pos_blob):
             entry = entries.get(uuid)
             if entry is not None:
                 lm_before[uuid] = book_lm
-                verdict, dt = decide_flag(entry, value, stamp, lm, book_lm, seen, dt)
+                verdict, dt = decide_flag(entry, value, stamp, lm, book_lm, seen, dt, now)
+                wb = writeback_for(entry, verdict, value, dt)
+                if wb is not None:
+                    writebacks[uuid] = wb
                 if verdict == APPLY:
                     flag_updates[uuid] = entry.value
                 if verdict in (APPLY, RECORD):
@@ -346,7 +414,8 @@ def run_sync(db, library_path, settings, flag_blob, pos_blob):
                 else:
                     skipped.append(uuid)
             elif seen is not NOT_SEEN and value != seen and book_lm is not None:
-                dt = book_lm if dt is None or book_lm > dt else dt
+                mark = book_lm if book_lm <= now else now
+                dt = mark if dt is None or mark > dt else dt
             flag_state[uuid] = (stamp, lm, dt)
         res.flags_skipped = len(skipped)
         res.unmatched.update(u for u in entries if u not in uuid_to_id)
@@ -406,9 +475,15 @@ def run_sync(db, library_path, settings, flag_blob, pos_blob):
     # Bookkeeping, with each book's last_modified as it stands after ALL writes.
     written = set(flag_updates) | set(pos_updates)
     lm_after = {u: _lm(db, uuid_to_id[u]) for u in set(flag_records) | set(pos_records) | written}
+    sent, note = write_back_flags(library_path, writebacks)
+    res.flags_sent_back = len(sent)
+    if note:
+        res.notes.append(note)
     for uuid, (stamp, lm, dt) in flag_state.items():
         if uuid in flag_records:
             stamp, lm = flag_records[uuid].stamp, lm_after[uuid]
+        elif uuid in sent:
+            stamp = sent[uuid]              # our own entry: never re-decided as a phone change
         now = db.field_for(flag_col, uuid_to_id[uuid])
         store_flag_record(flag_blob, uuid, stamp, lm, None if now is None else bool(now), dt)
     for uuid, entry in pos_records.items():
@@ -765,6 +840,66 @@ if __name__ == '__main__':  # pragma: no cover
             res = self.sync()
             self.assertIs(self.v('#read_status', 1), False)
             self.assertIn('val', self.flag_blob['uuid-a'])
+
+    class WriteBackTests(Base):
+        '''1.2.4: a calibre edit made after the plugin applied a phone entry, before the
+        phone synced again, is passed back through the sync file so both sides agree.'''
+
+        def read_file(self):
+            with open(os.path.join(self.dir, SYNC_FILE), encoding='utf-8') as f:
+                return json.load(f)
+
+        def test_calibre_edit_after_apply_is_written_back_once(self):
+            self.flags(**{'uuid-a': {'value': False, 'updated_at': stamp(2)}, 'uuid-b': True})
+            self.sync()                                        # applies No to a, Yes to b
+            self.assertIs(self.v('#read_status', 1), False)
+            self.db.clock = datetime.datetime(2026, 10, 5, 9, 0, 0, 1, tzinfo=UTC)
+            self.db.desktop_edit('#read_status', 1, True)      # the user ticks it in calibre
+            edited_at = format_iso(self.v('last_modified', 1))   # stamped with the edit's time
+            res = self.sync()
+            self.assertIs(self.v('#read_status', 1), True)     # calibre's later edit stands
+            self.assertEqual(res.flags_sent_back, 1)
+            doc = self.read_file()
+            self.assertEqual(doc['books']['uuid-a'], {'value': True, 'updated_at': edited_at})
+            self.assertIs(doc['books']['uuid-b'], True)        # other keys untouched (bare bool kept)
+            self.assertEqual(doc['updated_at'], stamp(1))      # file-level stamp untouched
+            before = open(os.path.join(self.dir, SYNC_FILE), 'rb').read()
+            res = self.sync()                                  # stable: nothing more to do
+            self.assertEqual((res.flags_updated, res.flags_sent_back), (0, 0))
+            self.assertEqual(open(os.path.join(self.dir, SYNC_FILE), 'rb').read(), before)
+            self.assertFalse([f for f in os.listdir(self.dir) if '.crtmp.' in f or '.crbak.' in f])
+
+        def test_no_write_back_when_calibre_cleared_the_flag(self):
+            self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(2)}})
+            self.sync()
+            self.db.clock = datetime.datetime(2026, 10, 5, 9, 0, 0, 1, tzinfo=UTC)
+            self.db.desktop_edit('#read_status', 1, None)
+            res = self.sync()
+            self.assertEqual(res.flags_sent_back, 0)
+            self.assertEqual(self.read_file()['books']['uuid-a']['value'], True)
+
+        def test_no_write_back_for_an_unrelated_edit(self):
+            self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(2)}})
+            self.sync()
+            self.db.clock = datetime.datetime(2026, 10, 5, 9, 0, 0, 1, tzinfo=UTC)
+            self.db.desktop_edit('rating', 1, 8)
+            res = self.sync()
+            self.assertEqual(res.flags_sent_back, 0)
+
+        def test_newer_entry_in_the_file_is_not_overwritten(self):
+            self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(9)}})
+            written, note = write_back_flags(self.dir, {'uuid-a': (False, parse_iso(stamp(5)))})
+            self.assertEqual((written, note), ({}, None))
+            self.assertEqual(self.read_file()['books']['uuid-a']['value'], True)
+
+        def test_damaged_file_is_left_alone(self):
+            with open(os.path.join(self.dir, SYNC_FILE), 'w', encoding='utf-8') as f:
+                f.write('{"schema": 1, "books": {"uuid-a": tr')
+            written, note = write_back_flags(self.dir, {'uuid-a': (False, parse_iso(stamp(5)))})
+            self.assertEqual(written, {})
+            self.assertIn('tried again next sync', note)
+            with open(os.path.join(self.dir, SYNC_FILE), encoding='utf-8') as f:
+                self.assertTrue(f.read().endswith('tr'))
 
     class SettingsTests(unittest.TestCase):
         def test_normalise(self):

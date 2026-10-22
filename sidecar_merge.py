@@ -1,4 +1,4 @@
-# Last modified: 2026-10-21--1751
+# Last modified: 2026-10-21--2001
 #
 # sidecar_merge.py — pure decision logic for CalibReader_sync.json.
 #
@@ -354,16 +354,23 @@ NOT_SEEN = object()   # no value record for this book yet
 
 
 def decide_flag(entry, current_value, applied_stamp, applied_last_modified,
-                book_last_modified, seen_value=NOT_SEEN, desktop_at=None):
-    '''The read-flag rule. Returns (APPLY/RECORD/SKIP, desktop_at to store).'''
+                book_last_modified, seen_value=NOT_SEEN, desktop_at=None, now=None):
+    '''The read-flag rule. Returns (APPLY/RECORD/SKIP, desktop_at to store).
+
+    `now` (1.2.4) caps the desktop-edit time: a `last_modified` in the future (a
+    desktop clock running ahead) must not outrank every phone entry for good.'''
+    if now is not None and book_last_modified is not None and book_last_modified > now:
+        desktop_mark = now
+    else:
+        desktop_mark = book_last_modified
     if seen_value is NOT_SEEN:
         verdict = decide(entry, current_value, applied_stamp, applied_last_modified, book_last_modified)
-        if (verdict == SKIP and entry.stamp is not None and book_last_modified is not None
+        if (verdict == SKIP and entry.stamp is not None and desktop_mark is not None
                 and (applied_stamp is None or entry.stamp > applied_stamp)):
-            desktop_at = later(desktop_at, book_last_modified)   # it lost to a desktop edit
+            desktop_at = later(desktop_at, desktop_mark)         # it lost to a desktop edit
         return verdict, desktop_at
-    if current_value != seen_value and book_last_modified is not None:
-        desktop_at = later(desktop_at, book_last_modified)       # the flag itself changed in calibre
+    if current_value != seen_value and desktop_mark is not None:
+        desktop_at = later(desktop_at, desktop_mark)             # the flag itself changed in calibre
     if entry.stamp is None:
         return SKIP, desktop_at                                  # undated never overrides a record
     floor = later(applied_stamp, desktop_at)
@@ -379,6 +386,21 @@ def later(a, b):
     if b is None:
         return a
     return a if a >= b else b
+
+
+def writeback_for(entry, verdict, current_value, desktop_at):
+    '''(1.2.4) The value + stamp the plugin should write into CalibReader_sync.json
+    for this book, or None. When a calibre edit of the read flag beats a phone
+    entry, the phone can't always tell that edit from an unrelated one (it may not
+    have synced in between), so the plugin records calibre's value there, stamped
+    with the edit's time, and the app follows it as a newer entry. Only for a
+    real conflict: a SKIP caused by a desktop edit newer than the entry, with a
+    different, known calibre value.'''
+    if (verdict == SKIP and entry is not None and entry.stamp is not None and desktop_at is not None
+            and desktop_at > entry.stamp and current_value is not None
+            and bool(current_value) != entry.value):
+        return bool(current_value), desktop_at
+    return None
 
 
 def load_flag_records(prefs_blob):
@@ -583,6 +605,13 @@ if __name__ == '__main__':  # pragma: no cover
 
         def test_undated_bootstraps_once_then_never_overrides(self):
             self.assertEqual(decide(Entry(True, None), None, None, None, None), APPLY)
+
+        def test_future_last_modified_is_capped_at_now(self):
+            # 1.2.4: a desktop clock running ahead must not outrank every phone entry.
+            future, now = NOV, OCT
+            verdict, desktop_at = decide_flag(Entry(True, SEP, True), False, None, None, future,
+                                              seen_value=True, desktop_at=None, now=now)
+            self.assertEqual(desktop_at, now)
             self.assertEqual(decide(Entry(False, None), True, SEP, SEP, SEP), SKIP)
 
     class PlanTests(unittest.TestCase):
