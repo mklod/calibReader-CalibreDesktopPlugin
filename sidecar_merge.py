@@ -1,4 +1,4 @@
-# Last modified: 2026-10-12--1345
+# Last modified: 2026-10-21--1751
 #
 # sidecar_merge.py — pure decision logic for CalibReader_sync.json.
 #
@@ -337,6 +337,73 @@ def decide(entry, current_value, applied_stamp, applied_last_modified,
             return SKIP
 
     return APPLY if current_value != entry.value else RECORD
+
+
+# --- the read flag, by value (v1.2.3) ------------------------------------------
+#
+# calibre bumps a book's `last_modified` on EVERY metadata edit (a rating, a tag,
+# a cover). Using it as "the read flag was edited in calibre" meant an unrelated
+# edit made after a phone toggle silently dropped that toggle. From 1.2.3 the
+# plugin remembers, per book, the read value it last saw in calibre, and only a
+# CHANGE of that value counts as a desktop edit of the read flag. When it sees
+# one it remembers when (`desktop_at`, the book's last_modified at that moment),
+# and a phone entry must be newer than that to win. Books the plugin has no value
+# record for yet (first contact, or a 1.2.x record) use `decide` as before.
+
+NOT_SEEN = object()   # no value record for this book yet
+
+
+def decide_flag(entry, current_value, applied_stamp, applied_last_modified,
+                book_last_modified, seen_value=NOT_SEEN, desktop_at=None):
+    '''The read-flag rule. Returns (APPLY/RECORD/SKIP, desktop_at to store).'''
+    if seen_value is NOT_SEEN:
+        verdict = decide(entry, current_value, applied_stamp, applied_last_modified, book_last_modified)
+        if (verdict == SKIP and entry.stamp is not None and book_last_modified is not None
+                and (applied_stamp is None or entry.stamp > applied_stamp)):
+            desktop_at = later(desktop_at, book_last_modified)   # it lost to a desktop edit
+        return verdict, desktop_at
+    if current_value != seen_value and book_last_modified is not None:
+        desktop_at = later(desktop_at, book_last_modified)       # the flag itself changed in calibre
+    if entry.stamp is None:
+        return SKIP, desktop_at                                  # undated never overrides a record
+    floor = later(applied_stamp, desktop_at)
+    if floor is not None and entry.stamp <= floor:
+        return SKIP, desktop_at
+    return (APPLY if current_value != entry.value else RECORD), desktop_at
+
+
+def later(a, b):
+    '''The later of two optional datetimes.'''
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a if a >= b else b
+
+
+def load_flag_records(prefs_blob):
+    '''`{uuid: (applied_stamp, applied_last_modified, seen_value | NOT_SEEN, desktop_at)}`.'''
+    out = {}
+    if not isinstance(prefs_blob, dict):
+        return out
+    for uuid, rec in prefs_blob.items():
+        if not isinstance(uuid, str) or not isinstance(rec, dict):
+            continue
+        seen = rec['val'] if 'val' in rec and rec['val'] in (True, False, None) else NOT_SEEN
+        out[uuid.lower()] = (parse_iso(rec.get('stamp')), parse_iso(rec.get('lm')), seen, parse_iso(rec.get('dt')))
+    return out
+
+
+def store_flag_record(prefs_blob, uuid, applied_stamp, applied_last_modified, seen_value, desktop_at):
+    '''One book's read-flag bookkeeping (in place). Keeps the 1.2.x keys, so an older
+    plugin installed over this one still reads `stamp` and `lm`.'''
+    prefs_blob[uuid.lower()] = {
+        'stamp': format_iso(applied_stamp),
+        'lm': format_iso(applied_last_modified),
+        'val': seen_value,
+        'dt': format_iso(desktop_at),
+    }
+    return prefs_blob
 
 
 def plan(entries, book_state):

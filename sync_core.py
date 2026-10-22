@@ -1,4 +1,4 @@
-# Last modified: 2026-10-21--1618
+# Last modified: 2026-10-21--1751
 #
 # sync_core.py — one sync run, without the GUI.
 #
@@ -31,15 +31,15 @@ import re
 
 try:
     from calibre_plugins.calibreader_sync.sidecar_merge import (
-        UTC, Target, format_iso, last_read_value, load_applied, parse_iso,
-        parse_positions, parse_sidecar, percent_for_column, plan, refresh_lm,
-        store_applied,
+        APPLY, NOT_SEEN, RECORD, UTC, Target, decide_flag, format_iso, last_read_value,
+        load_applied, load_flag_records, parse_iso, parse_positions, parse_sidecar,
+        percent_for_column, plan, refresh_lm, store_applied, store_flag_record,
     )
 except ImportError:  # pragma: no cover - standalone / test import
     from sidecar_merge import (
-        UTC, Target, format_iso, last_read_value, load_applied, parse_iso,
-        parse_positions, parse_sidecar, percent_for_column, plan, refresh_lm,
-        store_applied,
+        APPLY, NOT_SEEN, RECORD, UTC, Target, decide_flag, format_iso, last_read_value,
+        load_applied, load_flag_records, parse_iso, parse_positions, parse_sidecar,
+        percent_for_column, plan, refresh_lm, store_applied, store_flag_record,
     )
 
 SYNC_FILE = 'CalibReader_sync.json'
@@ -291,8 +291,9 @@ def run_sync(db, library_path, settings, flag_blob, pos_blob):
                 res.notes.append(hint)
         elif meta.get('datatype') != 'bool':
             res.notes.append(
-                'Read status was not synced: {} is a {} column, and it needs to be '
-                'Yes/No.'.format(READ_COLUMN, meta.get('datatype')))
+                'Read status was not synced: {} is {} {} column, and it needs to be '
+                'Yes/No.'.format(READ_COLUMN, 'an' if str(meta.get('datatype'))[:1] in 'aeiou' else 'a',
+                                 meta.get('datatype')))
         else:
             flag_col = READ_COLUMN
 
@@ -321,23 +322,34 @@ def run_sync(db, library_path, settings, flag_blob, pos_blob):
 
     lm_before = {}
 
-    # Read flags: exactly as in 1.1.
-    flag_updates, flag_records = {}, {}
+    # Read flags (1.2.3): a calibre-side edit of the flag is a change of its VALUE
+    # since the last run (sidecar_merge.decide_flag), so every book's value is
+    # remembered, not only the books with a phone entry.
+    flag_updates, flag_records, flag_state = {}, {}, {}
     if flag_col:
         entries = parse_sidecar(flags_data)
-        applied = load_applied(flag_blob)
-        state = {}
-        for uuid in entries:
-            book_id = uuid_to_id.get(uuid)
-            if book_id is None:
-                continue
+        records = load_flag_records(flag_blob)
+        skipped = []
+        for uuid, book_id in uuid_to_id.items():
             value = db.field_for(flag_col, book_id)
-            lm_before[uuid] = _lm(db, book_id)
-            stamp, lm = applied.get(uuid, (None, None))
-            state[uuid] = (None if value is None else bool(value), stamp, lm, lm_before[uuid])
-        flag_updates, flag_records, skipped, unmatched = plan(entries, state)
+            value = None if value is None else bool(value)
+            stamp, lm, seen, dt = records.get(uuid, (None, None, NOT_SEEN, None))
+            book_lm = _lm(db, book_id)
+            entry = entries.get(uuid)
+            if entry is not None:
+                lm_before[uuid] = book_lm
+                verdict, dt = decide_flag(entry, value, stamp, lm, book_lm, seen, dt)
+                if verdict == APPLY:
+                    flag_updates[uuid] = entry.value
+                if verdict in (APPLY, RECORD):
+                    flag_records[uuid] = entry
+                else:
+                    skipped.append(uuid)
+            elif seen is not NOT_SEEN and value != seen and book_lm is not None:
+                dt = book_lm if dt is None or book_lm > dt else dt
+            flag_state[uuid] = (stamp, lm, dt)
         res.flags_skipped = len(skipped)
-        res.unmatched.update(unmatched)
+        res.unmatched.update(u for u in entries if u not in uuid_to_id)
 
     # Reading progress: % read and last read, from one position entry.
     pos_updates, pos_records = {}, {}
@@ -394,8 +406,11 @@ def run_sync(db, library_path, settings, flag_blob, pos_blob):
     # Bookkeeping, with each book's last_modified as it stands after ALL writes.
     written = set(flag_updates) | set(pos_updates)
     lm_after = {u: _lm(db, uuid_to_id[u]) for u in set(flag_records) | set(pos_records) | written}
-    for uuid, entry in flag_records.items():
-        store_applied(flag_blob, uuid, entry.stamp, lm_after[uuid])
+    for uuid, (stamp, lm, dt) in flag_state.items():
+        if uuid in flag_records:
+            stamp, lm = flag_records[uuid].stamp, lm_after[uuid]
+        now = db.field_for(flag_col, uuid_to_id[uuid])
+        store_flag_record(flag_blob, uuid, stamp, lm, None if now is None else bool(now), dt)
     for uuid, entry in pos_records.items():
         store_applied(pos_blob, uuid, entry.stamp, lm_after[uuid])
     # Our write for one kind of entry must not look like a desktop edit to the other.
@@ -690,6 +705,66 @@ if __name__ == '__main__':  # pragma: no cover
                     '#owned': {'datatype': 'bool', 'name': 'Owned'}}
             self.assertEqual([c for c, _ in existing_read_columns(cols)],
                              ['#read', '#done', '#ko_statusbool'])
+
+    class ReadFlagByValueTests(Base):
+        '''1.2.3: an unrelated calibre edit no longer drops a phone toggle; a real
+        calibre edit of the flag still wins over older phone entries.'''
+
+        def test_rating_edit_after_toggle_does_not_drop_it(self):
+            self.flags(**{'uuid-a': {'value': False, 'updated_at': stamp(2)}})
+            self.sync()                                        # first contact: values recorded
+            self.assertIs(self.v('#read_status', 1), False)
+            self.db.tick(3600 * 24 * 2)                        # Oct 3
+            self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(4)}})   # phone toggle, Oct 4
+            self.db.clock = datetime.datetime(2026, 10, 5, 9, 0, 0, 1, tzinfo=UTC)
+            self.db.desktop_edit('rating', 1, 8)               # unrelated calibre edit, Oct 5
+            res = self.sync()
+            self.assertIs(self.v('#read_status', 1), True)     # 1.2.2 skipped this
+            self.assertEqual(res.flags_updated, 1)
+
+        def test_calibre_flag_edit_beats_an_older_toggle(self):
+            self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(2)}})
+            self.sync()
+            self.flags(**{'uuid-a': {'value': False, 'updated_at': stamp(4)}})  # phone, Oct 4
+            self.db.clock = datetime.datetime(2026, 10, 5, 9, 0, 0, 1, tzinfo=UTC)
+            self.db.desktop_edit('#read_status', 1, True)      # calibre, Oct 5 (value unchanged: True)
+            self.db.desktop_edit('#read_status', 1, None)      # ... then cleared in calibre
+            res = self.sync()
+            self.assertIsNone(self.v('#read_status', 1))       # calibre's later edit stands
+            self.assertEqual(res.flags_updated, 0)
+            self.assertEqual(self.sync().flags_updated, 0)     # and keeps standing
+
+        def test_newer_toggle_beats_an_earlier_calibre_edit(self):
+            self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(2)}})
+            self.sync()
+            self.db.clock = datetime.datetime(2026, 10, 3, 9, 0, 0, 1, tzinfo=UTC)
+            self.db.desktop_edit('#read_status', 1, False)     # calibre, Oct 3
+            self.sync()                                        # sees the edit, remembers when
+            self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(6)}})   # phone, Oct 6
+            self.db.clock = datetime.datetime(2026, 10, 7, 9, 0, 0, 1, tzinfo=UTC)
+            self.db.desktop_edit('rating', 1, 6)               # unrelated, Oct 7
+            res = self.sync()
+            self.assertIs(self.v('#read_status', 1), True)
+            self.assertEqual(res.flags_updated, 1)
+
+        def test_calibre_edit_seen_between_runs_without_an_entry(self):
+            self.flags(**{'uuid-b': {'value': True, 'updated_at': stamp(2)}})
+            self.sync()                                        # records book a's value (None) too
+            self.db.clock = datetime.datetime(2026, 10, 3, 9, 0, 0, 1, tzinfo=UTC)
+            self.db.desktop_edit('#read_status', 1, True)      # calibre marks a read, Oct 3
+            self.sync()                                        # no entry for a: remembers the edit
+            self.flags(**{'uuid-a': {'value': False, 'updated_at': stamp(2, 18)}})  # older phone entry
+            res = self.sync()
+            self.assertIs(self.v('#read_status', 1), True)
+            self.assertEqual(res.flags_updated, 0)
+
+        def test_upgrade_from_122_records_keeps_the_old_rule_once(self):
+            self.flag_blob = {'uuid-a': {'stamp': stamp(1), 'lm': '2026-10-01T12:00:00.123Z'}}
+            self.db.values[('#read_status', 1)] = True
+            self.flags(**{'uuid-a': {'value': False, 'updated_at': stamp(4)}})
+            res = self.sync()
+            self.assertIs(self.v('#read_status', 1), False)
+            self.assertIn('val', self.flag_blob['uuid-a'])
 
     class SettingsTests(unittest.TestCase):
         def test_normalise(self):

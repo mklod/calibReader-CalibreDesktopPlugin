@@ -16,7 +16,7 @@ them and updates `metadata.db`.
 | | |
 |---|---|
 | **Name** | CalibReader Sync |
-| **Version** | 1.2.2 |
+| **Version** | 1.2.3 |
 | **Author** | CalibReader |
 | **Platforms** | Windows, macOS, Linux |
 | **Minimum Calibre** | 9.0.0 |
@@ -142,9 +142,15 @@ entry it last applied and that book's `last_modified` right after the write.
    record exists, an undated source never overrides it.
 2. **Stale**: a stamp older than or equal to the one already applied is
    ignored. This retires an old `false` permanently.
-3. **Desktop edit wins**: if the book changed in Calibre since the last apply
-   (or was never synced), an entry whose stamp isn't strictly newer than the
-   book's `last_modified` is ignored.
+3. **Desktop edit wins**: an entry that isn't strictly newer than a Calibre
+   edit of the read flag is ignored. From 1.2.3 the plugin also remembers the
+   read value it last saw for every book, and a Calibre edit of the read flag
+   means that value **changed** (the edit's time is taken as the book's
+   `last_modified` when the change was first seen). Other metadata edits (a
+   rating, a tag) don't count. For a book with no such record yet (the first
+   sync, or a record from 1.2.2 or earlier), the old rule applies once: if the
+   book changed in Calibre since the last apply (or was never synced), an entry
+   whose stamp isn't strictly newer than the book's `last_modified` is ignored.
 4. Otherwise the entry wins and the column is set.
 
 Reading progress follows the same rules, with two additions in 1.2.0:
@@ -159,9 +165,10 @@ Reading progress follows the same rules, with two additions in 1.2.0:
   vice versa. The other record is moved on with it, unless the book was also
   edited in Calibre in between.
 
-Because rule 3 keys off `last_modified`, **any** metadata edit in Calibre (not
-just these columns) can make a same-vintage entry lose. Reading on, or
-re-toggling the book in the app, produces a newer stamp and syncs normally.
+For reading progress, rule 3 still keys off `last_modified`, so **any**
+metadata edit in Calibre can make a same-vintage position lose. Reading on
+produces a newer stamp and syncs normally. Read status no longer has this
+limitation (1.2.3, see rule 3).
 
 ### Testing
 
@@ -169,7 +176,7 @@ The rules live in two modules that import nothing from Calibre:
 
 ```bash
 python3 sidecar_merge.py      # 32 tests: parsing, timestamps, the conflict rules
-python3 sync_core.py          # 20 tests: whole sync runs against an in-memory library
+python3 sync_core.py          # 28 tests: whole sync runs against an in-memory library
 ```
 
 ---
@@ -334,6 +341,17 @@ project):
 ---
 
 ## Changelog
+
+### 1.2.3 — 2026-10-21
+
+- **Read status: an unrelated Calibre edit no longer drops a phone change.**
+  Calibre updates a book's `last_modified` on every metadata edit (a rating,
+  a tag, a cover), and the plugin used to treat any such edit as a change of the
+  read flag, so a newer read mark from the app was skipped. The plugin now
+  remembers the read value it last saw for each book, and only a change of
+  that value counts as a Calibre edit of the read flag. Newer still wins in both
+  directions. The sync files are unchanged.
+- Wording: "an enumeration column".
 
 ### 1.2.2 — 2026-10-21
 
