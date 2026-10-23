@@ -1,4 +1,4 @@
-# Last modified: 2026-10-22--2056
+# Last modified: 2026-10-22--2103
 #
 # CalibReader Sync — Calibre plugin
 # Reads the sidecars the CalibReader apps keep in the Calibre library folder
@@ -54,9 +54,10 @@
 # library's metadata.db preferences, which the apps (1.0.1+) follow; a missing or
 # non-Yes/No choice falls back to #read_status with a note. The read-flag memory
 # is kept per column, and an empty read cell takes the app's mark whatever its age
-# (a filled one keeps the usual rules). Each entry the plugin applies is stamped with
-# "applied_value" + "applied_at" in CalibReader_sync.json, so the app can tell a
-# later calibre edit from the plugin's own write (sync_core.update_sync_file).
+# (a filled one keeps the usual rules). Each entry the plugin applies, and once each
+# entry calibre already agrees with, is stamped with "applied_value" + "applied_at"
+# in CalibReader_sync.json, so the app can tell a later calibre edit from the
+# plugin's own write (sync_core.update_sync_file).
 #
 # Installation:
 #   1. Zip __init__.py, ui.py, config.py, sync_core.py, sidecar_merge.py,

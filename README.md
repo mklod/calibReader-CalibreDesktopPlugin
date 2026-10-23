@@ -62,9 +62,9 @@ status column and the progress columns you chose. It writes to
 - **A Calibre edit wins** (1.2.4): when you changed a book's read status in
   Calibre after the app's change, it records Calibre's value there, stamped
   with the time of your edit, so the app follows it on its next sync.
-- **An entry was applied** (1.3.0): when it writes an entry's read status into
-  Calibre, it adds `applied_value` and `applied_at` to that entry, so the app
-  can tell a later Calibre edit from the plugin's own write.
+- **Stamps** (1.3.0): it adds `applied_value` and `applied_at` to each entry
+  it writes into Calibre, and once to each entry Calibre already agrees with,
+  so the app can tell a later Calibre edit from the plugin's own write.
 
 `CalibReader_positions.json` is never written.
 
@@ -108,15 +108,23 @@ A bare bool carries the **file-level** `updated_at`; an object carries its own.
 Fractional seconds are allowed (milliseconds or microseconds).
 Both apps write `progress` for EPUB and PDF (a PDF's is `(page + 1) / pages`).
 
-`applied_value` / `applied_at` (1.3.0) are added by the plugin, only to an
-object entry it has just written into Calibre, and only while the file still
-holds that same entry; every other key is kept. `applied_value` is the value it
-wrote; `applied_at` is the book's Calibre `last_modified` right after the write
-(rounded up to the millisecond, same format as `updated_at`). So if the app
-later finds Calibre's value different from the entry's, with `last_modified`
-newer than `applied_at`, the read status was edited in Calibre afterwards.
-Readers ignore keys they don't know: older apps and plugins read `value` and
-`updated_at` only. A legacy bare bool is never converted.
+`applied_value` / `applied_at` (1.3.0) are added by the plugin to an object
+entry, only while the file still holds that same entry; every other key is
+kept. They mean "Calibre held `applied_value` at `applied_at`":
+
+- an entry the plugin writes into Calibre: the value it wrote, and the book's
+  Calibre `last_modified` right after the write;
+- an entry Calibre already agrees with (nothing written), and the plugin's own
+  write-back entries: the value, and the book's current `last_modified`. These
+  are stamped once: an entry that already carries `applied_value` equal to its
+  `value` is left alone, and a sync that changes nothing doesn't rewrite the
+  file.
+
+`applied_at` is rounded up to the millisecond, same format as `updated_at`. So
+if the app later finds Calibre's value different from the entry's, with
+`last_modified` newer than `applied_at`, the read status was edited in Calibre
+afterwards. Readers ignore keys they don't know: older apps and plugins read
+`value` and `updated_at` only. A legacy bare bool is never converted.
 
 ### Read status column (1.3.0)
 
@@ -230,7 +238,7 @@ The rules live in two modules that import nothing from Calibre:
 
 ```bash
 python3 sidecar_merge.py      # 38 tests: parsing, timestamps, the conflict rules
-python3 sync_core.py          # 52 tests: whole sync runs against an in-memory library
+python3 sync_core.py          # 56 tests: whole sync runs against an in-memory library
 ```
 
 ---
@@ -405,9 +413,10 @@ column (1.3.0).
   keeps its value unless the app's mark is newer. The per-book memory is kept
   per column, so switching to your own column fills its empty cells and keeps
   the rest.
-- Each read status entry the plugin applies gets `applied_value` and
-  `applied_at` in `CalibReader_sync.json`, so the app can tell a later Calibre
-  edit from the plugin's own write. Older apps ignore the extra keys.
+- Read status entries in `CalibReader_sync.json` get `applied_value` and
+  `applied_at` (once, when the plugin applies them or finds Calibre already
+  agrees), so the app can tell a later Calibre edit from the plugin's own
+  write. Older apps ignore the extra keys.
 
 ### 1.2.5 — 2026-10-21
 

@@ -1,4 +1,4 @@
-# Last modified: 2026-10-22--2056
+# Last modified: 2026-10-22--2103
 #
 # sidecar_merge.py — pure decision logic for CalibReader_sync.json.
 #
@@ -31,9 +31,11 @@
 # `applied_value` / `applied_at` (1.3.0): when the plugin writes an entry's value
 # into calibre it adds these two keys to that entry: the value it wrote and the
 # book's calibre `last_modified` right after the write (rounded UP to the
-# millisecond). An app that later finds calibre's value != the entry's value with
-# `last_modified` > `applied_at` knows the read flag was edited in calibre after
-# the plugin applied the entry. Readers ignore keys they don't know: this parser
+# millisecond). An entry calibre already agrees with (the plugin writes nothing)
+# and the plugin's own write-back entries get them too, once, with the book's
+# current `last_modified`. An app that later finds calibre's value != the entry's
+# value with `last_modified` > `applied_at` knows the read flag was edited in
+# calibre after that. Readers ignore keys they don't know: this parser
 # reads only `value` and `updated_at`, and so do the apps and plugins <= 1.2.5.
 #
 # ---------------------------------------------------------------------------

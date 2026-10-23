@@ -1,4 +1,4 @@
-# Last modified: 2026-10-22--2056
+# Last modified: 2026-10-22--2103
 #
 # sync_core.py — one sync run, without the GUI.
 #
@@ -389,31 +389,36 @@ def _norm_date(value):
     return None if dt is None else dt.astimezone(UTC).replace(microsecond=0)
 
 
-def update_sync_file(library_path, writebacks=None, applied=None):
+def update_sync_file(library_path, writebacks=None, applied=None, agreeing=None):
     '''Write into CalibReader_sync.json, following the apps' sidecar protocol
     (docs/PARITY.md, 2026-10-13): re-read the file right before writing and write
     only if it parses cleanly; touch only these books' entries; never remove a key;
     never touch the file-level updated_at (legacy bare entries inherit it); write a
-    temp file and rename it in, with the backup swap when rename-over is refused.
+    temp file and rename it in, with the backup swap when rename-over is refused;
+    don't write at all when nothing changes.
 
-    writebacks (1.2.4) = {uuid: (value, stamp)}: calibre's newer read values. The
-        entry is replaced, only when ours is strictly newer.
+    writebacks (1.2.4) = {uuid: (value, stamp[, applied_at])}: calibre's newer read
+        values. The entry is replaced, only when ours is strictly newer; with an
+        applied_at (1.3.0) it carries applied_value + applied_at as well.
     applied (1.3.0) = {uuid: (value, entry_stamp, applied_at)}: entries this plugin
-        wrote into calibre. `applied_value` and `applied_at` are added to the entry,
-        all its other keys kept, only while the file still holds that same entry
-        (same value and stamp) as an object; a legacy bare bool is left alone.
+        wrote into calibre. They get `applied_value` and `applied_at`, all their
+        other keys kept, only while the file still holds that same entry (same value
+        and stamp) as an object; a legacy bare bool is left alone.
+    agreeing (1.3.0) = the same shape, for entries calibre already agrees with (the
+        plugin wrote nothing): stamped the same way, once. An entry that already
+        carries applied_value == its value (and an applied_at) is left alone.
 
     Returns ({uuid: stamp written back}, {uuid: applied_at stamped}, failed, note);
     `failed` is True when the file could not be read or written this time.'''
     path = os.path.join(library_path, SYNC_FILE)
-    writebacks, applied = writebacks or {}, applied or {}
+    writebacks, applied, agreeing = writebacks or {}, applied or {}, agreeing or {}
     retry = ('Read status set in calibre could not be passed back to the app this time '
              '({}); it will be tried again next sync.')
 
     def failure(why):
         return {}, {}, True, (retry.format(why) if writebacks else None)
 
-    if not (writebacks or applied) or not os.path.exists(path):
+    if not (writebacks or applied or agreeing) or not os.path.exists(path):
         return {}, {}, False, None
     try:
         with open(path, 'r', encoding='utf-8') as f:
@@ -426,22 +431,42 @@ def update_sync_file(library_path, writebacks=None, applied=None):
     current = parse_sidecar(data)
     keys = {k.lower(): k for k in books if isinstance(k, str)}
     written, stamped, dirty = {}, {}, False
-    for uuid, (value, stamp) in writebacks.items():
+    for uuid, wb in writebacks.items():
+        value, stamp = wb[0], wb[1]
         have = current.get(uuid)
         if have is not None and have.stamp is not None and have.stamp >= stamp:
             continue                        # someone wrote a newer entry meanwhile
-        books[keys.get(uuid, uuid)] = {KEY_VALUE: bool(value), KEY_UPDATED_AT: format_iso(stamp)}
+        entry = {KEY_VALUE: bool(value), KEY_UPDATED_AT: format_iso(stamp)}
+        if len(wb) > 2 and wb[2] is not None:          # calibre holds this value: stamp it now
+            entry.update({KEY_APPLIED_VALUE: bool(value), KEY_APPLIED_AT: format_iso(wb[2])})
+        books[keys.get(uuid, uuid)] = entry
         written[uuid] = stamp
         dirty = True
-    for uuid, (value, entry_stamp, at) in applied.items():
+
+    def same_entry(uuid, value, entry_stamp):
+        '''The raw object entry, if the file still holds the entry we decided on.'''
         have, raw = current.get(uuid), books.get(keys.get(uuid))
         if (uuid in written or have is None or not isinstance(raw, dict) or have.value != bool(value)
                 or format_iso(have.stamp) != format_iso(entry_stamp)):
-            continue                        # replaced or removed meanwhile, or a bare bool
+            return None                     # replaced or removed meanwhile, or a bare bool
+        return raw
+
+    for uuid, (value, entry_stamp, at) in applied.items():
+        raw = same_entry(uuid, value, entry_stamp)
+        if raw is None:
+            continue
         want = {KEY_APPLIED_VALUE: bool(value), KEY_APPLIED_AT: format_iso(at)}
         if any(raw.get(k) != v for k, v in want.items()):
             raw.update(want)
             dirty = True
+        stamped[uuid] = at
+    for uuid, (value, entry_stamp, at) in agreeing.items():
+        raw = None if uuid in applied else same_entry(uuid, value, entry_stamp)
+        if raw is None or (raw.get(KEY_APPLIED_VALUE) is bool(value)
+                           and parse_iso(raw.get(KEY_APPLIED_AT)) is not None):
+            continue                        # stamped once already: left alone
+        raw.update({KEY_APPLIED_VALUE: bool(value), KEY_APPLIED_AT: format_iso(at)})
+        dirty = True
         stamped[uuid] = at
     if not dirty:
         return written, stamped, False, None
@@ -628,7 +653,21 @@ def run_sync(db, library_path, settings, flag_blobs, pos_blob):
     for uuid in flag_updates:
         entry = flag_records[uuid]
         stamps[uuid] = (entry.value, entry.stamp, ceil_ms(lm_after.get(uuid) or _dt.datetime.now(UTC)))
-    sent, stamped, failed, note = update_sync_file(library_path, writebacks, stamps)
+    # Entries calibre already agrees with (the plugin wrote nothing), and the 1.2.4
+    # write-backs (calibre's own value), are stamped too, with the book's current
+    # last_modified rounded up to the ms; update_sync_file stamps each entry once.
+    agreeing, wb_stamped = {}, {}
+    if flag_col:
+        def current_lm(uuid):
+            return ceil_ms(lm_after.get(uuid) or _lm(db, uuid_to_id[uuid]) or _dt.datetime.now(UTC))
+        for uuid, entry in entries.items():
+            if uuid not in uuid_to_id or uuid in stamps or uuid in writebacks:
+                continue
+            value = db.field_for(flag_col, uuid_to_id[uuid])
+            if value is not None and bool(value) == entry.value:
+                agreeing[uuid] = (entry.value, entry.stamp, current_lm(uuid))
+        wb_stamped = {u: (v, s, current_lm(u)) for u, (v, s) in writebacks.items()}
+    sent, stamped, failed, note = update_sync_file(library_path, wb_stamped, stamps, agreeing)
     res.flags_sent_back, res.flags_stamped = len(sent), len(stamped)
     keep = stamps if failed else {}
     if note:
@@ -1064,7 +1103,9 @@ if __name__ == '__main__':  # pragma: no cover
             self.assertGreater(parse_iso(books['uuid-a']['applied_at']),
                                parse_iso(before['uuid-a']['applied_at']))
             self.assertGreaterEqual(parse_iso(books['uuid-a']['applied_at']), self.v('last_modified', 1))
-            self.assertEqual(books['uuid-b'], {'value': False, 'updated_at': format_iso(self.v('last_modified', 2))})
+            lm_b = self.v('last_modified', 2)
+            self.assertEqual(books['uuid-b'], {'value': False, 'updated_at': format_iso(lm_b),
+                                               'applied_value': False, 'applied_at': format_iso(ceil_ms(lm_b))})
             self.assertEqual(books['uuid-c'], before['uuid-c'])         # agreeing cell: entry untouched
             self.assertEqual(self.sync(dict(SETTINGS, read_column='#read')).flags_updated, 0)
 
@@ -1093,8 +1134,11 @@ if __name__ == '__main__':  # pragma: no cover
             self.assertIs(self.v('#read_status', 1), True)     # calibre's later edit stands
             self.assertEqual(res.flags_sent_back, 1)
             doc = self.read_file()
-            # replaced whole: the earlier apply's applied_* stamps go with the old entry
-            self.assertEqual(doc['books']['uuid-a'], {'value': True, 'updated_at': edited_at})
+            # replaced whole (the earlier apply's stamps go with the old entry) and, since
+            # calibre holds this value, stamped in the same write (1.3.0)
+            self.assertEqual(doc['books']['uuid-a'], {
+                'value': True, 'updated_at': edited_at, 'applied_value': True,
+                'applied_at': format_iso(ceil_ms(self.v('last_modified', 1)))})
             self.assertIs(doc['books']['uuid-b'], True)        # other keys untouched (bare bool kept)
             self.assertEqual(doc['updated_at'], stamp(1))      # file-level stamp untouched
             before = self.file_bytes()
@@ -1236,7 +1280,7 @@ if __name__ == '__main__':  # pragma: no cover
             self.db.values[('#read_status', 3)] = True
             self.positions(**{'uuid-a': {'progress': 0.5, 'updated_at': stamp(2)}})
             res = self.sync()
-            self.assertEqual((res.flags_updated, res.flags_stamped), (2, 1))
+            self.assertEqual((res.flags_updated, res.flags_stamped), (2, 2))   # a applied, c agreeing
             doc = self.read_file()
             a = doc['books']['UUID-A']
             self.assertEqual(sorted(a), ['applied_at', 'applied_value', 'deviceId', 'updated_at', 'value'])
@@ -1248,7 +1292,9 @@ if __name__ == '__main__':  # pragma: no cover
             self.assertGreaterEqual(parse_iso(a['applied_at']), lm)
             self.assertLess(parse_iso(a['applied_at']) - lm, datetime.timedelta(milliseconds=1))
             self.assertIs(doc['books']['uuid-b'], False)                 # bare bool kept as it was
-            self.assertEqual(doc['books']['uuid-c'], {'value': True, 'updated_at': stamp(2)})
+            c = doc['books']['uuid-c']                                   # calibre already agreed
+            self.assertEqual((c['value'], c['updated_at'], c['applied_value']), (True, stamp(2), True))
+            self.assertEqual(parse_iso(c['applied_at']), ceil_ms(self.v('last_modified', 3)))
             self.assertEqual(doc['books']['uuid-z'], {'value': True, 'updated_at': stamp(2)})
             self.assertEqual(doc['updated_at'], stamp(1))
             before = self.file_bytes()
@@ -1308,6 +1354,66 @@ if __name__ == '__main__':  # pragma: no cover
             before = self.file_bytes()
             self.sync()
             self.assertEqual(self.file_bytes(), before)
+
+        def test_agreeing_entry_is_stamped_once(self):
+            self.db.values[('#read_status', 1)] = True               # calibre already says Yes
+            self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(2)}, 'uuid-b': True})
+            self.db.values[('#read_status', 2)] = True
+            res = self.sync()
+            self.assertEqual((res.flags_updated, res.flags_stamped), (0, 1))
+            doc = self.read_file()
+            a = doc['books']['uuid-a']
+            self.assertEqual((a['value'], a['updated_at'], a['applied_value']), (True, stamp(2), True))
+            self.assertEqual(parse_iso(a['applied_at']), ceil_ms(self.v('last_modified', 1)))
+            self.assertIs(doc['books']['uuid-b'], True)              # bare bool untouched
+            before = self.file_bytes()
+            self.db.tick(3600)
+            self.db.desktop_edit('rating', 1, 6)                     # unrelated edit: no re-stamp
+            self.assertEqual(self.sync().flags_stamped, 0)
+            self.assertEqual(self.file_bytes(), before)
+
+        def test_already_retired_agreeing_entries_are_stamped_once(self):
+            # Upgrade from 1.2.5: entries retired long ago, calibre agrees, no stamps yet.
+            self.write(SYNC_FILE, {'schema': 1, 'updated_at': stamp(1), 'books': {
+                'uuid-a': {'value': False, 'updated_at': stamp(2)}}})
+            self.db.values[('#read_status', 1)] = False
+            self.flag_blobs = flag_blobs_from_prefs({'uuid-a': {'stamp': stamp(2), 'lm': None, 'val': False,
+                                                                'dt': None}}, None)
+            self.db.tick(3600 * 24 * 5)
+            self.db.desktop_edit('rating', 1, 6)
+            res = self.sync()
+            self.assertEqual((res.flags_updated, res.flags_skipped, res.flags_stamped), (0, 1, 1))
+            self.assertEqual(self.read_file()['books']['uuid-a']['applied_value'], False)
+            before = self.file_bytes()
+            self.sync()
+            self.assertEqual(self.file_bytes(), before)
+
+        def test_agreeing_entry_with_a_stale_stamp_is_stamped_again(self):
+            self.db.values[('#read_status', 1)] = True
+            self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(4),
+                                     'applied_value': False, 'applied_at': stamp(2)}})   # left from an older value
+            res = self.sync()
+            self.assertEqual((res.flags_updated, res.flags_stamped), (0, 1))
+            a = self.read_file()['books']['uuid-a']
+            self.assertEqual((a['value'], a['updated_at'], a['applied_value']), (True, stamp(4), True))
+            self.assertEqual(parse_iso(a['applied_at']), ceil_ms(self.v('last_modified', 1)))
+            before = self.file_bytes()
+            self.assertEqual(self.sync().flags_stamped, 0)
+            self.assertEqual(self.file_bytes(), before)
+
+        def test_empty_cell_is_filled_and_stamped_disagreeing_cell_is_not_stamped(self):
+            self.db.values[('#read_status', 2)] = False              # filled, disagrees, newer than the entry
+            self.db.tick(3600 * 24 * 5)
+            self.db.desktop_edit('#read_status', 2, True)
+            self.db.desktop_edit('#read_status', 2, False)
+            self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(2)},
+                          'uuid-b': {'value': True, 'updated_at': stamp(2)}})
+            res = self.sync()
+            books = self.read_file()['books']
+            self.assertIs(self.v('#read_status', 1), True)
+            self.assertEqual(books['uuid-a']['applied_value'], True)             # filled from empty
+            self.assertEqual(books['uuid-b']['value'], False)                    # calibre's value went back
+            self.assertEqual((res.flags_updated, res.flags_sent_back), (1, 1))
 
         def test_parser_reads_a_stamped_file_as_before(self):
             self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(2)}, 'uuid-b': True})
