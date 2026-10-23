@@ -136,9 +136,11 @@ is missing or of another type, read status goes into `#read_status` instead,
 as in the app, and the sync says so.
 
 The plugin's per-book memory (see **Conflict resolution**) is kept per column,
-so switching columns starts the new one fresh: the first sync into it follows
-the first-sync rule below, and the old column's memory is kept for a switch
-back.
+so switching columns starts the new one fresh, and the old column's memory is
+kept for a switch back. Switching to a column you already fill in yourself:
+its empty cells take the app's marks, and its filled cells keep their values
+unless the app's mark is newer (where they disagree with an older mark,
+Calibre's value goes back to the app).
 
 ### Reading progress (1.2.0)
 
@@ -200,6 +202,11 @@ entry it last applied and that book's `last_modified` right after the write.
    whose stamp isn't strictly newer than the book's `last_modified` is ignored.
 4. Otherwise the entry wins and the column is set.
 
+**An empty read status cell takes the app's mark** (1.3.0), however old the
+mark is: rule 3 doesn't apply to an empty cell. Rule 2 still does, so a cell
+you clear in Calibre is not refilled by the entry the plugin already applied;
+the app's next mark fills it. A filled cell follows rules 1-4.
+
 Reading progress follows the same rules, with two additions in 1.2.0:
 
 - **An empty column takes the first value.** When the plugin has never written
@@ -222,8 +229,8 @@ limitation (1.2.3, see rule 3).
 The rules live in two modules that import nothing from Calibre:
 
 ```bash
-python3 sidecar_merge.py      # 36 tests: parsing, timestamps, the conflict rules
-python3 sync_core.py          # 47 tests: whole sync runs against an in-memory library
+python3 sidecar_merge.py      # 38 tests: parsing, timestamps, the conflict rules
+python3 sync_core.py          # 52 tests: whole sync runs against an in-memory library
 ```
 
 ---
@@ -393,13 +400,14 @@ column (1.3.0).
   columns (`#read`, `#finished`…) and has Create column…; the choice is
   saved in the library, and the CalibReader app (1.0.1 or later) follows it.
   A missing or non-Yes/No choice falls back to `#read_status`, with a note.
-- The plugin's per-book memory is kept per column, so switching columns
-  doesn't carry one column's history into another.
+  This replaces the 1.2.2 "copy your column over" steps.
+- An empty read status cell takes the app's mark, however old; a filled cell
+  keeps its value unless the app's mark is newer. The per-book memory is kept
+  per column, so switching to your own column fills its empty cells and keeps
+  the rest.
 - Each read status entry the plugin applies gets `applied_value` and
   `applied_at` in `CalibReader_sync.json`, so the app can tell a later Calibre
   edit from the plugin's own write. Older apps ignore the extra keys.
-- The 1.2.2 "copy your column into `#read_status`" steps are gone: pick your
-  column in Settings instead.
 
 ### 1.2.5 — 2026-10-21
 

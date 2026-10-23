@@ -1,4 +1,4 @@
-# Last modified: 2026-10-22--2048
+# Last modified: 2026-10-22--2056
 #
 # sidecar_merge.py — pure decision logic for CalibReader_sync.json.
 #
@@ -381,11 +381,26 @@ def decide_flag(entry, current_value, applied_stamp, applied_last_modified,
     '''The read-flag rule. Returns (APPLY/RECORD/SKIP, desktop_at to store).
 
     `now` (1.2.4) caps the desktop-edit time: a `last_modified` in the future (a
-    desktop clock running ahead) must not outrank every phone entry for good.'''
+    desktop clock running ahead) must not outrank every phone entry for good.
+
+    An EMPTY cell (1.3.0, user ruling 2026-10-22) takes the app's mark whatever its
+    age: no last_modified or desktop-edit gate, on first contact or later. Only an
+    entry this plugin already applied or recorded for the column stays retired (rule
+    2), so a cell the user clears in calibre is not refilled by that same old entry;
+    a newer mark from the app fills it. A FILLED cell keeps the rules below.'''
     if now is not None and book_last_modified is not None and book_last_modified > now:
         desktop_mark = now
     else:
         desktop_mark = book_last_modified
+    if current_value is None:
+        if entry.stamp is None:                      # undated: only if nothing was ever applied
+            fresh = applied_stamp is None and applied_last_modified is None
+        else:
+            fresh = applied_stamp is None or entry.stamp > applied_stamp
+        if fresh:
+            # Our write supersedes any earlier calibre edit of this cell (a clear),
+            # so it must not hold back the app's later entries: forget it.
+            return APPLY, None
     if seen_value is NOT_SEEN:
         verdict = decide(entry, current_value, applied_stamp, applied_last_modified, book_last_modified)
         if (verdict == SKIP and entry.stamp is not None and desktop_mark is not None
@@ -671,6 +686,25 @@ if __name__ == '__main__':  # pragma: no cover
 
         def test_undated_bootstraps_once_then_never_overrides(self):
             self.assertEqual(decide(Entry(True, None), None, None, None, None), APPLY)
+
+        def test_empty_cell_takes_an_old_entry(self):
+            # 1.3.0: no last_modified gate for an empty cell, first contact or not.
+            self.assertEqual(decide_flag(Entry(True, SEP, True), None, None, None, NOV), (APPLY, None))
+            self.assertEqual(decide(Entry(True, SEP, True), None, None, None, NOV), SKIP)   # progress rule unchanged
+            # cleared in calibre on Nov 2 (desktop_at), a mark from Oct (after the Sept apply) still fills it
+            self.assertEqual(decide_flag(Entry(False, OCT, True), None, SEP, SEP, NOV,
+                                         seen_value=True, desktop_at=NOV), (APPLY, None))
+            # the entry already applied does not refill a cell the user cleared
+            self.assertEqual(decide_flag(Entry(True, SEP, True), None, SEP, SEP, NOV,
+                                         seen_value=True)[0], SKIP)
+            # undated: only while nothing was ever applied for the book
+            self.assertEqual(decide_flag(Entry(True, None), None, None, None, NOV, seen_value=None)[0], APPLY)
+            self.assertEqual(decide_flag(Entry(True, None), None, None, SEP, NOV, seen_value=True)[0], SKIP)
+
+        def test_filled_cell_keeps_the_old_rules(self):
+            verdict, desktop_at = decide_flag(Entry(True, SEP, True), False, None, None, NOV)
+            self.assertEqual((verdict, desktop_at), (SKIP, NOV))
+            self.assertEqual(writeback_for(Entry(True, SEP, True), verdict, False, desktop_at), (False, NOV))
 
         def test_future_last_modified_is_capped_at_now(self):
             # 1.2.4: a desktop clock running ahead must not outrank every phone entry.

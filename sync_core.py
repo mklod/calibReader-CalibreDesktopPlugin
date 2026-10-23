@@ -1,4 +1,4 @@
-# Last modified: 2026-10-22--2048
+# Last modified: 2026-10-22--2056
 #
 # sync_core.py — one sync run, without the GUI.
 #
@@ -964,14 +964,30 @@ if __name__ == '__main__':  # pragma: no cover
         def test_calibre_flag_edit_beats_an_older_toggle(self):
             self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(2)}})
             self.sync()
-            self.flags(**{'uuid-a': {'value': False, 'updated_at': stamp(4)}})  # phone, Oct 4
+            self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(4)}})   # phone, Oct 4
             self.db.clock = datetime.datetime(2026, 10, 5, 9, 0, 0, 1, tzinfo=UTC)
-            self.db.desktop_edit('#read_status', 1, True)      # calibre, Oct 5 (value unchanged: True)
-            self.db.desktop_edit('#read_status', 1, None)      # ... then cleared in calibre
+            self.db.desktop_edit('#read_status', 1, False)     # calibre, Oct 5
             res = self.sync()
-            self.assertIsNone(self.v('#read_status', 1))       # calibre's later edit stands
-            self.assertEqual(res.flags_updated, 0)
+            self.assertIs(self.v('#read_status', 1), False)    # calibre's later edit stands
+            self.assertEqual((res.flags_updated, res.flags_sent_back), (0, 1))
             self.assertEqual(self.sync().flags_updated, 0)     # and keeps standing
+
+        def test_cleared_cell_takes_a_newer_mark_but_not_the_applied_one(self):
+            # 1.3.0 ruling: an empty cell takes the app's mark whatever its age.
+            self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(2)}})
+            self.sync()
+            self.db.clock = datetime.datetime(2026, 10, 5, 9, 0, 0, 1, tzinfo=UTC)
+            self.db.desktop_edit('#read_status', 1, None)      # cleared in calibre, Oct 5
+            res = self.sync()                                  # the Oct 2 entry was applied already
+            self.assertIsNone(self.v('#read_status', 1))
+            self.assertEqual((res.flags_updated, res.flags_sent_back), (0, 0))
+            self.flags(**{'uuid-a': {'value': False, 'updated_at': stamp(4)}})  # app, Oct 4: older than the clear
+            res = self.sync()
+            self.assertIs(self.v('#read_status', 1), False)
+            self.assertEqual(res.flags_updated, 1)
+            self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(4, 13)}})  # a later app toggle
+            self.assertEqual(self.sync().flags_updated, 1)     # not held back by the old clear
+            self.assertIs(self.v('#read_status', 1), True)
 
         def test_newer_toggle_beats_an_earlier_calibre_edit(self):
             self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(2)}})
@@ -1005,6 +1021,62 @@ if __name__ == '__main__':  # pragma: no cover
             res = self.sync()
             self.assertIs(self.v('#read_status', 1), False)
             self.assertIn('val', self.flag_blobs['#read_status']['uuid-a'])
+
+    class EmptyCellTests(Base):
+        '''1.3.0, user ruling 2026-10-22: an EMPTY read cell takes the app's mark whatever
+        its age; a FILLED cell keeps its value under the usual rules.'''
+
+        def test_old_app_entry_fills_an_empty_cell(self):
+            self.db.tick(3600 * 24 * 9)                        # Oct 10: the books were edited in calibre
+            self.db.desktop_edit('rating', 1, 8)
+            self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(2)}})   # app, Oct 2
+            res = self.sync()
+            self.assertIs(self.v('#read_status', 1), True)
+            self.assertEqual(res.flags_updated, 1)
+
+        def test_old_app_entry_does_not_overwrite_a_filled_cell(self):
+            self.db.tick(3600 * 24 * 9)
+            self.db.desktop_edit('#read_status', 1, False)     # calibre, Oct 10
+            self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(2)}})   # app, Oct 2
+            res = self.sync()
+            self.assertIs(self.v('#read_status', 1), False)
+            self.assertEqual((res.flags_updated, res.flags_sent_back), (0, 1))   # calibre's value goes back
+            self.assertEqual(self.read_file()['books']['uuid-a']['value'], False)
+
+        def test_switching_to_a_column_with_empty_and_filled_cells(self):
+            self.db.field_metadata = FakeFieldMetadata(
+                dict(COLS, **{'#read': {'datatype': 'bool', 'name': 'Have read'}}))
+            self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(2)},
+                          'uuid-b': {'value': True, 'updated_at': stamp(2)},
+                          'uuid-c': {'value': False, 'updated_at': stamp(2)}})
+            self.sync()                                        # into #read_status, Oct 1 run
+            before = self.read_file()['books']
+            self.db.tick(3600 * 24 * 9)                        # Oct 10: the user's own #read
+            self.db.set_field('#read', {2: False, 3: False})   # a empty, b filled differently, c agrees
+            self.db.desktop_edit('rating', 1, 8)               # a edited too: newer than its app entry
+            res = self.sync(dict(SETTINGS, read_column='#read'))
+            self.assertIs(self.v('#read', 1), True)            # empty: filled from the old entry
+            self.assertIs(self.v('#read', 2), False)           # filled: kept
+            self.assertIs(self.v('#read', 3), False)           # filled, agrees
+            self.assertEqual((res.flags_updated, res.flags_sent_back), (1, 1))
+            books = self.read_file()['books']
+            self.assertEqual(books['uuid-a']['applied_value'], True)    # stamped again: filled from empty
+            self.assertGreater(parse_iso(books['uuid-a']['applied_at']),
+                               parse_iso(before['uuid-a']['applied_at']))
+            self.assertGreaterEqual(parse_iso(books['uuid-a']['applied_at']), self.v('last_modified', 1))
+            self.assertEqual(books['uuid-b'], {'value': False, 'updated_at': format_iso(self.v('last_modified', 2))})
+            self.assertEqual(books['uuid-c'], before['uuid-c'])         # agreeing cell: entry untouched
+            self.assertEqual(self.sync(dict(SETTINGS, read_column='#read')).flags_updated, 0)
+
+        def test_filled_from_empty_is_stamped(self):
+            self.db.tick(3600 * 24 * 9)
+            self.db.desktop_edit('rating', 1, 8)               # book edited after the app's mark
+            self.flags(**{'uuid-a': {'value': False, 'updated_at': stamp(2)}})
+            res = self.sync()
+            self.assertEqual((res.flags_updated, res.flags_stamped), (1, 1))
+            a = self.read_file()['books']['uuid-a']
+            self.assertEqual((a['value'], a['applied_value']), (False, False))
+            self.assertGreaterEqual(parse_iso(a['applied_at']), self.v('last_modified', 1))
 
     class WriteBackTests(Base):
         '''1.2.4: a calibre edit made after the plugin applied a phone entry, before the

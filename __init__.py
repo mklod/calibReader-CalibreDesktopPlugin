@@ -1,4 +1,4 @@
-# Last modified: 2026-10-22--2048
+# Last modified: 2026-10-22--2056
 #
 # CalibReader Sync — Calibre plugin
 # Reads the sidecars the CalibReader apps keep in the Calibre library folder
@@ -53,7 +53,8 @@
 # "Create column…" through calibre's dialog). Saved as "read_column" in the
 # library's metadata.db preferences, which the apps (1.0.1+) follow; a missing or
 # non-Yes/No choice falls back to #read_status with a note. The read-flag memory
-# is kept per column. Each entry the plugin applies is stamped with
+# is kept per column, and an empty read cell takes the app's mark whatever its age
+# (a filled one keeps the usual rules). Each entry the plugin applies is stamped with
 # "applied_value" + "applied_at" in CalibReader_sync.json, so the app can tell a
 # later calibre edit from the plugin's own write (sync_core.update_sync_file).
 #
