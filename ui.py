@@ -1,4 +1,4 @@
-# Last modified: 2026-10-21--2257
+# Last modified: 2026-10-22--2048
 #
 # CalibReader Sync — the toolbar action (GUI only).
 # calibre imports this module only in its main window, through
@@ -12,6 +12,10 @@
 # every 5 minutes). Automatic runs never pop up a dialog: they put one short line
 # in the status bar, and say nothing at all when nothing changed. Settings has
 # the switch (on by default, stored with the library).
+#
+# v1.3.0: read status goes into the column picked in Settings; the plugin keeps
+# its read-flag memory per column ('applied' for #read_status as before,
+# 'applied_cols' for the others; sync_core.flag_blobs_from_prefs).
 #
 # Copyright (C) 2026 CalibReader
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU General
@@ -34,21 +38,25 @@ import os
 # used when the module is exercised from this folder directly.
 try:
     from calibre_plugins.calibreader_sync.sync_core import (
-        POSITIONS_FILE, SETTINGS_KEY, SYNC_FILE, normalise_settings, run_sync,
+        POSITIONS_FILE, SETTINGS_KEY, SYNC_FILE, flag_blobs_from_prefs, flag_blobs_to_prefs,
+        normalise_settings, run_sync,
     )
 except ImportError:  # pragma: no cover - standalone / test import
     from sync_core import (
-        POSITIONS_FILE, SETTINGS_KEY, SYNC_FILE, normalise_settings, run_sync,
+        POSITIONS_FILE, SETTINGS_KEY, SYNC_FILE, flag_blobs_from_prefs, flag_blobs_to_prefs,
+        normalise_settings, run_sync,
     )
 
 # Per-book bookkeeping lives in the plugin's OWN prefs, never in the user's
 # library: adding a column to someone's library to track sync state is not
 # ours to do, and this file has to survive switching libraries anyway.
-# 'applied' is the read flag's record, 'applied_pos' reading progress's.
+# 'applied' is the read flag's record for #read_status, 'applied_cols' the
+# records for any other read column (1.3.0), 'applied_pos' reading progress's.
 AUTO_DELAY_MS = 4000            # after calibre starts or a library opens
 POLL_MS = 5 * 60 * 1000         # how often the sync files are checked for changes
 PREFS = JSONConfig('plugins/calibreader_sync')
 PREFS.defaults['applied'] = {}
+PREFS.defaults['applied_cols'] = {}
 PREFS.defaults['applied_pos'] = {}
 
 
@@ -134,14 +142,15 @@ class CalibReaderSyncAction(InterfaceAction):
                 self.gui.status_bar.show_message('CalibReader Sync: ' + line, 10000)
 
     def _run(self, api, settings):
-        res, flag_blob, pos_blob = run_sync(
+        res, flag_blobs, pos_blob = run_sync(
             api, self.gui.library_path, settings,
-            PREFS.get('applied', {}), PREFS.get('applied_pos', {}))
+            flag_blobs_from_prefs(PREFS.get('applied', {}), PREFS.get('applied_cols', {})),
+            PREFS.get('applied_pos', {}))
         if res.found_any_file:
             # Assignment is what commits a JSONConfig. Stored even when nothing was
             # written: a RECORD verdict must persist so a retired entry is never
             # reconsidered.
-            PREFS['applied'] = flag_blob
+            PREFS['applied'], PREFS['applied_cols'] = flag_blobs_to_prefs(flag_blobs)
             PREFS['applied_pos'] = pos_blob
             if res.columns_written:
                 self.gui.library_view.model().refresh()

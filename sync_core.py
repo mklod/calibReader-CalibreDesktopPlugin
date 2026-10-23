@@ -1,16 +1,19 @@
-# Last modified: 2026-10-21--2257
+# Last modified: 2026-10-22--2048
 #
 # sync_core.py — one sync run, without the GUI.
 #
 # Reads the two sidecars the CalibReader apps keep in the library folder and
 # writes what wins into calibre:
-#   CalibReader_sync.json      -> the read flag (#read_status, Yes/No)
+#   CalibReader_sync.json      -> the read flag, into a Yes/No column the user
+#                                 picked (1.3.0; #read_status by default)
 #   CalibReader_positions.json -> % read and last-read date, into columns the
-#                                 user picked (plugin settings, stored in the
-#                                 library's own metadata.db preferences)
-# From the app to calibre, plus one write the other way (1.2.4): when a calibre
-# edit of the read flag beats a phone entry, calibre's value goes into
-# CalibReader_sync.json (write_back_flags) so the app follows it.
+#                                 user picked
+# The choices are plugin settings, stored in the library's own metadata.db
+# preferences. From the app to calibre, plus two writes into
+# CalibReader_sync.json (update_sync_file): when a calibre edit of the read flag
+# beats a phone entry, calibre's value (1.2.4), so the app follows it; and on
+# each entry the plugin applies, `applied_value` + `applied_at` (1.3.0), so the
+# app can tell a later calibre edit from the plugin's own write.
 # CalibReader_positions.json is never written.
 #
 # Like sidecar_merge.py this imports nothing from calibre. `db` is anything
@@ -34,14 +37,16 @@ import re
 
 try:
     from calibre_plugins.calibreader_sync.sidecar_merge import (
-        APPLY, NOT_SEEN, RECORD, UTC, Target, decide_flag, format_iso, last_read_value,
-        load_applied, load_flag_records, parse_iso, parse_positions, parse_sidecar,
+        APPLY, KEY_APPLIED_AT, KEY_APPLIED_VALUE, KEY_UPDATED_AT, KEY_VALUE, NOT_SEEN, RECORD,
+        UTC, Target, ceil_ms, decide_flag, format_iso, last_read_value, load_applied,
+        load_flag_records, load_pending_stamps, parse_iso, parse_positions, parse_sidecar,
         percent_for_column, plan, refresh_lm, store_applied, store_flag_record, writeback_for,
     )
 except ImportError:  # pragma: no cover - standalone / test import
     from sidecar_merge import (
-        APPLY, NOT_SEEN, RECORD, UTC, Target, decide_flag, format_iso, last_read_value,
-        load_applied, load_flag_records, parse_iso, parse_positions, parse_sidecar,
+        APPLY, KEY_APPLIED_AT, KEY_APPLIED_VALUE, KEY_UPDATED_AT, KEY_VALUE, NOT_SEEN, RECORD,
+        UTC, Target, ceil_ms, decide_flag, format_iso, last_read_value, load_applied,
+        load_flag_records, load_pending_stamps, parse_iso, parse_positions, parse_sidecar,
         percent_for_column, plan, refresh_lm, store_applied, store_flag_record, writeback_for,
     )
 import datetime as _dt
@@ -51,18 +56,21 @@ import uuid as _uuid
 SYNC_FILE = 'CalibReader_sync.json'
 POSITIONS_FILE = 'CalibReader_positions.json'
 
-READ_COLUMN = '#read_status'
+READ_COLUMN = '#read_status'        # the default read column (the only one before 1.3.0)
 
 # --- settings (library metadata.db preferences) ------------------------------
 #
 # Stored with db.set_pref(SETTINGS_KEY, {...}) so they travel with the library
 # to every computer and every phone that opens it. Schema:
-#   {"version": 1, "percent_column": "#read_percent" | "",
-#    "last_read_column": "#last_read" | "", "progress_threshold": 1}
+#   {"version": 1, "read_column": "#read_status",
+#    "percent_column": "#read_percent" | "", "last_read_column": "#last_read" | "",
+#    "progress_threshold": 1, "auto_sync": true}
 # "" means "don't sync". `version` is present once the user has saved the
 # dialog; until then the dialog may pre-select a suggested column.
-# Reserved for a later release: "read_column" (the read flag's column, which
-# the apps must learn to follow before the plugin can let users change it).
+# "read_column" (1.3.0): the read flag's Yes/No column, a lookup name with '#'.
+# Missing or malformed means #read_status. If the column is missing from the
+# library or is not Yes/No, the sync uses #read_status instead and says so; the
+# apps (1.0.1 and later) read the same key and fall back the same way.
 
 SETTINGS_KEY = 'calibreader_sync'
 SETTINGS_VERSION = 1
@@ -71,6 +79,8 @@ MAX_THRESHOLD = 50
 
 PERCENT_TYPES = ('int', 'float')
 DATE_TYPES = ('datetime',)
+READ_TYPES = ('bool',)
+_KIND_TYPES = {'percent': PERCENT_TYPES, 'last_read': DATE_TYPES, 'read': READ_TYPES}
 
 _LOOKUP_RE = re.compile(r'^#[a-z][a-z0-9_]*$')
 
@@ -82,6 +92,7 @@ def normalise_settings(raw):
     raw = raw if isinstance(raw, dict) else {}
     out = {
         'version': raw.get('version') if isinstance(raw.get('version'), int) else None,
+        'read_column': READ_COLUMN,     # 1.3.0
         'percent_column': '',
         'last_read_column': '',
         'progress_threshold': DEFAULT_THRESHOLD,
@@ -89,7 +100,7 @@ def normalise_settings(raw):
     }
     if isinstance(raw.get('auto_sync'), bool):
         out['auto_sync'] = raw['auto_sync']
-    for key in ('percent_column', 'last_read_column'):
+    for key in ('read_column', 'percent_column', 'last_read_column'):
         value = raw.get(key)
         if isinstance(value, str) and _LOOKUP_RE.match(value):
             out[key] = value
@@ -99,9 +110,11 @@ def normalise_settings(raw):
     return out
 
 
-def settings_to_store(percent_column, last_read_column, progress_threshold, auto_sync=True):
+def settings_to_store(percent_column, last_read_column, progress_threshold, auto_sync=True,
+                      read_column=READ_COLUMN):
     return normalise_settings({
         'version': SETTINGS_VERSION,
+        'read_column': read_column or READ_COLUMN,
         'percent_column': percent_column or '',
         'last_read_column': last_read_column or '',
         'progress_threshold': progress_threshold,
@@ -111,8 +124,8 @@ def settings_to_store(percent_column, last_read_column, progress_threshold, auto
 
 def eligible_columns(custom_columns, kind):
     '''[(lookup, heading)] of the custom columns that can hold `kind`
-    ('percent' or 'last_read'), sorted by heading.'''
-    types = PERCENT_TYPES if kind == 'percent' else DATE_TYPES
+    ('percent', 'last_read' or 'read'), sorted by heading.'''
+    types = _KIND_TYPES[kind]
     out = []
     for lookup, meta in (custom_columns or {}).items():
         if not isinstance(meta, dict) or meta.get('datatype') not in types:
@@ -144,55 +157,140 @@ def suggest_column(custom_columns, kind):
     return ''
 
 
-# --- a read column the user already has (v1.2.2) -----------------------------
+# --- the read column (1.3.0) ---------------------------------------------------
 #
 # Many libraries already track read status in their own Yes/No column (#read,
-# #finished, KOReader Sync's #ko_statusbool). The apps read #read_status only,
-# until a later release lets the user choose a column and the apps follow that
-# choice. Until then, when #read_status is missing, the plugin names the column
-# it found and explains how to copy it over once with calibre's bulk edit.
-# Search terms are :yes / :no, never :true / :false: on a Yes/No column
-# ":true" matches every book with a value, No included (calibre manual).
+# #finished, KOReader Sync's #ko_statusbool). From 1.3.0 the user picks the read
+# column in Settings ("read_column"), and the apps follow the same choice. Until
+# the user has chosen, Settings offers #read_status if the library has it, else
+# the existing column that looks most like a read flag. Nothing is ever picked
+# without the user clicking OK in Settings.
 
 _READ_FLAG_RE = re.compile(r'read|finish|done|complete|statusbool', re.I)
 _NOT_READ_RE = re.compile(r'unread|not.?read|to.?read|want|tbr|wish', re.I)
+# Most likely first: "#read", a heading "Read" / "Have read", then finished, done...
+_READ_RANK = [re.compile(p, re.I) for p in (
+    r'^#read$', r'^read$|have.?read', r'finish', r'done', r'complete', r'read', r'statusbool')]
 
 
-def existing_read_columns(custom_columns):
-    '''[(lookup, heading)] of Yes/No columns, other than #read_status, whose
-    lookup name or heading looks like a read flag (not "unread" / "to read").'''
+def _read_rank(lookup, heading):
+    for rank, rx in enumerate(_READ_RANK):
+        if rx.search(lookup) or rx.search(heading):
+            return rank
+    return len(_READ_RANK)
+
+
+def existing_read_columns(custom_columns, exclude=READ_COLUMN):
+    '''[(lookup, heading)] of Yes/No columns, other than `exclude` (one lookup name
+    or several), whose lookup name or heading looks like a read flag (not "unread"
+    / "to read"), the most likely first.'''
+    excluded = (exclude,) if isinstance(exclude, str) else tuple(exclude or ())
     out = []
     for lookup, meta in (custom_columns or {}).items():
-        if lookup == READ_COLUMN or not isinstance(meta, dict) or meta.get('datatype') != 'bool':
+        if lookup in excluded or not isinstance(meta, dict) or meta.get('datatype') != 'bool':
             continue
         heading = meta.get('name') or lookup
         names = lookup + ' ' + heading
         if _READ_FLAG_RE.search(names) and not _NOT_READ_RE.search(names):
             out.append((lookup, heading))
-    return sorted(out, key=lambda x: (x[0] != '#read', x[1].lower(), x[0]))
+    return sorted(out, key=lambda x: (_read_rank(*x), x[1].lower(), x[0]))
 
 
-def read_column_copy_hint(custom_columns):
-    '''Plain-English steps to copy an existing read column into #read_status
-    once, or "" when the library has no such column.'''
+def suggest_read_column(custom_columns):
+    '''The read column Settings offers before the user has chosen one: #read_status
+    if the library has it as Yes/No, else the likeliest existing read column, else
+    #read_status (to be created).'''
+    meta = (custom_columns or {}).get(READ_COLUMN)
+    if isinstance(meta, dict) and meta.get('datatype') in READ_TYPES:
+        return READ_COLUMN
     cols = existing_read_columns(custom_columns)
+    return cols[0][0] if cols else READ_COLUMN
+
+
+def read_column_hint(custom_columns, exclude=READ_COLUMN, where='in Settings'):
+    '''One short line naming the library's own read column(s), or "".'''
+    cols = existing_read_columns(custom_columns, exclude)
     if not cols:
         return ''
     lookup, heading = cols[0]
     also = ''
     if len(cols) > 1:
         also = ' (also: {})'.format(', '.join('{} ({})'.format(h, l) for l, h in cols[1:]))
-    return (
-        'This library already has a Yes/No column that looks like a read flag: {heading} '
-        '({lookup}){also}. CalibReader uses {col} for now; choosing your own column is coming '
-        'in the next update. To copy yours over once:\n'
-        '1. Preferences > Add your own columns: lookup name read_status, type Yes/No. '
-        'Restart calibre.\n'
-        '2. Search for {lookup}:yes and select all the books. Right-click Edit metadata and '
-        'choose Edit metadata in bulk. On the Custom metadata tab set Read Status to Yes, '
-        'tick Apply changes, then OK.\n'
-        '3. Do the same with {lookup}:no and No.'
-    ).format(heading=heading, lookup=lookup, also=also, col=READ_COLUMN)
+    return ('This library already has a Yes/No column that looks like a read flag: {} ({}){}. '
+            'To use it, pick it as the read status column {}.').format(heading, lookup, also, where)
+
+
+def _a_type(datatype):
+    datatype = str(datatype)
+    return '{} {} column'.format('an' if datatype[:1] in 'aeiou' else 'a', datatype)
+
+
+def _column_problem(custom_columns, lookup):
+    '''Why `lookup` can't hold the read flag, or None when it can.'''
+    meta = custom_columns.get(lookup)
+    if not isinstance(meta, dict):
+        return 'does not exist (restart calibre if you just created it)'
+    if meta.get('datatype') not in READ_TYPES:
+        return 'is {}, not Yes/No'.format(_a_type(meta.get('datatype')))
+    return None
+
+
+def resolve_read_column(custom_columns, chosen):
+    '''(column to write, [notes]). The chosen column when it is a Yes/No column of
+    this library; otherwise #read_status, as the apps do, with a note saying so;
+    None (with a note) when there is no usable column at all.'''
+    custom_columns = custom_columns or {}
+    notes = []
+    if chosen and chosen != READ_COLUMN:
+        why = _column_problem(custom_columns, chosen)
+        if why is None:
+            return chosen, notes
+        fallback = _column_problem(custom_columns, READ_COLUMN)
+        if fallback is None:
+            notes.append('Read status went into {} instead: the column chosen in Settings, {}, '
+                         '{}.'.format(READ_COLUMN, chosen, why))
+            return READ_COLUMN, notes
+        notes.append('Read status was not synced: the column chosen in Settings, {}, {}; and '
+                     '{}, used instead, {}. Pick a Yes/No column in Settings.'.format(
+                         chosen, why, READ_COLUMN, fallback))
+        return None, notes
+    meta = custom_columns.get(READ_COLUMN)
+    if not isinstance(meta, dict):
+        notes.append('Read status was not synced: this library has no {} column. In Settings '
+                     '(the arrow next to Sync Read Status), pick the Yes/No column you use for '
+                     'read status, or create one there.'.format(READ_COLUMN))
+        hint = read_column_hint(custom_columns)
+        if hint:
+            notes.append(hint)
+        return None, notes
+    if meta.get('datatype') not in READ_TYPES:
+        notes.append('Read status was not synced: {} is {}, and it needs to be Yes/No. Pick a '
+                     'Yes/No column in Settings.'.format(READ_COLUMN, _a_type(meta.get('datatype'))))
+        return None, notes
+    return READ_COLUMN, notes
+
+
+# The read flag's per-book memory (sidecar_merge's records) is kept PER COLUMN
+# (1.3.0): what the plugin last saw or applied in one column says nothing about
+# another, so switching columns starts the new one from a clean slate and leaves
+# the old one's memory for a switch back. In the plugin's prefs, #read_status
+# keeps the key 1.2.x used ('applied'); other columns go under 'applied_cols'.
+
+def flag_blobs_from_prefs(applied, applied_cols):
+    '''Plugin prefs -> {column: {uuid: record}} for run_sync.'''
+    blobs = {}
+    if isinstance(applied_cols, dict):
+        for column, blob in applied_cols.items():
+            if isinstance(column, str) and column != READ_COLUMN and isinstance(blob, dict):
+                blobs[column] = blob
+    blobs[READ_COLUMN] = applied if isinstance(applied, dict) else {}
+    return blobs
+
+
+def flag_blobs_to_prefs(blobs):
+    '''{column: {uuid: record}} -> (applied, applied_cols) for the plugin prefs.'''
+    blobs = dict(blobs or {})
+    return blobs.pop(READ_COLUMN, {}), blobs
 
 
 # --- one run ------------------------------------------------------------------
@@ -206,6 +304,8 @@ class SyncResult(object):
         self.flags_updated = 0
         self.flags_skipped = 0
         self.flags_sent_back = 0       # 1.2.4: calibre edits written back for the app
+        self.flags_stamped = 0         # 1.3.0: applied entries stamped applied_value / applied_at
+        self.read_column = None        # 1.3.0: the column read status went into this run
         self.progress_updated = 0
         self.progress_skipped = 0
         self.below_threshold = 0
@@ -223,7 +323,9 @@ class SyncResult(object):
         or "" when nothing changed and nothing needs attention (a quiet run).'''
         parts = []
         if self.flags_updated:
-            parts.append('{} read status'.format(self.flags_updated))
+            column = (' ({})'.format(self.read_column)
+                      if self.read_column and self.read_column != READ_COLUMN else '')
+            parts.append('{} read status{}'.format(self.flags_updated, column))
         if self.progress_updated:
             parts.append('{} reading progress'.format(self.progress_updated))
         if self.flags_sent_back:
@@ -236,7 +338,8 @@ class SyncResult(object):
     def summary(self):
         lines = []
         if self.found_sync_file:
-            lines.append('Read status: {} book(s) updated.'.format(self.flags_updated))
+            column = ' ({})'.format(self.read_column) if self.read_column else ''
+            lines.append('Read status{}: {} book(s) updated.'.format(column, self.flags_updated))
         if self.found_positions_file and self.progress_columns:
             lines.append('Reading progress: {} book(s) updated.'.format(self.progress_updated))
         skipped = self.flags_skipped + self.progress_skipped
@@ -286,38 +389,62 @@ def _norm_date(value):
     return None if dt is None else dt.astimezone(UTC).replace(microsecond=0)
 
 
-def write_back_flags(library_path, writebacks):
-    '''(1.2.4) Put calibre's newer read values into CalibReader_sync.json, following
-    the apps' sidecar protocol (docs/PARITY.md, 2026-10-13): re-read the file right
-    before writing and write only if it parses cleanly; replace only these books'
-    entries, and only when ours is strictly newer; never remove a key; never touch
-    the file-level updated_at (legacy bare entries inherit it); write a temp file
-    and rename it in, with the backup swap when rename-over is refused.
-    `writebacks` = {uuid: (value, stamp)}. Returns ({uuid: stamp written}, note).'''
+def update_sync_file(library_path, writebacks=None, applied=None):
+    '''Write into CalibReader_sync.json, following the apps' sidecar protocol
+    (docs/PARITY.md, 2026-10-13): re-read the file right before writing and write
+    only if it parses cleanly; touch only these books' entries; never remove a key;
+    never touch the file-level updated_at (legacy bare entries inherit it); write a
+    temp file and rename it in, with the backup swap when rename-over is refused.
+
+    writebacks (1.2.4) = {uuid: (value, stamp)}: calibre's newer read values. The
+        entry is replaced, only when ours is strictly newer.
+    applied (1.3.0) = {uuid: (value, entry_stamp, applied_at)}: entries this plugin
+        wrote into calibre. `applied_value` and `applied_at` are added to the entry,
+        all its other keys kept, only while the file still holds that same entry
+        (same value and stamp) as an object; a legacy bare bool is left alone.
+
+    Returns ({uuid: stamp written back}, {uuid: applied_at stamped}, failed, note);
+    `failed` is True when the file could not be read or written this time.'''
     path = os.path.join(library_path, SYNC_FILE)
+    writebacks, applied = writebacks or {}, applied or {}
     retry = ('Read status set in calibre could not be passed back to the app this time '
              '({}); it will be tried again next sync.')
-    if not writebacks or not os.path.exists(path):
-        return {}, None
+
+    def failure(why):
+        return {}, {}, True, (retry.format(why) if writebacks else None)
+
+    if not (writebacks or applied) or not os.path.exists(path):
+        return {}, {}, False, None
     try:
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
     except Exception:
-        return {}, retry.format('the file is being written, or damaged')
+        return failure('the file is being written, or damaged')
     books = data.get('books') if isinstance(data, dict) else None
     if not isinstance(books, dict):
-        return {}, retry.format('the file has no books table')
+        return failure('the file has no books table')
     current = parse_sidecar(data)
     keys = {k.lower(): k for k in books if isinstance(k, str)}
-    written = {}
+    written, stamped, dirty = {}, {}, False
     for uuid, (value, stamp) in writebacks.items():
         have = current.get(uuid)
         if have is not None and have.stamp is not None and have.stamp >= stamp:
             continue                        # someone wrote a newer entry meanwhile
-        books[keys.get(uuid, uuid)] = {'value': bool(value), 'updated_at': format_iso(stamp)}
+        books[keys.get(uuid, uuid)] = {KEY_VALUE: bool(value), KEY_UPDATED_AT: format_iso(stamp)}
         written[uuid] = stamp
-    if not written:
-        return {}, None
+        dirty = True
+    for uuid, (value, entry_stamp, at) in applied.items():
+        have, raw = current.get(uuid), books.get(keys.get(uuid))
+        if (uuid in written or have is None or not isinstance(raw, dict) or have.value != bool(value)
+                or format_iso(have.stamp) != format_iso(entry_stamp)):
+            continue                        # replaced or removed meanwhile, or a bare bool
+        want = {KEY_APPLIED_VALUE: bool(value), KEY_APPLIED_AT: format_iso(at)}
+        if any(raw.get(k) != v for k, v in want.items()):
+            raw.update(want)
+            dirty = True
+        stamped[uuid] = at
+    if not dirty:
+        return written, stamped, False, None
     tmp = '{}.crtmp.{}'.format(path, _uuid.uuid4().hex)
     try:
         with open(tmp, 'w', encoding='utf-8', newline='\n') as f:
@@ -336,16 +463,25 @@ def write_back_flags(library_path, writebacks):
                 os.remove(tmp)
             except OSError:
                 pass
-        return {}, retry.format(exc)
-    return written, None
+        return failure(exc)
+    return written, stamped, False, None
 
 
-def run_sync(db, library_path, settings, flag_blob, pos_blob):
-    '''One sync. Returns (SyncResult, new_flag_blob, new_pos_blob); the blobs
-    are the plugin's per-book bookkeeping (see sidecar_merge), to be stored by
-    the caller. Nothing is written to calibre unless a rule says it may.'''
+def write_back_flags(library_path, writebacks):
+    '''(1.2.4) update_sync_file with write-backs only: ({uuid: stamp written}, note).'''
+    written, _, _, note = update_sync_file(library_path, writebacks)
+    return written, note
+
+
+def run_sync(db, library_path, settings, flag_blobs, pos_blob):
+    '''One sync. Returns (SyncResult, new_flag_blobs, new_pos_blob); these are the
+    plugin's per-book bookkeeping (see sidecar_merge), to be stored by the caller.
+    `flag_blobs` = {read column: {uuid: record}} (flag_blobs_from_prefs); only the
+    blob of the column used this run is read or changed. Nothing is written to
+    calibre unless a rule says it may.'''
     settings = normalise_settings(settings)
-    flag_blob = dict(flag_blob or {})
+    flag_blobs = {c: dict(b) for c, b in (flag_blobs or {}).items() if isinstance(b, dict)}
+    flag_blob = {}
     pos_blob = dict(pos_blob or {})
     res = SyncResult()
 
@@ -363,22 +499,11 @@ def run_sync(db, library_path, settings, flag_blob, pos_blob):
     # Which columns may be written this run.
     flag_col = None
     if flags_data is not None:
-        meta = custom.get(READ_COLUMN)
-        if meta is None:
-            res.notes.append(
-                'Read status was not synced: this library has no {0} column. Create it in '
-                'calibre: Preferences > Add your own columns, lookup name read_status, type '
-                'Yes/No, then restart calibre.'.format(READ_COLUMN))
-            hint = read_column_copy_hint(custom)
-            if hint:
-                res.notes.append(hint)
-        elif meta.get('datatype') != 'bool':
-            res.notes.append(
-                'Read status was not synced: {} is {} {} column, and it needs to be '
-                'Yes/No.'.format(READ_COLUMN, 'an' if str(meta.get('datatype'))[:1] in 'aeiou' else 'a',
-                                 meta.get('datatype')))
-        else:
-            flag_col = READ_COLUMN
+        flag_col, notes = resolve_read_column(custom, settings['read_column'])
+        res.notes.extend(notes)
+        res.read_column = flag_col
+        if flag_col:
+            flag_blob = flag_blobs.get(flag_col, {})
 
     pct_col = last_col = None
     if pos_data is not None:
@@ -395,7 +520,7 @@ def run_sync(db, library_path, settings, flag_blob, pos_blob):
     res.progress_columns = [c for c in (pct_col, last_col) if c]
 
     if flag_col is None and not res.progress_columns:
-        return res, flag_blob, pos_blob
+        return res, flag_blobs, pos_blob
 
     uuid_to_id = {}
     for book_id in db.all_book_ids():
@@ -408,11 +533,12 @@ def run_sync(db, library_path, settings, flag_blob, pos_blob):
     # Read flags (1.2.3): a calibre-side edit of the flag is a change of its VALUE
     # since the last run (sidecar_merge.decide_flag), so every book's value is
     # remembered, not only the books with a phone entry.
-    flag_updates, flag_records, flag_state, writebacks = {}, {}, {}, {}
+    flag_updates, flag_records, flag_state, writebacks, pending = {}, {}, {}, {}, {}
     now = _dt.datetime.now(UTC)
     if flag_col:
         entries = parse_sidecar(flags_data)
         records = load_flag_records(flag_blob)
+        pending = {u: p for u, p in load_pending_stamps(flag_blob).items() if u in uuid_to_id}
         skipped = []
         for uuid, book_id in uuid_to_id.items():
             value = db.field_for(flag_col, book_id)
@@ -494,8 +620,17 @@ def run_sync(db, library_path, settings, flag_blob, pos_blob):
     # Bookkeeping, with each book's last_modified as it stands after ALL writes.
     written = set(flag_updates) | set(pos_updates)
     lm_after = {u: _lm(db, uuid_to_id[u]) for u in set(flag_records) | set(pos_records) | written}
-    sent, note = write_back_flags(library_path, writebacks)
-    res.flags_sent_back = len(sent)
+    # 1.3.0: each entry applied above gets applied_value + applied_at in the sync
+    # file: the book's last_modified after ALL our writes, rounded up to the ms, so
+    # only a later calibre edit can be newer. Stamps an earlier run could not write
+    # (`pending`) are tried again; they stay pending only while the file fails.
+    stamps = dict(pending)
+    for uuid in flag_updates:
+        entry = flag_records[uuid]
+        stamps[uuid] = (entry.value, entry.stamp, ceil_ms(lm_after.get(uuid) or _dt.datetime.now(UTC)))
+    sent, stamped, failed, note = update_sync_file(library_path, writebacks, stamps)
+    res.flags_sent_back, res.flags_stamped = len(sent), len(stamped)
+    keep = stamps if failed else {}
     if note:
         res.notes.append(note)
     for uuid, (stamp, lm, dt) in flag_state.items():
@@ -503,8 +638,9 @@ def run_sync(db, library_path, settings, flag_blob, pos_blob):
             stamp, lm = flag_records[uuid].stamp, lm_after[uuid]
         elif uuid in sent:
             stamp = sent[uuid]              # our own entry: never re-decided as a phone change
-        now = db.field_for(flag_col, uuid_to_id[uuid])
-        store_flag_record(flag_blob, uuid, stamp, lm, None if now is None else bool(now), dt)
+        value = db.field_for(flag_col, uuid_to_id[uuid])
+        store_flag_record(flag_blob, uuid, stamp, lm, None if value is None else bool(value), dt,
+                          keep.get(uuid))
     for uuid, entry in pos_records.items():
         store_applied(pos_blob, uuid, entry.stamp, lm_after[uuid])
     # Our write for one kind of entry must not look like a desktop edit to the other.
@@ -513,7 +649,9 @@ def run_sync(db, library_path, settings, flag_blob, pos_blob):
             refresh_lm(flag_blob, uuid, lm_before.get(uuid), lm_after[uuid])
         if uuid not in pos_records:
             refresh_lm(pos_blob, uuid, lm_before.get(uuid), lm_after[uuid])
-    return res, flag_blob, pos_blob
+    if flag_col:
+        flag_blobs[flag_col] = flag_blob
+    return res, flag_blobs, pos_blob
 
 
 # ---------------------------------------------------------------------------
@@ -593,7 +731,7 @@ if __name__ == '__main__':  # pragma: no cover
         def setUp(self):
             self.dir = tempfile.mkdtemp()
             self.db = FakeDB(COLS, {1: 'uuid-a', 2: 'uuid-b', 3: 'uuid-c'})
-            self.flag_blob, self.pos_blob = {}, {}
+            self.flag_blobs, self.pos_blob = {}, {}
 
         def tearDown(self):
             shutil.rmtree(self.dir)
@@ -609,9 +747,17 @@ if __name__ == '__main__':  # pragma: no cover
             self.write(SYNC_FILE, {'schema': 1, 'updated_at': stamp(1), 'books': entries})
 
         def sync(self, settings=SETTINGS):
-            res, self.flag_blob, self.pos_blob = run_sync(
-                self.db, self.dir, settings, self.flag_blob, self.pos_blob)
+            res, self.flag_blobs, self.pos_blob = run_sync(
+                self.db, self.dir, settings, self.flag_blobs, self.pos_blob)
             return res
+
+        def read_file(self):
+            with open(os.path.join(self.dir, SYNC_FILE), encoding='utf-8') as f:
+                return json.load(f)
+
+        def file_bytes(self):
+            with open(os.path.join(self.dir, SYNC_FILE), 'rb') as f:
+                return f.read()
 
         def v(self, name, book_id):
             return self.db.field_for(name, book_id)
@@ -762,22 +908,21 @@ if __name__ == '__main__':  # pragma: no cover
             self.assertEqual(res.flags_updated, 2)
             self.assertEqual(self.sync().flags_updated, 0)
 
-        def test_missing_read_column_explains_copying_an_existing_one(self):
+        def test_missing_read_column_points_to_an_existing_one_in_settings(self):
             custom = {k: v for k, v in COLS.items() if k != '#read_status'}
             custom['#read'] = {'datatype': 'bool', 'name': 'Read'}
             custom['#finished'] = {'datatype': 'bool', 'name': 'Finished'}
             self.db.field_metadata = FakeFieldMetadata(custom)
             self.flags(**{'uuid-a': True})
             res = self.sync()
-            self.assertIsNone(self.v('#read', 1))            # never written
+            self.assertIsNone(self.v('#read', 1))            # never written unless chosen
             self.assertEqual(len(res.notes), 2)
+            self.assertIn('pick the Yes/No column you use', res.notes[0])
             hint = res.notes[1]
             self.assertIn('Read (#read)', hint)
             self.assertIn('also: Finished (#finished)', hint)
-            self.assertIn('#read:yes', hint)
-            self.assertIn('#read:no', hint)
-            self.assertNotIn(':true', hint)
-            self.assertIn('next update', hint)
+            self.assertIn('pick it as the read status column in Settings', hint)
+            self.assertNotIn('#read:yes', hint)              # the 1.2.2 copy steps are gone
 
         def test_no_hint_without_a_likely_column(self):
             custom = {k: v for k, v in COLS.items() if k != '#read_status'}
@@ -788,7 +933,7 @@ if __name__ == '__main__':  # pragma: no cover
             self.flags(**{'uuid-a': True})
             res = self.sync()
             self.assertEqual(len(res.notes), 1)
-            self.assertEqual(read_column_copy_hint(custom), '')
+            self.assertEqual(read_column_hint(custom), '')
 
         def test_existing_read_columns(self):
             cols = {'#read_status': {'datatype': 'bool', 'name': 'Read Status'},
@@ -853,20 +998,17 @@ if __name__ == '__main__':  # pragma: no cover
             self.assertEqual(res.flags_updated, 0)
 
         def test_upgrade_from_122_records_keeps_the_old_rule_once(self):
-            self.flag_blob = {'uuid-a': {'stamp': stamp(1), 'lm': '2026-10-01T12:00:00.123Z'}}
+            self.flag_blobs = flag_blobs_from_prefs(
+                {'uuid-a': {'stamp': stamp(1), 'lm': '2026-10-01T12:00:00.123Z'}}, None)
             self.db.values[('#read_status', 1)] = True
             self.flags(**{'uuid-a': {'value': False, 'updated_at': stamp(4)}})
             res = self.sync()
             self.assertIs(self.v('#read_status', 1), False)
-            self.assertIn('val', self.flag_blob['uuid-a'])
+            self.assertIn('val', self.flag_blobs['#read_status']['uuid-a'])
 
     class WriteBackTests(Base):
         '''1.2.4: a calibre edit made after the plugin applied a phone entry, before the
         phone synced again, is passed back through the sync file so both sides agree.'''
-
-        def read_file(self):
-            with open(os.path.join(self.dir, SYNC_FILE), encoding='utf-8') as f:
-                return json.load(f)
 
         def test_calibre_edit_after_apply_is_written_back_once(self):
             self.flags(**{'uuid-a': {'value': False, 'updated_at': stamp(2)}, 'uuid-b': True})
@@ -879,13 +1021,14 @@ if __name__ == '__main__':  # pragma: no cover
             self.assertIs(self.v('#read_status', 1), True)     # calibre's later edit stands
             self.assertEqual(res.flags_sent_back, 1)
             doc = self.read_file()
+            # replaced whole: the earlier apply's applied_* stamps go with the old entry
             self.assertEqual(doc['books']['uuid-a'], {'value': True, 'updated_at': edited_at})
             self.assertIs(doc['books']['uuid-b'], True)        # other keys untouched (bare bool kept)
             self.assertEqual(doc['updated_at'], stamp(1))      # file-level stamp untouched
-            before = open(os.path.join(self.dir, SYNC_FILE), 'rb').read()
+            before = self.file_bytes()
             res = self.sync()                                  # stable: nothing more to do
             self.assertEqual((res.flags_updated, res.flags_sent_back), (0, 0))
-            self.assertEqual(open(os.path.join(self.dir, SYNC_FILE), 'rb').read(), before)
+            self.assertEqual(self.file_bytes(), before)
             self.assertFalse([f for f in os.listdir(self.dir) if '.crtmp.' in f or '.crbak.' in f])
 
         def test_no_write_back_when_calibre_cleared_the_flag(self):
@@ -920,7 +1063,198 @@ if __name__ == '__main__':  # pragma: no cover
             with open(os.path.join(self.dir, SYNC_FILE), encoding='utf-8') as f:
                 self.assertTrue(f.read().endswith('tr'))
 
+    class ReadColumnTests(Base):
+        '''1.3.0: the user picks the read column; the memory is kept per column.'''
+
+        CUSTOM = dict(COLS, **{'#read': {'datatype': 'bool', 'name': 'Have read'},
+                               '#finished': {'datatype': 'datetime', 'name': 'Finished'}})
+
+        def setUp(self):
+            Base.setUp(self)
+            self.db.field_metadata = FakeFieldMetadata(self.CUSTOM)
+
+        def test_chosen_column_gets_the_read_flag(self):
+            self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(2)}, 'uuid-b': False})
+            res = self.sync(dict(SETTINGS, read_column='#read'))
+            self.assertIs(self.v('#read', 1), True)
+            self.assertIs(self.v('#read', 2), False)
+            self.assertIsNone(self.v('#read_status', 1))     # the default column is left alone
+            self.assertEqual((res.read_column, res.notes), ('#read', []))
+            self.assertIn('Read status (#read): 2 book(s) updated.', res.summary())
+            self.assertEqual(res.status_line(), 'updated 2 read status (#read).')
+            self.assertEqual(sorted(self.flag_blobs), ['#read'])
+
+        def test_non_bool_choice_falls_back_to_read_status_with_a_note(self):
+            self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(2)}})
+            res = self.sync(dict(SETTINGS, read_column='#finished'))
+            self.assertIs(self.v('#read_status', 1), True)
+            self.assertIsNone(self.v('#finished', 1))         # a Date column is never written
+            self.assertEqual(res.read_column, '#read_status')
+            self.assertEqual(len(res.notes), 1)
+            self.assertIn('went into #read_status instead', res.notes[0])
+            self.assertIn('#finished, is a datetime column, not Yes/No', res.notes[0])
+
+        def test_missing_choice_falls_back_and_says_restart(self):
+            self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(2)}})
+            res = self.sync(dict(SETTINGS, read_column='#done'))
+            self.assertIs(self.v('#read_status', 1), True)
+            self.assertIn('#done, does not exist (restart calibre', res.notes[0])
+
+        def test_no_usable_column_at_all_writes_nothing(self):
+            custom = {k: v for k, v in self.CUSTOM.items() if k != '#read_status'}
+            self.db.field_metadata = FakeFieldMetadata(custom)
+            self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(2)}})
+            res = self.sync(dict(SETTINGS, read_column='#genre'))
+            self.assertEqual([w for w in self.db.writes if w[0] in ('#genre', '#read_status')], [])
+            self.assertIsNone(res.read_column)
+            self.assertIn('was not synced', res.notes[0])
+            self.assertIn('#read_status, used instead, does not exist', res.notes[0])
+
+        def test_changing_the_read_column_does_not_carry_the_memory_over(self):
+            self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(2)}})
+            self.assertEqual(self.sync().flags_updated, 1)    # into #read_status
+            # The user picks #read (empty). With one shared memory the entry would be
+            # "already applied" and #read would never get it.
+            res = self.sync(dict(SETTINGS, read_column='#read'))
+            self.assertIs(self.v('#read', 1), True)
+            self.assertEqual(res.flags_updated, 1)
+            self.assertEqual(sorted(self.flag_blobs), ['#read', '#read_status'])
+            # ... and #read's memory does not leak back: a calibre edit of #read_status
+            # made meanwhile is still seen as one when the user switches back.
+            self.db.clock = datetime.datetime(2026, 10, 5, 9, 0, 0, 1, tzinfo=UTC)
+            self.db.desktop_edit('#read_status', 1, False)
+            self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(4)}})   # older than the edit
+            res = self.sync()
+            self.assertIs(self.v('#read_status', 1), False)   # calibre's later edit stands
+            self.assertEqual((res.flags_updated, res.flags_sent_back), (0, 1))
+
+        def test_prefs_mapping_keeps_read_status_where_122_had_it(self):
+            blobs = flag_blobs_from_prefs({'u': {'stamp': None}}, {'#read': {'v': {}}, '#read_status': {'x': 1},
+                                                                  'bad': 3})
+            self.assertEqual(blobs, {'#read_status': {'u': {'stamp': None}}, '#read': {'v': {}}})
+            self.assertEqual(flag_blobs_to_prefs(blobs), ({'u': {'stamp': None}}, {'#read': {'v': {}}}))
+            self.assertEqual(flag_blobs_from_prefs(None, None), {'#read_status': {}})
+
+        def test_suggestions(self):
+            self.assertEqual(suggest_read_column(self.CUSTOM), '#read_status')   # it exists
+            no_rs = {k: v for k, v in self.CUSTOM.items() if k != '#read_status'}
+            self.assertEqual(suggest_read_column(no_rs), '#read')
+            self.assertEqual(suggest_read_column({}), '#read_status')
+            self.assertEqual([c for c, _ in eligible_columns(self.CUSTOM, 'read')], ['#read', '#read_status'])
+            cols = {'#fin': {'datatype': 'bool', 'name': 'Finished'},
+                    '#hr': {'datatype': 'bool', 'name': 'Have read'},
+                    '#is_done': {'datatype': 'bool', 'name': 'Done'}}
+            self.assertEqual([c for c, _ in existing_read_columns(cols)], ['#hr', '#fin', '#is_done'])
+            hint = read_column_hint(dict(cols, **self.CUSTOM), exclude=('#hr', '#read_status'), where='above')
+            self.assertIn('Have read (#read) (also: Finished (#fin), Done (#is_done))', hint)
+            self.assertTrue(hint.endswith('pick it as the read status column above.'))
+            self.assertNotIn('#hr', hint)
+
+    class AppliedStampTests(Base):
+        '''1.3.0 (bug 4): each entry the plugin applies gets applied_value + applied_at.'''
+
+        AT_RE = r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$'
+
+        def test_applied_entry_is_stamped_once_and_nothing_else_changes(self):
+            self.write(SYNC_FILE, {'schema': 1, 'updated_at': stamp(1), 'books': {
+                'UUID-A': {'value': True, 'updated_at': stamp(2), 'deviceId': 'phone-1'},
+                'uuid-b': False,                                          # legacy bare bool
+                'uuid-c': {'value': True, 'updated_at': stamp(2)},        # calibre already agrees
+                'uuid-z': {'value': True, 'updated_at': stamp(2)}}})      # not in this library
+            self.db.values[('#read_status', 3)] = True
+            self.positions(**{'uuid-a': {'progress': 0.5, 'updated_at': stamp(2)}})
+            res = self.sync()
+            self.assertEqual((res.flags_updated, res.flags_stamped), (2, 1))
+            doc = self.read_file()
+            a = doc['books']['UUID-A']
+            self.assertEqual(sorted(a), ['applied_at', 'applied_value', 'deviceId', 'updated_at', 'value'])
+            self.assertEqual((a['value'], a['updated_at'], a['deviceId'], a['applied_value']),
+                             (True, stamp(2), 'phone-1', True))
+            self.assertRegex(a['applied_at'], self.AT_RE)
+            # not earlier than the last_modified ALL our writes left (flag, then % and date)
+            lm = self.v('last_modified', 1)
+            self.assertGreaterEqual(parse_iso(a['applied_at']), lm)
+            self.assertLess(parse_iso(a['applied_at']) - lm, datetime.timedelta(milliseconds=1))
+            self.assertIs(doc['books']['uuid-b'], False)                 # bare bool kept as it was
+            self.assertEqual(doc['books']['uuid-c'], {'value': True, 'updated_at': stamp(2)})
+            self.assertEqual(doc['books']['uuid-z'], {'value': True, 'updated_at': stamp(2)})
+            self.assertEqual(doc['updated_at'], stamp(1))
+            before = self.file_bytes()
+            res = self.sync()                                            # nothing new: no write
+            self.assertEqual((res.flags_updated, res.flags_stamped), (0, 0))
+            self.assertEqual(self.file_bytes(), before)
+            self.assertFalse([f for f in os.listdir(self.dir) if '.crtmp.' in f or '.crbak.' in f])
+
+        def test_a_newer_phone_entry_is_stamped_afresh(self):
+            self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(2)}})
+            self.sync()
+            first = self.read_file()['books']['uuid-a']['applied_at']
+            self.db.tick(3600 * 24 * 3)
+            self.flags(**{'uuid-a': {'value': False, 'updated_at': stamp(6)}})   # the app rewrote it
+            self.sync()
+            a = self.read_file()['books']['uuid-a']
+            self.assertEqual((a['value'], a['applied_value']), (False, False))
+            self.assertGreater(parse_iso(a['applied_at']), parse_iso(first))
+
+        def test_entry_replaced_during_the_run_is_not_stamped(self):
+            self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(2)},
+                          'uuid-b': {'value': True, 'updated_at': stamp(2)}})
+            replaced = {'uuid-a': {'value': True, 'updated_at': stamp(3)},     # same value, newer
+                        'uuid-b': {'value': False, 'updated_at': stamp(2)}}    # other value
+            real_set_field = self.db.set_field
+
+            def set_field(name, mapping):                    # the phone writes while we sync
+                self.flags(**replaced)
+                return real_set_field(name, mapping)
+            self.db.set_field = set_field
+            res = self.sync()
+            self.assertIs(self.v('#read_status', 1), True)
+            self.assertEqual((res.flags_updated, res.flags_stamped), (2, 0))
+            self.assertEqual(self.read_file()['books'], replaced)
+
+        def test_a_stamp_the_file_could_not_take_is_written_next_run(self):
+            entry = {'value': True, 'updated_at': stamp(2)}
+            self.flags(**{'uuid-a': entry})
+            real_set_field = self.db.set_field
+
+            def set_field(name, mapping):                    # the cloud app is mid-write
+                with open(os.path.join(self.dir, SYNC_FILE), 'w') as f:
+                    f.write('{"schema": 1, "books": {"uuid-a": {"val')
+                return real_set_field(name, mapping)
+            self.db.set_field = set_field
+            res = self.sync()
+            self.db.set_field = real_set_field
+            self.assertEqual((res.flags_updated, res.flags_stamped, res.notes), (1, 0, []))
+            pending = load_pending_stamps(self.flag_blobs['#read_status'])
+            self.assertEqual(list(pending), ['uuid-a'])
+            self.flags(**{'uuid-a': entry})                  # the cloud app finished writing
+            res = self.sync()
+            self.assertEqual((res.flags_updated, res.flags_stamped), (0, 1))
+            a = self.read_file()['books']['uuid-a']
+            self.assertEqual(parse_iso(a['applied_at']), pending['uuid-a'][2])
+            self.assertEqual(load_pending_stamps(self.flag_blobs['#read_status']), {})
+            before = self.file_bytes()
+            self.sync()
+            self.assertEqual(self.file_bytes(), before)
+
+        def test_parser_reads_a_stamped_file_as_before(self):
+            self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(2)}, 'uuid-b': True})
+            before = parse_sidecar(self.read_file())
+            self.sync()
+            self.assertIn('applied_at', self.read_file()['books']['uuid-a'])
+            self.assertEqual(parse_sidecar(self.read_file()), before)
+
     class SettingsTests(unittest.TestCase):
+        def test_read_column_round_trip(self):
+            db = FakeDB(COLS, {})
+            db.set_pref(SETTINGS_KEY, json.loads(json.dumps(
+                settings_to_store('', '', 1, True, read_column='#read'))))
+            self.assertEqual(normalise_settings(db.pref(SETTINGS_KEY))['read_column'], '#read')
+            self.assertEqual(settings_to_store('', '', 1, read_column=None)['read_column'], '#read_status')
+            for bad in (None, 5, 'read', '#Read', '#read status', ''):
+                self.assertEqual(normalise_settings({'read_column': bad})['read_column'], '#read_status')
+            self.assertEqual(normalise_settings(None)['read_column'], '#read_status')
+
         def test_normalise(self):
             self.assertEqual(normalise_settings(None)['progress_threshold'], 1)
             s = normalise_settings({'percent_column': 'read_percent', 'last_read_column': '#Bad',
@@ -929,7 +1263,7 @@ if __name__ == '__main__':  # pragma: no cover
                              ('', '', 50))
             self.assertIsNone(s['version'])
             self.assertEqual(settings_to_store('#read_percent', None, 2),
-                             {'version': 1, 'percent_column': '#read_percent',
+                             {'version': 1, 'read_column': '#read_status', 'percent_column': '#read_percent',
                               'last_read_column': '', 'progress_threshold': 2, 'auto_sync': True})
             self.assertIs(normalise_settings(None)['auto_sync'], True)
             self.assertIs(normalise_settings({'auto_sync': False})['auto_sync'], False)

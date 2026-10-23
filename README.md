@@ -5,9 +5,10 @@ you do in the **CalibReader** app for iPhone and iPad back into your
 desktop Calibre library. Get the app: [calibreader.com](https://calibreader.com)
 (public beta on TestFlight: https://testflight.apple.com/join/PVW2VU9c).
 
-- **Read status**: read / unread, into a `#read_status` Yes/No column.
-- **Reading progress** (new in 1.2.0): **% read** and the **last-read date**,
-  into columns you choose.
+- **Read status**: read / unread, into a Yes/No column you choose (new in
+  1.3.0; `#read_status` unless you pick another). It goes both ways.
+- **Reading progress**: **% read** and the **last-read date**, into columns
+  you choose.
 
 The app keeps two small files in your library folder,
 `CalibReader_sync.json` and `CalibReader_positions.json`. This plugin reads
@@ -16,7 +17,7 @@ them and updates `metadata.db`.
 | | |
 |---|---|
 | **Name** | CalibReader Sync |
-| **Version** | 1.2.5 |
+| **Version** | 1.3.0 |
 | **Author** | CalibReader |
 | **Platforms** | Windows, macOS, Linux |
 | **Minimum Calibre** | 9.0.0 |
@@ -51,14 +52,20 @@ them and updates `metadata.db`.
 3. **Plugin → metadata.db.** The plugin syncs by itself (1.2.5) a few seconds
    after Calibre starts or a library opens, and whenever the app's files change
    (checked every 5 minutes); **Sync Read Status** syncs on demand. It sets
-   `#read_status` to Yes or No, and writes % read and last read into the
-   columns you picked in **Settings**.
+   your read status column to Yes or No, and writes % read and last read into
+   the columns you picked in **Settings**.
 
-The plugin never touches the internet. In Calibre it changes only
-`#read_status` and the progress columns you chose. It writes to
-`CalibReader_sync.json` in one case only (1.2.4): when you changed a book's read
-status in Calibre after the app's change, it records Calibre's value there,
-stamped with the time of your edit, so the app follows it on its next sync.
+The plugin never touches the internet. In Calibre it changes only the read
+status column and the progress columns you chose. It writes to
+`CalibReader_sync.json` in two cases:
+
+- **A Calibre edit wins** (1.2.4): when you changed a book's read status in
+  Calibre after the app's change, it records Calibre's value there, stamped
+  with the time of your edit, so the app follows it on its next sync.
+- **An entry was applied** (1.3.0): when it writes an entry's read status into
+  Calibre, it adds `applied_value` and `applied_at` to that entry, so the app
+  can tell a later Calibre edit from the plugin's own write.
+
 `CalibReader_positions.json` is never written.
 
 ### File formats
@@ -71,7 +78,9 @@ stamped with the time of your edit, so the app follows it on its next sync.
   "updated_at": "2026-03-11T23:47:35.089553Z",
   "books": {
     "0f5c1e2a-....-uuid": true,
-    "9a3b77de-....-uuid": { "value": false, "updated_at": "2026-11-02T18:31:12.482Z" }
+    "9a3b77de-....-uuid": { "value": false, "updated_at": "2026-11-02T18:31:12.482Z" },
+    "5d2e0c41-....-uuid": { "value": true, "updated_at": "2026-11-02T18:31:12.482Z",
+                            "applied_value": true, "applied_at": "2026-11-02T18:40:03.117Z" }
   }
 }
 ```
@@ -99,10 +108,41 @@ A bare bool carries the **file-level** `updated_at`; an object carries its own.
 Fractional seconds are allowed (milliseconds or microseconds).
 Both apps write `progress` for EPUB and PDF (a PDF's is `(page + 1) / pages`).
 
-### Reading progress (1.2.0)
+`applied_value` / `applied_at` (1.3.0) are added by the plugin, only to an
+object entry it has just written into Calibre, and only while the file still
+holds that same entry; every other key is kept. `applied_value` is the value it
+wrote; `applied_at` is the book's Calibre `last_modified` right after the write
+(rounded up to the millisecond, same format as `updated_at`). So if the app
+later finds Calibre's value different from the entry's, with `last_modified`
+newer than `applied_at`, the read status was edited in Calibre afterwards.
+Readers ignore keys they don't know: older apps and plugins read `value` and
+`updated_at` only. A legacy bare bool is never converted.
+
+### Read status column (1.3.0)
 
 Open **Settings** (the arrow next to the toolbar button, or Preferences →
-Plugins → CalibReader Sync → Customize) and choose:
+Plugins → CalibReader Sync → Customize) and choose the **Read status column**.
+It lists the library's Yes/No columns. Until you choose, it offers
+`#read_status` if the library has it, otherwise a Yes/No column that already
+looks like a read flag (`#read`, "Have read", `#finished`, `#done`, KOReader
+Sync's `#ko_statusbool`…). Nothing changes until you click OK. **Create
+column…** opens Calibre's own column dialog, filled in with `#read_status`
+(Yes/No); Calibre must restart before the new column can be used.
+
+The choice is saved in the library with the other settings (`read_column`), and
+the CalibReader app reads the same column (app 1.0.1 or later; an older app
+reads `#read_status` only). Only a Yes/No column is used: if the chosen column
+is missing or of another type, read status goes into `#read_status` instead,
+as in the app, and the sync says so.
+
+The plugin's per-book memory (see **Conflict resolution**) is kept per column,
+so switching columns starts the new one fresh: the first sync into it follows
+the first-sync rule below, and the old column's memory is kept for a switch
+back.
+
+### Reading progress (1.2.0)
+
+In **Settings**, choose:
 
 | Setting | Column type | What it gets |
 |---|---|---|
@@ -125,11 +165,12 @@ sync skips it and says so.
 it:
 
 ```json
-{"version": 1, "percent_column": "#read_percent", "last_read_column": "#last_read",
- "progress_threshold": 1}
+{"version": 1, "read_column": "#read_status", "percent_column": "#read_percent",
+ "last_read_column": "#last_read", "progress_threshold": 1, "auto_sync": true}
 ```
 
-`""` means "don't sync". `read_column` is reserved for a later release.
+`""` means "don't sync" (progress columns only). `read_column` (1.3.0) is a
+lookup name with `#`; a missing or malformed value means `#read_status`.
 
 The read flag and % read stay separate on purpose: 100 % is not the same as
 finished (some books end with previews), and you may mark a book read at 60 %.
@@ -138,7 +179,8 @@ finished (some books end with previews), and you may mark a book read at 60 %.
 
 The plugin keeps its own per-book record of what it last applied, in the
 plugin's preferences (`plugins/calibreader_sync.json`: `applied` for read
-status, `applied_pos` for reading progress). The record holds the stamp of the
+status in `#read_status`, `applied_cols` for any other read column (1.3.0),
+`applied_pos` for reading progress). The record holds the stamp of the
 entry it last applied and that book's `last_modified` right after the write.
 **No column is added to your library for this.** For each entry, in order:
 
@@ -180,8 +222,8 @@ limitation (1.2.3, see rule 3).
 The rules live in two modules that import nothing from Calibre:
 
 ```bash
-python3 sidecar_merge.py      # 33 tests: parsing, timestamps, the conflict rules
-python3 sync_core.py          # 34 tests: whole sync runs against an in-memory library
+python3 sidecar_merge.py      # 36 tests: parsing, timestamps, the conflict rules
+python3 sync_core.py          # 47 tests: whole sync runs against an in-memory library
 ```
 
 ---
@@ -218,9 +260,12 @@ Requires **Calibre 9.0.0 or later**.
 
 ## One-time setup
 
-### Read status: the `#read_status` column
+### Read status: a Yes/No column
 
-Read status goes into a custom **Yes/No** column. Create it once:
+Read status goes into a custom **Yes/No** column. **Already track read status
+in your own column** (for example `#read` or `#finished`, Yes/No)? Pick it in
+**Settings** (see **Read status column** above). Otherwise create one there
+with **Create column…**, or by hand:
 
 **Calibre → Preferences → Add your own columns → (+) Add custom column**
 
@@ -230,24 +275,9 @@ Read status goes into a custom **Yes/No** column. Create it once:
 | Column heading | `Read Status` |
 | Column type | `Yes/No` |
 
-(The lookup name `read_status` becomes `#read_status` internally.) If the
-column is missing, or isn't Yes/No, the sync says so and leaves read status
-alone; reading progress still syncs.
-
-**Already track read status in your own column?** (for example `#read` or
-`#finished`, Yes/No.) Choosing your own column is coming in the next update.
-Until then, copy it into `#read_status` once; the plugin spots a likely column
-and shows these steps in its summary and in Settings:
-
-1. Create `#read_status` as above and restart Calibre.
-2. Search for `#read:yes` (use your column's lookup name) and select all the
-   books. Right-click **Edit metadata** and choose **Edit metadata in bulk**.
-   On the **Custom metadata** tab set **Read Status** to **Yes**, tick
-   **Apply changes**, then **OK**.
-3. Do the same with `#read:no` and **No**.
-
-Search with `:yes` and `:no`. On a Yes/No column `:true` matches every book
-that has a value, **No** included.
+(The lookup name `read_status` becomes `#read_status` internally.) Restart
+Calibre after creating a column. If there is no usable column, the sync says so
+and leaves read status alone; reading progress still syncs.
 
 ### Reading progress
 
@@ -313,26 +343,26 @@ Every failure path shows a Calibre dialog rather than crashing:
   and to check that this is the library the app opens.
 - **A file can't be read** (a cloud client may leave it half-written): that
   file is skipped for this run and the other one still syncs.
-- **Missing or wrong-type `#read_status`**: read status is skipped with the
-  exact column setup. If the library already has a Yes/No column that looks
-  like a read flag (`#read`, `#finished`…), the message names it and explains
-  how to copy it into `#read_status` once.
+- **No usable read status column**: read status is skipped, and the message
+  says to pick or create a Yes/No column in Settings, naming any column that
+  already looks like a read flag (`#read`, `#finished`…). A chosen column that
+  is missing or not Yes/No falls back to `#read_status`, with a note.
 - **A chosen progress column is missing or the wrong type**: skipped, with a
   note (usually "restart calibre" after creating it).
 - **Books not in this library**: informational only.
 
 ---
 
-## Scope & limitations (1.2.x)
+## Scope & limitations (1.3.x)
 
-- **Read status goes both ways; progress goes one way.** The app reads
-  `#read_status` from your library when it syncs. When both sides changed a
-  book, the newer change wins, and the plugin passes a newer Calibre change back
-  through `CalibReader_sync.json` (1.2.4). % read and last read go from the app
-  to Calibre only.
-- **The read-status column is fixed** to `#read_status`. Choosing your own
-  read column needs the apps to read that choice first; it's coming in the
-  next update. Until then, copy an existing column once (see One-time setup).
+- **Read status goes both ways; progress goes one way.** The app reads the
+  read status column from your library when it syncs. When both sides changed
+  a book, the newer change wins, and the plugin passes a newer Calibre change
+  back through `CalibReader_sync.json` (1.2.4). % read and last read go from
+  the app to Calibre only.
+- **The app must follow the column choice.** CalibReader 1.0.1 and later read
+  `read_column`; an older app keeps reading `#read_status`, so update the app
+  before choosing another column.
 - **Automatic sync polls.** Changes from the app are checked every 5 minutes
   while Calibre is open (cloud folders don't reliably report file changes).
 - **Current library only.** Operates on whatever library is open.
@@ -347,17 +377,29 @@ Every failure path shows a Calibre dialog rather than crashing:
 Decided 2026-10-12 (`docs/PLUGIN_READ_STATUS_DISCUSSION.md` in the CalibReader
 project):
 
-- Pick your own read column (Yes/No), suggested from the library, with the
-  choice saved in the library so the apps follow it.
-- Automatic sync when the library opens and when the files change, with a
-  quiet notice; the button becomes "Sync now".
 - A "Read" tag as an alternative to a Yes/No column.
-- Two-way read status (Calibre → app), after the column choice.
 - Highlights & annotations, later.
+
+Done: two-way read status (1.2.4), automatic sync (1.2.5), your own read
+column (1.3.0).
 
 ---
 
 ## Changelog
+
+### 1.3.0 — 2026-10-22
+
+- Pick your own read status column: Settings lists the library's Yes/No
+  columns (`#read`, `#finished`…) and has Create column…; the choice is
+  saved in the library, and the CalibReader app (1.0.1 or later) follows it.
+  A missing or non-Yes/No choice falls back to `#read_status`, with a note.
+- The plugin's per-book memory is kept per column, so switching columns
+  doesn't carry one column's history into another.
+- Each read status entry the plugin applies gets `applied_value` and
+  `applied_at` in `CalibReader_sync.json`, so the app can tell a later Calibre
+  edit from the plugin's own write. Older apps ignore the extra keys.
+- The 1.2.2 "copy your column into `#read_status`" steps are gone: pick your
+  column in Settings instead.
 
 ### 1.2.5 — 2026-10-21
 

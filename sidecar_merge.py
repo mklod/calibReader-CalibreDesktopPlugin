@@ -1,4 +1,4 @@
-# Last modified: 2026-10-21--2001
+# Last modified: 2026-10-22--2048
 #
 # sidecar_merge.py — pure decision logic for CalibReader_sync.json.
 #
@@ -17,7 +17,9 @@
 #       "<uuid-legacy>": true,                        <- LEGACY bare bool
 #       "<uuid-modern>": {                            <- per-entry stamp
 #         "value": false,
-#         "updated_at": "2026-11-02T18:31:12.482Z"
+#         "updated_at": "2026-11-02T18:31:12.482Z",
+#         "applied_value": false,                     <- plugin >= 1.3.0, optional
+#         "applied_at": "2026-11-02T18:40:03.117Z"
 #       }
 #     }
 #   }
@@ -25,6 +27,14 @@
 # A bare bool carries the FILE-level `updated_at`. An object carries its own.
 # Fractional seconds are allowed; a trailing `Z` or a `+00:00` offset are both
 # accepted, as is a naive stamp (assumed UTC).
+#
+# `applied_value` / `applied_at` (1.3.0): when the plugin writes an entry's value
+# into calibre it adds these two keys to that entry: the value it wrote and the
+# book's calibre `last_modified` right after the write (rounded UP to the
+# millisecond). An app that later finds calibre's value != the entry's value with
+# `last_modified` > `applied_at` knows the read flag was edited in calibre after
+# the plugin applied the entry. Readers ignore keys they don't know: this parser
+# reads only `value` and `updated_at`, and so do the apps and plugins <= 1.2.5.
 #
 # ---------------------------------------------------------------------------
 # Why per-entry stamps exist
@@ -56,6 +66,8 @@ import re
 # future writer can't drift apart.
 KEY_VALUE = 'value'
 KEY_UPDATED_AT = 'updated_at'
+KEY_APPLIED_VALUE = 'applied_value'     # 1.3.0, written by the plugin only
+KEY_APPLIED_AT = 'applied_at'
 
 # CalibReader_positions.json: `positions[uuid] = {progress (0-1), updated_at,
 # chapter, page, scrollY, deviceId, textAnchor?}`. Both apps write it for EPUB
@@ -115,6 +127,17 @@ def format_iso(dt):
         dt = dt.replace(tzinfo=UTC)
     dt = dt.astimezone(UTC)
     return dt.strftime('%Y-%m-%dT%H:%M:%S.') + '{:03d}Z'.format(dt.microsecond // 1000)
+
+
+def ceil_ms(dt):
+    '''Round UP to the millisecond (format_iso keeps milliseconds). Used for
+    `applied_at`, which must not be earlier than the `last_modified` our own
+    write produced, or that write would look like a later calibre edit.'''
+    if dt is None:
+        return None
+    if dt.microsecond % 1000:
+        dt = dt + datetime.timedelta(microseconds=1000 - dt.microsecond % 1000)
+    return dt
 
 
 def trunc_ms(dt):
@@ -277,7 +300,7 @@ def last_read_value(stamp):
 
 # --- decisions -------------------------------------------------------------
 
-APPLY = 'apply'        # write the value into #read_status, then record
+APPLY = 'apply'        # write the value into the read column, then record
 RECORD = 'record'      # entry won, but the column already agrees: record only
 SKIP = 'skip'          # entry lost (stale, or a desktop edit is newer)
 
@@ -293,7 +316,7 @@ def decide(entry, current_value, applied_stamp, applied_last_modified,
     Arguments
     ---------
     entry                  : Entry (or Target) from the sidecar (never None).
-    current_value          : current `#read_status` (True/False/None-if-unset).
+    current_value          : the read column's current value (True/False/None-if-unset).
     applied_stamp          : stamp of the entry this plugin last applied to
                              this book, or None if it never has.
     applied_last_modified  : the book's calibre `last_modified` as observed
@@ -416,16 +439,40 @@ def load_flag_records(prefs_blob):
     return out
 
 
-def store_flag_record(prefs_blob, uuid, applied_stamp, applied_last_modified, seen_value, desktop_at):
+def store_flag_record(prefs_blob, uuid, applied_stamp, applied_last_modified, seen_value, desktop_at,
+                      pending=None):
     '''One book's read-flag bookkeeping (in place). Keeps the 1.2.x keys, so an older
-    plugin installed over this one still reads `stamp` and `lm`.'''
-    prefs_blob[uuid.lower()] = {
+    plugin installed over this one still reads `stamp` and `lm`. `pending` (1.3.0) =
+    (value, entry_stamp, applied_at) of an applied_* stamp the sync file could not
+    take this time (see load_pending_stamps).'''
+    rec = {
         'stamp': format_iso(applied_stamp),
         'lm': format_iso(applied_last_modified),
         'val': seen_value,
         'dt': format_iso(desktop_at),
     }
+    if pending is not None:
+        rec['pa'] = {'value': bool(pending[0]), 'stamp': format_iso(pending[1]),
+                     'at': format_iso(pending[2])}
+    prefs_blob[uuid.lower()] = rec
     return prefs_blob
+
+
+def load_pending_stamps(prefs_blob):
+    '''(1.3.0) `{uuid: (value, entry_stamp, applied_at)}`: applied_* stamps that a run
+    could not write into CalibReader_sync.json (it was being written, say), kept in
+    the read-flag records to be tried again on the next run.'''
+    out = {}
+    if not isinstance(prefs_blob, dict):
+        return out
+    for uuid, rec in prefs_blob.items():
+        pa = rec.get('pa') if isinstance(rec, dict) else None
+        if not isinstance(uuid, str) or not isinstance(pa, dict) or not isinstance(pa.get('value'), bool):
+            continue
+        at = parse_iso(pa.get('at'))
+        if at is not None:
+            out[uuid.lower()] = (pa['value'], parse_iso(pa.get('stamp')), at)
+    return out
 
 
 def plan(entries, book_state):
@@ -437,7 +484,7 @@ def plan(entries, book_state):
                    library. uuids missing from it are counted as unmatched.
 
     Returns (updates, records, skipped, unmatched):
-      updates  : {uuid: bool}      -> write these into #read_status
+      updates  : {uuid: bool}      -> write these into the read column
       records  : {uuid: Entry}     -> stamp bookkeeping for updates + RECORDs
       skipped  : [uuid]
       unmatched: [uuid]
@@ -501,9 +548,9 @@ def refresh_lm(prefs_blob, uuid, lm_before, lm_after):
 
 
 def build_entry_object(value, stamp):
-    '''The object form a WRITER must emit. The plugin does not currently write
-    the sidecar, but if/when read-status writeback lands it must use this so
-    every client agrees on the shape.'''
+    '''The object form a WRITER must emit (the shape the 1.2.4 write-back uses),
+    so every client agrees on it. `applied_value` / `applied_at` are added only
+    to an entry the plugin applied (sync_core.update_sync_file).'''
     return {KEY_VALUE: bool(value), KEY_UPDATED_AT: format_iso(stamp)}
 
 
@@ -542,6 +589,25 @@ if __name__ == '__main__':  # pragma: no cover
             self.assertEqual(sorted(got), ['legacy', 'modern'])
             self.assertFalse(got['legacy'].dated)
             self.assertTrue(got['modern'].dated)
+
+        def test_applied_keys_are_ignored_by_the_reader(self):
+            # 1.3.0 adds applied_value / applied_at to entries it applied; the entry
+            # must read exactly as before, whatever those keys hold.
+            plain = {'value': False, 'updated_at': '2026-11-02T18:31:12.482Z'}
+            for extra in ({'applied_value': False, 'applied_at': '2026-11-02T18:40:03.117Z'},
+                          {'applied_value': 'x', 'applied_at': 12, 'future_key': [1]}):
+                got = parse_sidecar({'updated_at': '2026-09-15T05:00:00Z',
+                                     'books': {'A': dict(plain, **extra), 'B': True}})
+                self.assertEqual(got['a'], Entry(False, NOV, True))
+                self.assertEqual(got['b'], Entry(True, SEP, False))
+
+        def test_ceil_ms(self):
+            t = OCT.replace(microsecond=123001)
+            self.assertEqual(ceil_ms(t), OCT.replace(microsecond=124000))
+            self.assertEqual(ceil_ms(OCT.replace(microsecond=123000)), OCT.replace(microsecond=123000))
+            self.assertEqual(ceil_ms(OCT.replace(microsecond=999999)), OCT + datetime.timedelta(seconds=1))
+            self.assertGreaterEqual(parse_iso(format_iso(ceil_ms(t))), t)
+            self.assertIsNone(ceil_ms(None))
 
         def test_garbage_entries_are_dropped(self):
             got = parse_sidecar({'books': {'a': 1, 'b': None, 'c': 'yes',
@@ -644,6 +710,15 @@ if __name__ == '__main__':  # pragma: no cover
         def test_load_tolerates_garbage(self):
             self.assertEqual(load_applied({'a': 'nope', 'b': {'stamp': 'x'}}),
                              {'b': (None, None)})
+
+        def test_pending_stamp_roundtrip(self):
+            blob = {}
+            store_flag_record(blob, 'ABC', NOV, NOV, True, None, pending=(True, NOV, NOV))
+            store_flag_record(blob, 'def', NOV, NOV, True, None)
+            loaded = json.loads(json.dumps(blob))
+            self.assertEqual(load_pending_stamps(loaded), {'abc': (True, NOV, NOV)})
+            self.assertEqual(load_flag_records(loaded)['abc'], (NOV, NOV, True, None))
+            self.assertEqual(load_pending_stamps({'x': {'pa': {'value': 1, 'at': 'y'}}, 'y': 3}), {})
 
         def test_writer_object_shape(self):
             self.assertEqual(build_entry_object(True, NOV),

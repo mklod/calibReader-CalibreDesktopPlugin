@@ -1,10 +1,11 @@
-# Last modified: 2026-10-21--2257
+# Last modified: 2026-10-22--2048
 #
 # CalibReader Sync — Calibre plugin
 # Reads the sidecars the CalibReader apps keep in the Calibre library folder
 # (synced by Dropbox, Google Drive, OneDrive or a network share) and writes
 # them into the library:
-#   CalibReader_sync.json      -> the #read_status column (Yes/No)
+#   CalibReader_sync.json      -> read status, into a Yes/No column the user
+#                                 picks in Settings (v1.3.0; #read_status by default)
 #   CalibReader_positions.json -> % read and last-read date, into columns the
 #                                 user picks in Settings (v1.2.0)
 #
@@ -48,6 +49,14 @@
 # when the app's sync files change (checked every 5 minutes); status-bar note,
 # no pop-ups; a Settings switch, on by default.
 #
+# v1.3.0: the user picks the read status column in Settings (any Yes/No column;
+# "Create column…" through calibre's dialog). Saved as "read_column" in the
+# library's metadata.db preferences, which the apps (1.0.1+) follow; a missing or
+# non-Yes/No choice falls back to #read_status with a note. The read-flag memory
+# is kept per column. Each entry the plugin applies is stamped with
+# "applied_value" + "applied_at" in CalibReader_sync.json, so the app can tell a
+# later calibre edit from the plugin's own write (sync_core.update_sync_file).
+#
 # Installation:
 #   1. Zip __init__.py, ui.py, config.py, sync_core.py, sidecar_merge.py,
 #      plugin-import-name-calibreader_sync.txt, images/icon.png and LICENSE
@@ -55,7 +64,8 @@
 #   2. Calibre → Preferences → Plugins → Load plugin from file → select zip
 #   3. Restart Calibre. Add "Sync Read Status" to the toolbar if desired.
 #
-# Read status needs this custom column in Calibre:
+# Read status needs a Yes/No custom column in Calibre: pick yours in Settings,
+# or create one there. Without a choice the plugin uses:
 #   Column lookup name : read_status   (creates #read_status)
 #   Column type        : Yes/No
 #   Column heading     : Read Status
@@ -81,7 +91,7 @@ class CalibReaderSyncPlugin(InterfaceActionBase):
                              'app for iPhone and iPad')
     supported_platforms   = ['windows', 'osx', 'linux']
     author                = 'CalibReader'
-    version               = (1, 2, 5)
+    version               = (1, 3, 0)
     minimum_calibre_version = (9, 0, 0)
 
     #: Points Calibre at the InterfaceAction class, in ui.py so that only the GUI imports it.
