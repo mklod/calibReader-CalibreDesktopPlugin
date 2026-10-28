@@ -3,7 +3,7 @@
 A small, focused [Calibre](https://calibre-ebook.com/) plugin that brings what
 you do in the **CalibReader** app for iPhone and iPad back into your
 desktop Calibre library. Get the app: [calibreader.com](https://calibreader.com)
-(public beta on TestFlight: https://testflight.apple.com/join/PVW2VU9c).
+(on the App Store: https://apps.apple.com/app/id6777391511).
 
 - **Read status**: read / unread, into a `#read_status` Yes/No column.
 - **Reading progress** (new in 1.2.0): **% read** and the **last-read date**,
