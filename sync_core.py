@@ -1151,6 +1151,44 @@ if __name__ == '__main__':  # pragma: no cover
             self.assertEqual((a['value'], a['applied_value']), (False, False))
             self.assertGreaterEqual(parse_iso(a['applied_at']), self.v('last_modified', 1))
 
+    class BareBoolTests(Base):
+        '''M2 (review): a bare-bool entry (Android) carries only the FILE's updated_at, which
+        both apps move on every upload. An entry applied once must stay applied once.'''
+
+        def bare(self, day, **books):
+            self.write(SYNC_FILE, {'schema': 1, 'updated_at': stamp(day), 'books': books})
+
+        def test_bare_bool_does_not_refill_a_cleared_cell_when_the_file_stamp_moves(self):
+            self.bare(1, **{'uuid-a': True})
+            self.assertEqual(self.sync().flags_updated, 1)
+            self.db.desktop_edit('#read_status', 1, None)          # the user clears it in calibre
+            self.sync()
+            self.bare(5, **{'uuid-a': True, 'uuid-b': True})       # the phone marks another book
+            res = self.sync()
+            self.assertIsNone(self.v('#read_status', 1))
+            self.assertIs(self.v('#read_status', 2), True)
+            self.assertEqual(res.flags_updated, 1)
+
+        def test_bare_bool_does_not_overwrite_a_calibre_edit_when_the_file_stamp_moves(self):
+            self.bare(1, **{'uuid-a': True})
+            self.sync()
+            self.db.tick(3600 * 24 * 2)
+            self.db.desktop_edit('#read_status', 1, False)         # unticked in calibre
+            self.bare(5, **{'uuid-a': True, 'uuid-b': True})       # the phone re-uploads its state
+            self.sync()
+            self.bare(7, **{'uuid-a': True, 'uuid-b': True, 'uuid-c': False})
+            self.sync()
+            self.assertIs(self.v('#read_status', 1), False)
+
+        def test_a_new_bare_mark_still_applies(self):
+            self.bare(1, **{'uuid-a': True})
+            self.sync()
+            self.db.desktop_edit('#read_status', 1, None)
+            self.sync()
+            self.bare(6, **{'uuid-a': False})                      # marked unread on the phone
+            self.assertEqual(self.sync().flags_updated, 1)
+            self.assertIs(self.v('#read_status', 1), False)
+
     class WriteBackTests(Base):
         '''1.2.4: a calibre edit made after the plugin applied a phone entry, before the
         phone synced again, is passed back through the sync file so both sides agree.'''

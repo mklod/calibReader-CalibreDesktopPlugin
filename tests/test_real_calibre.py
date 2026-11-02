@@ -240,6 +240,22 @@ class RealColumnGoneTests(RealCalibreBase):
 
 
 @unittest.skipUnless(HAVE_CALIBRE, 'needs calibre (run tests/run_calibre.sh)')
+class RealBareBoolTests(RealCalibreBase):
+    def test_cleared_cell_is_not_refilled_by_file_stamp_churn(self):
+        # M2 (review probe 2): Android writes bare bools; the file stamp moves on each upload
+        (b1, u1), (b2, u2) = self.lib.books(2)
+        self.lib.api.set_field('#read_status', {b1: None, b2: None})
+        self.lib.write_sync({u1: True}, file_stamp='2030-01-01T00:00:00.000Z')
+        self.assertEqual(self.run_ui().flags_updated, 1)
+        self.lib.api.set_field('#read_status', {b1: None})        # cleared in calibre
+        self.run_ui()
+        self.lib.write_sync({u1: True, u2: True}, file_stamp='2030-01-05T00:00:00.000Z')
+        self.run_ui()
+        self.assertIsNone(self.v('#read_status', b1))
+        self.assertIs(self.v('#read_status', b2), True)
+
+
+@unittest.skipUnless(HAVE_CALIBRE, 'needs calibre (run tests/run_calibre.sh)')
 class RealUpgradeTests(RealCalibreBase):
     '''Upgrade from 1.2.5: its own code ran a sync and stored its prefs; then 1.3.x runs.'''
 
