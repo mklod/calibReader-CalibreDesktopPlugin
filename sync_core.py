@@ -68,9 +68,13 @@ READ_COLUMN = '#read_status'        # the default read column (the only one befo
 # "" means "don't sync". `version` is present once the user has saved the
 # dialog; until then the dialog may pre-select a suggested column.
 # "read_column" (1.3.0): the read flag's Yes/No column, a lookup name with '#'.
-# Missing or malformed means #read_status. If the column is missing from the
-# library or is not Yes/No, the sync uses #read_status instead and says so; the
-# apps (1.0.1 and later) read the same key and fall back the same way.
+# Missing or malformed means #read_status (the 1.2.x behaviour). 1.3.1 (review M1):
+# when the user HAS chosen a column and it is missing from the library (deleted,
+# renamed, or created and calibre not restarted yet) or is not Yes/No, read status
+# is not written at all, never into #read_status, and the summary says why; % read
+# and last read still sync. normalise_settings marks a choice with
+# "read_column_set" (never stored). The apps (1.0.1 and later) read the same key;
+# their read-only fallback to #read_status writes nothing into calibre.
 
 SETTINGS_KEY = 'calibreader_sync'
 SETTINGS_VERSION = 1
@@ -104,6 +108,11 @@ def normalise_settings(raw):
         value = raw.get(key)
         if isinstance(value, str) and _LOOKUP_RE.match(value):
             out[key] = value
+    # 1.3.1: did the user choose the read column? Survives normalising twice.
+    chosen = raw.get('read_column_set')
+    out['read_column_set'] = (chosen if isinstance(chosen, bool)
+                              else isinstance(raw.get('read_column'), str)
+                              and bool(_LOOKUP_RE.match(raw['read_column'])))
     threshold = raw.get('progress_threshold')
     if isinstance(threshold, (int, float)) and not isinstance(threshold, bool):
         out['progress_threshold'] = min(MAX_THRESHOLD, max(0, threshold))
@@ -122,6 +131,7 @@ def settings_to_store(percent_column, last_read_column, progress_threshold, auto
         'progress_threshold': progress_threshold,
         'auto_sync': bool(auto_sync),
     })
+    del out['read_column_set']                  # derived, never stored
     if read_column is None:
         del out['read_column']
     return out
@@ -244,30 +254,29 @@ def _column_problem(custom_columns, lookup):
     '''Why `lookup` can't hold the read flag, or None when it can.'''
     meta = custom_columns.get(lookup)
     if not isinstance(meta, dict):
-        return 'does not exist (restart calibre if you just created it)'
+        return ('is not in this library (deleted or renamed? If you just created it, restart '
+                'calibre)')
     if meta.get('datatype') not in READ_TYPES:
         return 'is {}, not Yes/No'.format(_a_type(meta.get('datatype')))
     return None
 
 
-def resolve_read_column(custom_columns, chosen):
-    '''(column to write, [notes]). The chosen column when it is a Yes/No column of
-    this library; otherwise #read_status, as the apps do, with a note saying so;
-    None (with a note) when there is no usable column at all.'''
+def resolve_read_column(custom_columns, chosen, explicit=True):
+    '''(column to write, [notes]). With a choice (`explicit`): that column when it is
+    a Yes/No column of this library, otherwise None with a note (1.3.1, review M1:
+    never another column, so a deleted, renamed or not-yet-created choice can't send
+    read status into the #read_status the user moved away from). Without one:
+    #read_status, or None with a note when it is missing or not Yes/No.'''
     custom_columns = custom_columns or {}
     notes = []
-    if chosen and chosen != READ_COLUMN:
+    if explicit and chosen:
         why = _column_problem(custom_columns, chosen)
         if why is None:
             return chosen, notes
-        fallback = _column_problem(custom_columns, READ_COLUMN)
-        if fallback is None:
-            notes.append('Read status went into {} instead: the column chosen in Settings, {}, '
-                         '{}.'.format(READ_COLUMN, chosen, why))
-            return READ_COLUMN, notes
-        notes.append('Read status was not synced: the column chosen in Settings, {}, {}; and '
-                     '{}, used instead, {}. Pick a Yes/No column in Settings.'.format(
-                         chosen, why, READ_COLUMN, fallback))
+        notes.append('Read status was not synced: the column chosen in Settings, {}, {}. It was '
+                     'not written into any other column, and % read and last read still sync. '
+                     'Pick a Yes/No column in Settings (the arrow next to Sync Read '
+                     'Status).'.format(chosen, why))
         return None, notes
     meta = custom_columns.get(READ_COLUMN)
     if not isinstance(meta, dict):
@@ -539,7 +548,8 @@ def run_sync(db, library_path, settings, flag_blobs, pos_blob):
     # Which columns may be written this run.
     flag_col = None
     if flags_data is not None:
-        flag_col, notes = resolve_read_column(custom, settings['read_column'])
+        flag_col, notes = resolve_read_column(custom, settings['read_column'],
+                                              settings['read_column_set'])
         res.notes.extend(notes)
         res.read_column = flag_col
         if flag_col:
@@ -1222,21 +1232,23 @@ if __name__ == '__main__':  # pragma: no cover
             self.assertEqual(res.status_line(), 'updated 2 read status (#read).')
             self.assertEqual(sorted(self.flag_blobs), ['#read'])
 
-        def test_non_bool_choice_falls_back_to_read_status_with_a_note(self):
+        def test_non_bool_choice_writes_nothing(self):
+            # 1.3.1 (M1): no fallback into #read_status
             self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(2)}})
             res = self.sync(dict(SETTINGS, read_column='#finished'))
-            self.assertIs(self.v('#read_status', 1), True)
+            self.assertIsNone(self.v('#read_status', 1))
             self.assertIsNone(self.v('#finished', 1))         # a Date column is never written
-            self.assertEqual(res.read_column, '#read_status')
+            self.assertIsNone(res.read_column)
             self.assertEqual(len(res.notes), 1)
-            self.assertIn('went into #read_status instead', res.notes[0])
             self.assertIn('#finished, is a datetime column, not Yes/No', res.notes[0])
+            self.assertIn('not written into any other column', res.notes[0])
 
-        def test_missing_choice_falls_back_and_says_restart(self):
+        def test_missing_choice_writes_nothing_and_says_restart(self):
             self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(2)}})
             res = self.sync(dict(SETTINGS, read_column='#done'))
-            self.assertIs(self.v('#read_status', 1), True)
-            self.assertIn('#done, does not exist (restart calibre', res.notes[0])
+            self.assertIsNone(self.v('#read_status', 1))
+            self.assertIn('#done, is not in this library (deleted or renamed? If you just created '
+                          'it, restart calibre)', res.notes[0])
 
         def test_no_usable_column_at_all_writes_nothing(self):
             custom = {k: v for k, v in self.CUSTOM.items() if k != '#read_status'}
@@ -1246,7 +1258,6 @@ if __name__ == '__main__':  # pragma: no cover
             self.assertEqual([w for w in self.db.writes if w[0] in ('#genre', '#read_status')], [])
             self.assertIsNone(res.read_column)
             self.assertIn('was not synced', res.notes[0])
-            self.assertIn('#read_status, used instead, does not exist', res.notes[0])
 
         def test_changing_the_read_column_does_not_carry_the_memory_over(self):
             self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(2)}})

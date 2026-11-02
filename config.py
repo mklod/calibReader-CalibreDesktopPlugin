@@ -177,11 +177,10 @@ class ConfigWidget(QWidget):
         return combo
 
     def _update_read_note(self, *args):
+        # 1.3.1 (review M1): a chosen column that can't be used means read status is
+        # not synced at all; it never goes into #read_status instead.
         lookup = self.combos['read'].currentData()
         meta = self.custom.get(lookup)
-        default_ok = (self.custom.get(READ_COLUMN) or {}).get('datatype') in READ_TYPES
-        meanwhile = ('goes into {}'.format(READ_COLUMN) if default_ok and lookup != READ_COLUMN
-                     else 'is not synced')
         if isinstance(meta, dict) and meta.get('datatype') in READ_TYPES:
             text = 'Read status goes into {} ({}).'.format(meta.get('name') or lookup, lookup)
             if not self.read_chosen and lookup == READ_COLUMN:
@@ -189,13 +188,14 @@ class ConfigWidget(QWidget):
                 if hint:
                     text += '\n\n' + hint
         elif isinstance(meta, dict):
-            text = '{} is not a Yes/No column, so read status {} instead.'.format(lookup, meanwhile)
+            text = ('{} is not a Yes/No column, so read status is not synced. Pick a Yes/No '
+                    'column.'.format(lookup))
         elif lookup in self.new_columns:
-            text = ('{} can be used once calibre restarts. Until then read status {}.'.format(
-                lookup, meanwhile))
+            text = ('{} can be used once calibre restarts. Until then read status is not synced '
+                    '(it is not written into any other column).'.format(lookup))
         else:
-            text = ('{} is not in this library yet. Pick another column, or create one with Create '
-                    'column…. Until then read status {}.'.format(lookup, meanwhile))
+            text = ('{} is not in this library. Pick another column, or create one with Create '
+                    'column…. Until then read status is not synced.'.format(lookup))
             hint = read_column_hint(self.custom, exclude=(lookup, READ_COLUMN), where='above')
             if hint:
                 text += '\n\n' + hint
