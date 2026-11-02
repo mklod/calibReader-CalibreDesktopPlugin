@@ -1,4 +1,4 @@
-# Last modified: 2026-11-02--1416
+# Last modified: 2026-11-02--1446
 #
 # config.py — the plugin's settings dialog (Preferences > Plugins > CalibReader
 # Sync > Customize, or the "Settings…" item in the toolbar button's menu).
@@ -11,6 +11,10 @@
 # (sync_core.SETTINGS_KEY), so they follow the library to other computers and
 # to the iPhone/iPad app, which reads the same read column (the Android app reads
 # #read_status only).
+#
+# 1.4.0 (tester preview): the Kobo section keeps Calibre-Web's app.db path in the
+# plugin's own prefs (ui.PREFS['kobo'], per library folder): it is this computer's.
+# Off unless a path is set.
 #
 # 1.3.1: no read column is pre-selected or saved unless the user picks one (H1);
 # a chosen column that can't be used means read status is not synced (M1); OK
@@ -27,8 +31,8 @@ __license__   = 'GPL v3'
 __copyright__ = '2026, CalibReader'
 
 from qt.core import (
-    QCheckBox, QComboBox, QFrame, QGridLayout, QLabel, QPushButton, QSpinBox, QTimer, QVBoxLayout,
-    QWidget,
+    QCheckBox, QComboBox, QFrame, QGridLayout, QLabel, QLineEdit, QPushButton, QSpinBox, QTimer,
+    QVBoxLayout, QWidget,
 )
 
 try:
@@ -138,6 +142,32 @@ class ConfigWidget(QWidget):
             'replaced, in its change log (the arrow next to Sync Read Status, then Change log…). '
             'The first sync into a read column you pick asks you first, with the number of '
             'cells it will fill.'))
+
+        v.addWidget(self._line())
+        v.addWidget(self._heading('Kobo via Calibre-Web (tester preview)'))
+        v.addWidget(self._text(
+            'TESTER PREVIEW: use it only with the CalibReader test build on every iPhone or '
+            'iPad you read on. If your Kobo syncs with Calibre-Web, CalibReader can open your '
+            'books where you stopped on the Kobo. Point this at Calibre-Web\'s app.db (it is '
+            'only read, never changed). Off while the path is empty. The place goes into {} '
+            'for the app. Exact to the sentence when Calibre-Web sends KEPUBs (kepubify), '
+            'otherwise within a page or two.'.format(POSITIONS_FILE)))
+        grid = QGridLayout()
+        kobo = self._kobo_prefs().get(self.gui.library_path) or {}
+        self.kobo_db = QLineEdit(kobo.get('app_db', ''), self)
+        self.kobo_db.setPlaceholderText('Not set: Kobo places are not imported')
+        browse = QPushButton('Choose…', self)
+        browse.clicked.connect(self.choose_app_db)
+        grid.addWidget(QLabel('Calibre-Web app.db:', self), 0, 0)
+        grid.addWidget(self.kobo_db, 0, 1)
+        grid.addWidget(browse, 0, 2)
+        self.kobo_user = QLineEdit(kobo.get('user', ''), self)
+        self.kobo_user.setPlaceholderText('Whose Kobo CalibReader follows (needed when Calibre-Web has several users)')
+        grid.addWidget(QLabel('Calibre-Web user:', self), 1, 0)
+        grid.addWidget(self.kobo_user, 1, 1)
+        grid.setColumnStretch(1, 1)
+        v.addLayout(grid)
+        v.addWidget(self._text('Saved on this computer only, for this library.'))
         v.addStretch(1)
 
     # -- building blocks ------------------------------------------------------
@@ -257,7 +287,37 @@ class ConfigWidget(QWidget):
                                  self.auto_sync.isChecked(),
                                  read_column=self.chosen_read_column())
 
+    # -- Kobo (1.4.0, tester preview) -------------------------------------------
+
+    def _kobo_prefs(self):
+        try:
+            from calibre_plugins.calibreader_sync.ui import PREFS
+        except ImportError:  # pragma: no cover
+            return {}
+        return dict(PREFS.get('kobo', {}) or {})
+
+    def choose_app_db(self):
+        from calibre.gui2 import choose_files
+        picked = choose_files(self, 'calibreader-sync-kobo-app-db', 'Calibre-Web app.db',
+                              filters=[('Calibre-Web database', ['db'])], all_files=True, select_only_single_file=True)
+        if picked:
+            self.kobo_db.setText(picked[0])
+
+    def save_kobo(self):
+        try:
+            from calibre_plugins.calibreader_sync.ui import PREFS
+        except ImportError:  # pragma: no cover
+            return
+        table = dict(PREFS.get('kobo', {}) or {})
+        path = self.kobo_db.text().strip()
+        if path:
+            table[self.gui.library_path] = {'app_db': path, 'user': self.kobo_user.text().strip()}
+        else:
+            table.pop(self.gui.library_path, None)
+        PREFS['kobo'] = table                   # assignment commits a JSONConfig
+
     def save_settings(self):
+        self.save_kobo()
         before = normalise_settings(self.db.pref(SETTINGS_KEY, None))
         after = self.settings()
         self.db.set_pref(SETTINGS_KEY, after)

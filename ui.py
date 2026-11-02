@@ -1,4 +1,4 @@
-# Last modified: 2026-11-02--1441
+# Last modified: 2026-11-02--1446
 #
 # CalibReader Sync — the toolbar action (GUI only).
 # calibre imports this module only in its main window, through
@@ -52,6 +52,10 @@ except ImportError:  # pragma: no cover - standalone / test import
         CHANGE_LOG_DIR, POSITIONS_FILE, SETTINGS_KEY, SYNC_FILE, change_log_path,
         normalise_settings, sync_library,
     )
+try:
+    from calibre_plugins.calibreader_sync.kobo_import import import_positions as import_kobo_positions
+except ImportError:  # pragma: no cover - standalone / test import
+    from kobo_import import import_positions as import_kobo_positions
 
 # Per-book bookkeeping lives in the plugin's OWN prefs, never in the user's
 # library: adding a column to someone's library to track sync state is not
@@ -66,6 +70,15 @@ AUTO_DELAY_MS = 4000            # after calibre starts or a library opens
 POLL_MS = 5 * 60 * 1000         # how often the sync files are checked for changes
 PREFS = JSONConfig('plugins/calibreader_sync')
 CHANGE_LOGS = os.path.join(config_dir, 'plugins', CHANGE_LOG_DIR)
+# 1.4.0 (tester preview): Kobo reading places from Calibre-Web, per library
+# folder: PREFS['kobo'] = {library path: {'app_db': path, 'user': name or ''}}.
+# This computer's path, so not in the library. Off unless a path is set.
+PREFS.defaults['kobo'] = {}
+
+
+def kobo_settings(library_path):
+    entry = (PREFS.get('kobo', {}) or {}).get(library_path) or {}
+    return entry if entry.get('app_db') else None
 
 
 class CalibReaderSyncAction(InterfaceAction):
@@ -117,9 +130,13 @@ class CalibReaderSyncAction(InterfaceAction):
 
     def _file_stamps(self):
         out = []
-        for name in (SYNC_FILE, POSITIONS_FILE):
+        paths = [(name, os.path.join(self.gui.library_path, name)) for name in (SYNC_FILE, POSITIONS_FILE)]
+        kobo = kobo_settings(self.gui.library_path)
+        if kobo:                                # a Kobo sync changes app.db (or its WAL)
+            paths += [('app.db', kobo['app_db']), ('app.db-wal', kobo['app_db'] + '-wal')]
+        for name, path in paths:
             try:
-                st = os.stat(os.path.join(self.gui.library_path, name))
+                st = os.stat(path)
                 out.append((name, st.st_mtime_ns, st.st_size))
             except OSError:
                 out.append((name, None, None))
@@ -136,7 +153,7 @@ class CalibReaderSyncAction(InterfaceAction):
         stamps = self._file_stamps()
         if why == 'poll' and stamps == self._seen:
             return                              # nothing new from the app
-        if all(mtime is None for _, mtime, _ in stamps[1]):
+        if all(mtime is None for _, mtime, _ in stamps[1]) and not kobo_settings(self.gui.library_path):
             self._seen = stamps                 # not a CalibReader library: stay silent
             return
         try:
@@ -150,12 +167,40 @@ class CalibReaderSyncAction(InterfaceAction):
             if line:
                 self.gui.status_bar.show_message('CalibReader Sync: ' + line, 10000)
 
+    def _run_kobo(self, api):
+        '''Kobo places from Calibre-Web's app.db into CalibReader_positions.json
+        (1.4.0 tester preview), before the sync reads that file. None when not set up.'''
+        kobo = kobo_settings(self.gui.library_path)
+        if not kobo:
+            return None
+        ids = api.all_book_ids()
+
+        def lookup(book_id):
+            if book_id not in ids:
+                return None
+            return (api.field_for('uuid', book_id), api.format_abspath(book_id, 'EPUB'),
+                    api.format_abspath(book_id, 'KEPUB'))
+        return import_kobo_positions(self.gui.library_path, kobo['app_db'], lookup, user=kobo.get('user') or None)
+
     def _run(self, api, settings=None, approve=None):
         # settings: unused since 1.3.1 (sync_library reads the library's own); kept so
         # callers written for 1.3.0 still work.
+        # 1.4.0 L2: the Kobo import never stops the read-status sync.
+        try:
+            kres, kobo_error = self._run_kobo(api), None
+        except Exception as exc:
+            kres, kobo_error = None, 'Kobo import failed ({}); read status and progress still synced.'.format(exc)
+        # L1: a run maps at most kobo_import.MAX_BOOKS books; the rest follow soon.
+        if kres is not None and kres.more:
+            self._kick.start(AUTO_DELAY_MS)
         res = sync_library(api, self.gui.library_path, PREFS, log_dir=CHANGE_LOGS, approve=approve)
         if res.columns_written:
             self.gui.library_view.model().refresh()
+        if kres is not None:
+            res.notes.extend(kres.notes)
+            res.kobo_imported = len(kres.written)
+        if kobo_error:
+            res.notes.append(kobo_error)
         return res
 
     def show_settings(self):

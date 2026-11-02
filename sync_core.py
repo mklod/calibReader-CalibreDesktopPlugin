@@ -1,4 +1,4 @@
-# Last modified: 2026-11-02--1441
+# Last modified: 2026-11-02--1446
 #
 # sync_core.py — one sync run, without the GUI.
 #
@@ -14,7 +14,8 @@
 # beats a phone entry, calibre's value (1.2.4), so the app follows it; and on
 # each entry the plugin applies, `applied_value` + `applied_at` (1.3.0), so the
 # app can tell a later calibre edit from the plugin's own write.
-# CalibReader_positions.json is never written.
+# CalibReader_positions.json is never written here; kobo_import.py (1.4.0, tester
+# preview) adds Kobo places to it, before this reads it.
 #
 # Like sidecar_merge.py this imports nothing from calibre. `db` is anything
 # with calibre's Cache API (gui.current_db.new_api): field_metadata,
@@ -404,6 +405,7 @@ class SyncResult(object):
         self.progress_columns = []     # the % read / last read columns usable this run
         self.columns_written = []      # e.g. ['#read_status', '#read_percent']
         self.notes = []                # plain-English problems worth showing
+        self.kobo_imported = 0         # 1.4.0: Kobo places put into the positions file (ui.py)
         self.changes = []              # 1.3.1: every value written, old -> new (append_change_log)
         self.confirm = None            # 1.3.1: {column, heading, fill, change} of a first sync
                                        # into a chosen column waiting for the user's OK
@@ -424,6 +426,8 @@ class SyncResult(object):
             parts.append('{} reading progress'.format(self.progress_updated))
         if self.flags_sent_back:
             parts.append('{} passed back to the app'.format(self.flags_sent_back))
+        if self.kobo_imported:
+            parts.append('{} Kobo reading place(s) for the app'.format(self.kobo_imported))
         line = ('updated ' + ', '.join(parts) + '.') if parts else ''
         if self.notes:
             line = (line + ' ' if line else '') + 'Something needs attention: click Sync Read Status for details.'
@@ -445,6 +449,8 @@ class SyncResult(object):
                 self.flags_sent_back))
         if self.unmatched:
             lines.append('{} book(s) in the files are not in this library.'.format(len(self.unmatched)))
+        if self.kobo_imported:
+            lines.append('Kobo: {} reading place(s) from Calibre-Web passed to the app.'.format(self.kobo_imported))
         lines.extend(self.notes)
         return '\n\n'.join(lines) if lines else 'Nothing to sync.'
 

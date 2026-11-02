@@ -17,7 +17,7 @@ them and updates `metadata.db`.
 | | |
 |---|---|
 | **Name** | CalibReader Sync |
-| **Version** | 1.3.1 |
+| **Version** | 1.4.0 (tester preview) |
 | **Author** | CalibReader |
 | **Platforms** | Windows, macOS, Linux |
 | **Minimum Calibre** | 9.0.0 |
@@ -66,7 +66,8 @@ status column and the progress columns you chose. It writes to
   it writes into Calibre, and once to each entry Calibre already agrees with,
   so the app can tell a later Calibre edit from the plugin's own write.
 
-`CalibReader_positions.json` is never written.
+`CalibReader_positions.json` is written only by the Kobo import (1.4.0 tester
+preview, off until you set it up).
 
 ### File formats
 
@@ -289,6 +290,35 @@ metadata edit in Calibre can make a same-vintage position lose. Reading on
 produces a newer stamp and syncs normally. Read status no longer has this
 limitation (1.2.3, see rule 3).
 
+### Kobo reading places from Calibre-Web (1.4.0, TESTER PREVIEW)
+
+**Tester preview only, until the CalibReader app 1.0.4 is on the App Store.**
+Do not publish this build. The feature is off unless you set Calibre-Web's
+`app.db` path in **Settings → Kobo via Calibre-Web**. Use it only with the
+CalibReader test build on every iPhone or iPad you read on: that build asks
+before a Kobo place moves you back; older apps do not.
+
+If your Kobo syncs with **Calibre-Web** (its Kobo sync), the plugin hands the
+Kobo's place in each book to CalibReader:
+
+- `app.db` is opened **read-only**; nothing is written to it or to `metadata.db`.
+- Each Kobo place is mapped to CalibReader's chapter + text position (the text
+  counted as the app counts it) and written into `CalibReader_positions.json`
+  (`deviceId` `kobo-calibre-web`, plus a `kobo` block with the raw location
+  and the precision). The file keeps its permissions; the plugin re-reads it
+  just before writing, so an app upload meanwhile is kept.
+- **Newer wins**, as between devices; the app 1.0.4 never moves you BACK to a
+  Kobo place without asking. The Kobo's stamp is Calibre-Web's server time;
+  stamps more than 10 minutes in the future are refused (wrong clock).
+- **Precision.** With KEPUBs (Calibre-Web with kepubify) the place is the
+  Kobo's sentence; otherwise the same chapter, within a page or two.
+- Not imported: a Kobo location not found in the book (wrong library: if
+  most are, nothing is imported), an unchanged location under a new stamp,
+  status-only updates (0 % / 100 %), a location far from the Kobo's own %.
+- With several Calibre-Web users, name whose Kobo to follow.
+- At most 25 books are mapped per run; the rest follow a few seconds later.
+- CalibReader to the Kobo is not in this version.
+
 ### Testing
 
 The rules live in two modules that import nothing from Calibre, each with its
@@ -304,6 +334,7 @@ All tests, with a count per source:
 ```bash
 python3 tests/run_tests.py    # both modules; the real-Calibre tests are skipped
 tests/run_calibre.sh          # the same under Calibre's own python, real-Calibre tests included
+# run_tests.py also runs tests/test_kobo_position.py + tests/test_kobo_import.py (1.4.0)
 ```
 
 `tests/test_real_calibre.py` runs against real Calibre (`LibraryDatabase`,
@@ -332,6 +363,8 @@ in the `__main__` block, which `unittest.main()` can't find under
    - `config.py`
    - `sync_core.py`
    - `sidecar_merge.py`
+   - `kobo_position.py`
+   - `kobo_import.py`
    - `plugin-import-name-calibreader_sync.txt`
    - `images/icon.png`
    - `LICENSE`
@@ -419,6 +452,8 @@ changed. A library with neither file is left alone. Turn it off in **Settings**
 | `config.py` | The settings dialog: column pickers with suggestions, **Create column…** through Calibre's API, the threshold. Saves to the library's preferences. |
 | `sync_core.py` | One sync run (`run_sync`), the settings schema and the column suggestions. No Calibre imports; `python3 sync_core.py` runs its tests. |
 | `sidecar_merge.py` | Parsing both files, timestamps, the per-book conflict rules and the bookkeeping. No Calibre imports; `python3 sidecar_merge.py` runs its tests. |
+| `kobo_position.py` | (1.4.0, tester preview) A Kobo place (KoboSpan / EPUB CFI / percentages) to CalibReader's chapter + text position. No Calibre imports. |
+| `kobo_import.py` | (1.4.0, tester preview) Reads Calibre-Web's app.db read-only and merges Kobo places into `CalibReader_positions.json`; `python3 kobo_import.py --library … --app-db … --user …` runs one import. |
 | `plugin-import-name-calibreader_sync.txt` | Required by Calibre's loader; declares the import name `calibreader_sync`. |
 | `images/icon.png` | Toolbar icon (blue circular sync arrows), loaded at runtime via `get_icons('images/icon.png')`. |
 | `LICENSE` | GPL v3. |
@@ -497,6 +532,14 @@ column (1.3.0).
 ---
 
 ## Changelog
+
+### 1.4.0 — 2026-11-02 (tester preview, not published)
+
+- **Kobo → CalibReader** (off unless set up): Kobo reading places from
+  Calibre-Web's app.db (read-only) go into `CalibReader_positions.json`.
+  KoboSpan via the KEPUB, EPUB CFI, or the chapter/book percentage. Automatic
+  sync also runs when app.db changes. A Kobo failure never stops the
+  read-status sync. Built on 1.3.1.
 
 ### 1.3.1 — 2026-11-02
 

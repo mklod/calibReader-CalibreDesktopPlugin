@@ -1,4 +1,4 @@
-# Last modified: 2026-11-02--1430
+# Last modified: 2026-11-02--1446
 #
 # CalibReader Sync — Calibre plugin
 # Reads the sidecars the CalibReader apps keep in the Calibre library folder
@@ -102,7 +102,7 @@ class CalibReaderSyncPlugin(InterfaceActionBase):
                              'app for iPhone and iPad')
     supported_platforms   = ['windows', 'osx', 'linux']
     author                = 'CalibReader'
-    version               = (1, 3, 1)
+    version               = (1, 4, 0)
     minimum_calibre_version = (9, 0, 0)
 
     #: Points Calibre at the InterfaceAction class, in ui.py so that only the GUI imports it.
@@ -138,7 +138,7 @@ class CalibReaderSyncPlugin(InterfaceActionBase):
 import importlib
 import sys
 
-for _name in ('sidecar_merge', 'sync_core', 'config', 'ui'):
+for _name in ('sidecar_merge', 'sync_core', 'kobo_position', 'kobo_import', 'config', 'ui'):
     _module = sys.modules.get('calibre_plugins.calibreader_sync.' + _name)
     if _module is not None:
         importlib.reload(_module)
