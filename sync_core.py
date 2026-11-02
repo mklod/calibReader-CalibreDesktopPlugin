@@ -1935,6 +1935,27 @@ if __name__ == '__main__':  # pragma: no cover
             kept = sorted(k.split('-')[1] for k in self.prefs['libraries'])
             self.assertEqual(kept, sorted(str(n) for n in range(3, MAX_LIBRARIES + 3)))
 
+        def test_old_memory_is_copied_to_each_library_not_moved_to_the_first(self):
+            # Re-review L1 probe: two DIFFERENT libraries, 1.3.0 memory for both, B syncs first.
+            a, b = self.dbs
+            self.dbs[1] = b = FakeDB(COLS, {1: 'uuid-x', 2: 'uuid-y'})
+            b.library_id = 'lib-0002'
+            rec = lambda st: {'stamp': st, 'lm': '2026-10-01T12:00:00.123Z', 'val': None, 'dt': None}
+            self.prefs.update({'applied': {'uuid-a': rec(stamp(2)), 'uuid-b': rec(stamp(1)),
+                                           'uuid-x': rec(stamp(2))},
+                               'applied_cols': {}, 'applied_pos': {}})
+            # in A both cells were filled by 1.3.0 and then cleared by the user (seen: None)
+            self.flags(0, **{'uuid-a': {'value': True, 'updated_at': stamp(2)}, 'uuid-b': True})
+            self.flags(1, **{'uuid-x': {'value': True, 'updated_at': stamp(2)}})
+            self.sync_lib(1)                                       # B first
+            res = self.sync_lib(0)
+            self.assertIsNone(a.field_for('#read_status', 1))      # dated: not refilled
+            self.assertIsNone(a.field_for('#read_status', 2))      # bare: not refilled
+            self.assertEqual(res.flags_updated, 0)
+            states = {k.split('-')[1]: v for k, v in self.prefs['libraries'].items()}
+            self.assertEqual(sorted(states['0001']['applied']), ['uuid-a', 'uuid-b'])
+            self.assertEqual(sorted(states['0002']['applied']), ['uuid-x', 'uuid-y'])
+
         def test_the_12x_memory_moves_to_the_first_library_that_syncs(self):
             self.dbs[0].values[('#read_status', 1)] = True
             self.prefs.update({'applied': {'uuid-a': {'stamp': stamp(2), 'lm': None, 'val': True, 'dt': None}},
