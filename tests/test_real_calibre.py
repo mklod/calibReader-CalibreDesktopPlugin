@@ -256,6 +256,31 @@ class RealBareBoolTests(RealCalibreBase):
 
 
 @unittest.skipUnless(HAVE_CALIBRE, 'needs calibre (run tests/run_calibre.sh)')
+class RealColumnSwitchTests(RealCalibreBase):
+    def test_switch_after_rating_edit_does_not_flip_the_phone(self):
+        # M3 (review probe 4): #finished = No (old); phone marks Read at T1, applied to
+        # #read_status; a rating edit at T2 > T1; the user picks #finished.
+        (b1, u1), = self.lib.books(1)
+        self.lib.add_column('finished', 'Finished')
+        self.lib.api.set_field('#finished', {b1: False})
+        self.lib.api.set_field('#read_status', {b1: None})
+        import time
+        time.sleep(0.05)
+        from sidecar_merge import format_iso
+        t1 = format_iso(datetime.datetime.now(UTC))
+        self.lib.write_sync({u1: {'value': True, 'updated_at': t1}})
+        self.assertEqual(self.run_ui().flags_updated, 1)
+        time.sleep(0.05)
+        self.lib.api.set_field('rating', {b1: 8})
+        self.lib.set_settings({'version': 1, 'read_column': '#finished', 'percent_column': '',
+                               'last_read_column': '', 'progress_threshold': 1, 'auto_sync': True})
+        res = self.run_ui()
+        entry = self.lib.read_sync()['books'][u1]
+        self.assertEqual((entry['value'], entry['updated_at']), (True, t1))
+        self.assertEqual(res.flags_sent_back, 0)
+
+
+@unittest.skipUnless(HAVE_CALIBRE, 'needs calibre (run tests/run_calibre.sh)')
 class RealUpgradeTests(RealCalibreBase):
     '''Upgrade from 1.2.5: its own code ran a sync and stored its prefs; then 1.3.x runs.'''
 

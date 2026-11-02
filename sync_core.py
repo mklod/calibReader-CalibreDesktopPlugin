@@ -1196,6 +1196,43 @@ if __name__ == '__main__':  # pragma: no cover
             self.assertEqual(self.sync().flags_updated, 1)
             self.assertIs(self.v('#read_status', 1), False)
 
+    class ColumnSwitchTests(Base):
+        '''M3 (review): switching columns is a first contact for every book. calibre keeps
+        no per-field edit time, so an unrelated edit (a rating) newer than a phone toggle is
+        no evidence that the new column's value is newer: it must not push calibre's old
+        value back over the phone's mark.'''
+
+        def setUp(self):
+            Base.setUp(self)
+            self.db.field_metadata = FakeFieldMetadata(
+                dict(COLS, **{'#finished': {'datatype': 'bool', 'name': 'Finished'}}))
+            self.db.values[('#finished', 1)] = False                   # old value, Oct 1
+
+        def switch_after_rating_edit(self):
+            self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(3)}})   # phone: read, Oct 3
+            self.db.clock = datetime.datetime(2026, 10, 3, 13, 0, 0, 1, tzinfo=UTC)
+            self.assertEqual(self.sync().flags_updated, 1)              # into #read_status
+            self.db.clock = datetime.datetime(2026, 10, 5, 9, 0, 0, 1, tzinfo=UTC)
+            self.db.desktop_edit('rating', 1, 8)                       # unrelated, Oct 5
+            return self.sync(dict(SETTINGS, read_column='#finished'))   # the user switches
+
+        def test_switch_does_not_write_back_an_unrelated_edit(self):
+            res = self.switch_after_rating_edit()
+            entry = self.read_file()['books']['uuid-a']
+            self.assertEqual((entry['value'], entry['updated_at']), (True, stamp(3)))
+            self.assertEqual(res.flags_sent_back, 0)
+            self.assertIs(self.v('#finished', 1), False)               # rule (a): calibre's value kept
+            res = self.sync(dict(SETTINGS, read_column='#finished'))   # and the next run agrees
+            self.assertEqual((res.flags_updated, res.flags_sent_back), (0, 0))
+            self.assertEqual(self.read_file()['books']['uuid-a']['value'], True)
+
+        def test_a_later_phone_mark_lands_in_the_new_column(self):
+            self.switch_after_rating_edit()
+            self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(4)}})   # made Oct 4, synced late
+            res = self.sync(dict(SETTINGS, read_column='#finished'))
+            self.assertIs(self.v('#finished', 1), True)
+            self.assertEqual(res.flags_updated, 1)
+
     class WriteBackTests(Base):
         '''1.2.4: a calibre edit made after the plugin applied a phone entry, before the
         phone synced again, is passed back through the sync file so both sides agree.'''
