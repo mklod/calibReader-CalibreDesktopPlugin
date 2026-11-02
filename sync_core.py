@@ -893,6 +893,7 @@ if __name__ == '__main__':  # pragma: no cover
                 self.values[('uuid', book_id)] = uuid
                 self.values[('last_modified', book_id)] = self.clock
             self.prefs = {}
+            self.library_id = 'lib-0001'      # a copied library keeps it (it is in metadata.db)
 
         def all_book_ids(self):
             return {b for (f, b) in self.values if f == 'uuid'}
@@ -1826,6 +1827,60 @@ if __name__ == '__main__':  # pragma: no cover
             self.sync()
             self.assertIn('applied_at', self.read_file()['books']['uuid-a'])
             self.assertEqual(parse_sidecar(self.read_file()), before)
+
+    class PerLibraryMemoryTests(unittest.TestCase):
+        '''L1 (review): the read-flag memory is kept per library, and bounded.'''
+
+        def setUp(self):
+            self.dirs = [tempfile.mkdtemp(), tempfile.mkdtemp()]
+            self.dbs = [FakeDB(COLS, {1: 'uuid-a', 2: 'uuid-b'}) for _ in self.dirs]
+            self.prefs = {}
+
+        def tearDown(self):
+            for d in self.dirs:
+                shutil.rmtree(d)
+
+        def flags(self, i, **books):
+            with open(os.path.join(self.dirs[i], SYNC_FILE), 'w', encoding='utf-8') as f:
+                json.dump({'schema': 1, 'updated_at': stamp(1), 'books': books}, f)
+
+        def sync_lib(self, i):
+            return sync_library(self.dbs[i], self.dirs[i], self.prefs)
+
+        def test_two_copies_of_a_library_do_not_share_memory(self):
+            # same uuids AND the same library_id (a copied metadata.db), different values
+            self.dbs[0].values[('#read_status', 1)] = True
+            self.dbs[1].values[('#read_status', 1)] = False
+            for i in (0, 1):
+                self.flags(i, **{'uuid-a': {'value': True, 'updated_at': '2026-09-20T12:00:00.000Z'}})
+            sent = []
+            for i in (0, 1, 0, 1, 0, 1):
+                sent.append(self.sync_lib(i).flags_sent_back)
+            self.assertEqual(sent, [0] * 6)
+            self.assertEqual(len(self.prefs['libraries']), 2)
+
+        def test_memory_is_kept_for_a_bounded_number_of_libraries(self):
+            self.flags(0, **{'uuid-a': True})
+            for n in range(MAX_LIBRARIES + 3):
+                self.dbs[0].library_id = 'lib-{}'.format(n)
+                sync_library(self.dbs[0], self.dirs[0], self.prefs,
+                             now=datetime.datetime(2026, 11, 1, tzinfo=UTC) + datetime.timedelta(hours=n))
+            self.assertEqual(len(self.prefs['libraries']), MAX_LIBRARIES)
+            kept = sorted(k.split('-')[1] for k in self.prefs['libraries'])
+            self.assertEqual(kept, sorted(str(n) for n in range(3, MAX_LIBRARIES + 3)))
+
+        def test_the_12x_memory_moves_to_the_first_library_that_syncs(self):
+            self.dbs[0].values[('#read_status', 1)] = True
+            self.prefs.update({'applied': {'uuid-a': {'stamp': stamp(2), 'lm': None, 'val': True, 'dt': None}},
+                               'applied_cols': {}, 'applied_pos': {}})
+            self.flags(0, **{'uuid-a': {'value': True, 'updated_at': stamp(2)}})
+            res = self.sync_lib(0)
+            self.assertEqual((res.flags_updated, res.flags_skipped), (0, 1))      # the 1.2.x record was used
+            self.assertNotIn('applied', self.prefs)
+            (state,) = self.prefs['libraries'].values()
+            self.assertIn('uuid-a', state['applied'])
+            self.flags(1, **{'uuid-a': {'value': True, 'updated_at': stamp(2)}})
+            self.assertEqual(self.sync_lib(1).flags_updated, 1)                        # a second library starts fresh
 
     class SettingsTests(unittest.TestCase):
         def test_read_column_round_trip(self):
