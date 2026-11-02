@@ -65,13 +65,17 @@ def run(sources, verbosity=1, stream=None):
     '''Run [(label, suite)] one after another. Returns (exit code, [(label, run, skipped,
     failed)]).'''
     stream = stream or sys.stderr
-    rows, failed_any = [], False
+    rows, failed_any, void = [], False, not sources
     for label, suite in sources:
         result = unittest.TextTestRunner(stream=stream, verbosity=verbosity).run(suite)
         bad = len(result.failures) + len(result.errors) + len(result.unexpectedSuccesses)
-        rows.append((label, result.testsRun - len(result.skipped), len(result.skipped), bad))
+        executed = result.testsRun - len(result.skipped)
+        rows.append((label, executed, len(result.skipped), bad))
         failed_any = failed_any or bad > 0
-    return (1 if failed_any else 0), rows
+        void = void or executed == 0                # a source that ran nothing proves nothing
+    if failed_any:
+        return 1, rows
+    return (2 if void else 0), rows
 
 
 def main(argv=None):
@@ -83,6 +87,17 @@ def main(argv=None):
     for label, executed, skipped, bad in rows:
         print('{:<24} {:>8} {:>8} {:>8}'.format(label, executed, skipped, bad))
     print('python {} ({})'.format(sys.version.split()[0], sys.executable))
+    try:
+        import calibre  # noqa: F401
+        under_calibre = True
+    except ImportError:
+        under_calibre = False
+    if under_calibre and code == 0 and any(skipped for label, _, skipped, _ in rows
+                                           if label in MODULES):
+        code = 2                                    # under calibre the real-calibre tests must run
+    total = sum(executed for _, executed, _, _ in rows)
+    print('TOTAL executed {}: {}'.format(total, {0: 'PASS', 1: 'FAIL', 2: 'VOID (nothing, or not '
+                                                 'everything, was executed)'}[code]))
     return code
 
 
