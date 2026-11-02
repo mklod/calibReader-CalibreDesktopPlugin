@@ -1,4 +1,4 @@
-# Last modified: 2026-11-02--1416
+# Last modified: 2026-11-02--1441
 #
 # test_real_calibre.py — CalibReader Sync against REAL calibre (LibraryDatabase, set_field,
 # metadata.db, JSONConfig, the Settings widget), not the in-memory FakeDB of sync_core.py.

@@ -1,4 +1,4 @@
-# Last modified: 2026-11-02--1430
+# Last modified: 2026-11-02--1441
 #
 # sync_core.py — one sync run, without the GUI.
 #

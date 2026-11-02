@@ -158,7 +158,10 @@ choice saved, `#read_status` is used, as in 1.2.x.
 writes anything into that column, the Sync Read Status button shows how many
 empty cells it will fill with the app's marks (and how many filled cells it
 will change); nothing is written until you click Yes. An automatic run only
-leaves a status-bar note until then, and everything else keeps syncing. After
+leaves a status-bar note until then, and everything else keeps syncing. Your
+Yes is remembered for that column in that library; a run that had nothing to
+write does not count as one. If you chose a column with 1.3.0, you are asked
+once, the next time the plugin has something to write into it. After
 you click OK in Settings with a newly picked column, the plugin runs the
 button's sync for you, so the question comes up straight away.
 
@@ -179,8 +182,9 @@ replaced: one JSON line per value, with the time, book id, title, UUID,
 column, old value, new value, and the stamp of the app entry that won. The log
 is in Calibre's configuration folder,
 `plugins/calibreader_sync_changes/<library>.log`, one file per library, and
-keeps the newest 10,000 lines. Open it from the toolbar button's menu:
-**Change log…**.
+keeps the newest 10,000 lines. The log of a library the plugin no longer
+remembers (see **Conflict resolution**: the 8 most recent) is removed. Open it
+from the toolbar button's menu: **Change log…**.
 
 ### Reading progress (1.2.0)
 
@@ -225,7 +229,9 @@ status in `#read_status`, `applied_cols` for any other read column (1.3.0),
 `applied_pos` for reading progress). From 1.3.1 these are kept **per
 library** (under `libraries`, keyed by Calibre's library id and the library's
 folder, so two copies of one library don't mix), for the 8 most recently
-synced libraries. The record holds the stamp of the
+synced libraries. On the upgrade from 1.3.0 or 1.2.x, each library gets a
+copy of the old memory, filtered to its own books, the first time it syncs;
+the old keys are left in place (unused) for a downgrade. The record holds the stamp of the
 entry it last applied and that book's `last_modified` right after the write.
 **No column is added to your library for this.** For each entry, in order:
 
@@ -290,7 +296,7 @@ own tests (the in-memory library returns local-time dates, as Calibre does):
 
 ```bash
 python3 sidecar_merge.py      # 39 tests: parsing, timestamps, the conflict rules
-python3 sync_core.py          # 78 tests: whole sync runs against an in-memory library
+python3 sync_core.py          # 81 tests: whole sync runs against an in-memory library
 ```
 
 All tests, with a count per source:
@@ -519,6 +525,13 @@ CalibReader project):
   sync runs.
 - Tests: the real-Calibre tests are in the repo (`tests/`), with a runner that
   refuses a run that executed nothing.
+- Known, one-time on the upgrade (Android users): the "applied once" memory of
+  a bare `true`/`false` is new in 1.3.1. A 1.3.0 record has none, and it can
+  only be inferred when the phone has not uploaded since 1.3.0's last run. So
+  on the first 1.3.1 run, a cell you cleared or changed in Calibre after 1.3.0
+  applied a bare mark can be set back once (as 1.3.0 itself would do); from
+  then on it holds. It is not inferred from Calibre's value because a change
+  in Calibre and a new mark from the phone look the same in a 1.3.0 record.
 
 ### 1.3.0 — 2026-10-22
 

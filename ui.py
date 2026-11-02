@@ -1,4 +1,4 @@
-# Last modified: 2026-11-02--1416
+# Last modified: 2026-11-02--1441
 #
 # CalibReader Sync — the toolbar action (GUI only).
 # calibre imports this module only in its main window, through

@@ -1,6 +1,6 @@
 # CalibReader Sync plugin — TODO
 
-_Last modified: 2026-11-02--1430_
+_Last modified: 2026-11-02--1441_
 
 - [ ] **Default sort parity with the app (user, 2026-10-23).** The desktop library sorts by a custom column "date downloaded" that calibre leaves empty on add (typed by hand), while the iOS app sorts by Date added, so "newest first" differs (desktop's newest = Roadside Picnic). Options to examine: (a) the plugin fills "date downloaded" automatically when a book is added (and offers a one-time backfill from `timestamp`); (b) the plugin writes the desktop's current sort column + direction into the `calibreader_sync` prefs so the app can default to the same order (the app side reads it, like `read_column`). Decide with the user; not before the 1.0.1 Duo items.
 
@@ -10,3 +10,4 @@ _Last modified: 2026-11-02--1430_
 - [ ] **L4 (rest): the sync runs on the GUI thread** (`ui.py` `_run`, `update_sync_file`). Fine on local disks; a slow SMB or cloud library stalls calibre for each run. Move the run to a worker (calibre's `ThreadedJob`) and keep the writes on the main thread, or at least the file reads. (1.3.1 did the other half: a sync runs after Settings OK.)
 - [ ] **L5: cloud write amplification.** Every apply or first agreeing stamp rewrites `CalibReader_sync.json`; an app write inside the read-modify-replace window is lost (pre-existing since 1.2.4), and cloud clients make "(conflicted copy)" files. Consider batching stamps (write at most once per N minutes) or a separate stamps file the apps merge. README notes it.
 - [ ] **M3 follow-up (user call).** 1.3.1 took option (a): on first contact with a filled cell that is older than the book's last edit, calibre's value is kept and nothing is pushed back. Option (b) would let the phone's mark win instead. Revisit with the app's `CatalogueReadStatusRule` ("review finding 2"), which has the same blind spot.
+- [ ] **M2 upgrade gap (one-time, Android).** A 1.3.0 read-flag record has no `av`; 1.3.1 infers it only when the sync file's stamp has not moved since that record. Otherwise the first 1.3.1 run can refill a cleared cell / undo a calibre untick once per book (re-review probe `bare churn, calibre edit False -> (False, True)`). Not inferred from the record's seen value: a calibre edit and a new phone mark are indistinguishable there, so a guess would either keep the refill or drop a genuine phone mark. Logged in the change log, so it is visible and reversible.
