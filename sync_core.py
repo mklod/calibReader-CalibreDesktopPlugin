@@ -37,14 +37,14 @@ import re
 
 try:
     from calibre_plugins.calibreader_sync.sidecar_merge import (
-        APPLY, KEY_APPLIED_AT, KEY_APPLIED_VALUE, KEY_UPDATED_AT, KEY_VALUE, NOT_SEEN, RECORD,
+        APPLY, RETIRE, KEY_APPLIED_AT, KEY_APPLIED_VALUE, KEY_UPDATED_AT, KEY_VALUE, NOT_SEEN, RECORD,
         UTC, Target, ceil_ms, decide_flag, format_iso, last_read_value, load_applied,
         load_applied_values, load_flag_records, load_pending_stamps, parse_iso, parse_positions, parse_sidecar,
         percent_for_column, plan, refresh_lm, store_applied, store_flag_record, writeback_for,
     )
 except ImportError:  # pragma: no cover - standalone / test import
     from sidecar_merge import (
-        APPLY, KEY_APPLIED_AT, KEY_APPLIED_VALUE, KEY_UPDATED_AT, KEY_VALUE, NOT_SEEN, RECORD,
+        APPLY, RETIRE, KEY_APPLIED_AT, KEY_APPLIED_VALUE, KEY_UPDATED_AT, KEY_VALUE, NOT_SEEN, RECORD,
         UTC, Target, ceil_ms, decide_flag, format_iso, last_read_value, load_applied,
         load_applied_values, load_flag_records, load_pending_stamps, parse_iso, parse_positions, parse_sidecar,
         percent_for_column, plan, refresh_lm, store_applied, store_flag_record, writeback_for,
@@ -584,6 +584,7 @@ def run_sync(db, library_path, settings, flag_blobs, pos_blob):
     # since the last run (sidecar_merge.decide_flag), so every book's value is
     # remembered, not only the books with a phone entry.
     flag_updates, flag_records, flag_state, writebacks, pending = {}, {}, {}, {}, {}
+    retired = {}                            # 1.3.1 (M3): first-contact conflicts, calibre kept
     now = _dt.datetime.now(UTC)
     if flag_col:
         entries = parse_sidecar(flags_data)
@@ -614,6 +615,8 @@ def run_sync(db, library_path, settings, flag_blobs, pos_blob):
                     flag_records[uuid] = entry
                 else:
                     skipped.append(uuid)
+                    if verdict == RETIRE:
+                        retired[uuid] = entry
             elif seen is not NOT_SEEN and value != seen and book_lm is not None:
                 mark = book_lm if book_lm <= now else now
                 dt = mark if dt is None or mark > dt else dt
@@ -709,6 +712,8 @@ def run_sync(db, library_path, settings, flag_blobs, pos_blob):
         elif uuid in sent:
             stamp = sent[uuid]              # our own entry: never re-decided as a phone change
             av = writebacks[uuid][0]
+        elif uuid in retired:
+            stamp, lm, av = retired[uuid].stamp, lm_before[uuid], retired[uuid].value
         value = db.field_for(flag_col, uuid_to_id[uuid])
         store_flag_record(flag_blob, uuid, stamp, lm, None if value is None else bool(value), dt,
                           keep.get(uuid), applied_value=av)
@@ -1118,8 +1123,10 @@ if __name__ == '__main__':  # pragma: no cover
             self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(2)}})   # app, Oct 2
             res = self.sync()
             self.assertIs(self.v('#read_status', 1), False)
-            self.assertEqual((res.flags_updated, res.flags_sent_back), (0, 1))   # calibre's value goes back
-            self.assertEqual(self.read_file()['books']['uuid-a']['value'], False)
+            # 1.3.1 (M3): first contact, so nothing proves the cell is newer than the entry:
+            # calibre's value is kept and nothing goes back to the phone
+            self.assertEqual((res.flags_updated, res.flags_sent_back), (0, 0))
+            self.assertEqual(self.read_file()['books']['uuid-a']['value'], True)
 
         def test_switching_to_a_column_with_empty_and_filled_cells(self):
             self.db.field_metadata = FakeFieldMetadata(
@@ -1136,15 +1143,13 @@ if __name__ == '__main__':  # pragma: no cover
             self.assertIs(self.v('#read', 1), True)            # empty: filled from the old entry
             self.assertIs(self.v('#read', 2), False)           # filled: kept
             self.assertIs(self.v('#read', 3), False)           # filled, agrees
-            self.assertEqual((res.flags_updated, res.flags_sent_back), (1, 1))
+            self.assertEqual((res.flags_updated, res.flags_sent_back), (1, 0))
             books = self.read_file()['books']
             self.assertEqual(books['uuid-a']['applied_value'], True)    # stamped again: filled from empty
             self.assertGreater(parse_iso(books['uuid-a']['applied_at']),
                                parse_iso(before['uuid-a']['applied_at']))
             self.assertGreaterEqual(parse_iso(books['uuid-a']['applied_at']), self.v('last_modified', 1))
-            lm_b = self.v('last_modified', 2)
-            self.assertEqual(books['uuid-b'], {'value': False, 'updated_at': format_iso(lm_b),
-                                               'applied_value': False, 'applied_at': format_iso(ceil_ms(lm_b))})
+            self.assertEqual(books['uuid-b'], before['uuid-b'])         # 1.3.1 (M3): kept, not pushed back
             self.assertEqual(books['uuid-c'], before['uuid-c'])         # agreeing cell: entry untouched
             self.assertEqual(self.sync(dict(SETTINGS, read_column='#read')).flags_updated, 0)
 
@@ -1589,8 +1594,9 @@ if __name__ == '__main__':  # pragma: no cover
             books = self.read_file()['books']
             self.assertIs(self.v('#read_status', 1), True)
             self.assertEqual(books['uuid-a']['applied_value'], True)             # filled from empty
-            self.assertEqual(books['uuid-b']['value'], False)                    # calibre's value went back
-            self.assertEqual((res.flags_updated, res.flags_sent_back), (1, 1))
+            self.assertIs(self.v('#read_status', 2), False)                      # calibre's value kept
+            self.assertEqual(books['uuid-b'], {'value': True, 'updated_at': stamp(2)})   # (M3) not pushed back
+            self.assertEqual((res.flags_updated, res.flags_sent_back), (1, 0))
 
         def test_parser_reads_a_stamped_file_as_before(self):
             self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(2)}, 'uuid-b': True})

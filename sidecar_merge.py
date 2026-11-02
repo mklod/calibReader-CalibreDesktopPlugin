@@ -305,6 +305,9 @@ def last_read_value(stamp):
 APPLY = 'apply'        # write the value into the read column, then record
 RECORD = 'record'      # entry won, but the column already agrees: record only
 SKIP = 'skip'          # entry lost (stale, or a desktop edit is newer)
+RETIRE = 'retire'      # 1.3.1 (read flag): first contact with a filled cell and no proof
+                       # either side is newer: calibre's value kept, nothing written back,
+                       # the entry recorded as handled (decide_flag)
 
 
 def decide(entry, current_value, applied_stamp, applied_last_modified,
@@ -421,6 +424,15 @@ def decide_flag(entry, current_value, applied_stamp, applied_last_modified,
             return APPLY, None
     if seen_value is NOT_SEEN:
         verdict = decide(entry, current_value, applied_stamp, applied_last_modified, book_last_modified)
+        if (verdict == SKIP and not has_record and entry.stamp is not None
+                and current_value is not None):
+            # 1.3.1 (review M3): first contact (a new install, or a switch to another read
+            # column) with a filled cell, and the book was edited after the entry. calibre
+            # keeps no per-field edit time, so that edit may be a rating or a tag: no
+            # evidence that the cell is newer than the phone's mark. Keep calibre's value,
+            # push nothing back to the phone, and record the entry as handled so that
+            # only a later mark (or a real edit of the cell, seen by value) decides.
+            return RETIRE, desktop_at
         if (verdict == SKIP and entry.stamp is not None and desktop_mark is not None
                 and (applied_stamp is None or entry.stamp > applied_stamp)):
             desktop_at = later(desktop_at, desktop_mark)         # it lost to a desktop edit
@@ -749,7 +761,13 @@ if __name__ == '__main__':  # pragma: no cover
             self.assertEqual(load_applied_values(json.loads(json.dumps(blob))), {'a': True})
 
         def test_filled_cell_keeps_the_old_rules(self):
-            verdict, desktop_at = decide_flag(Entry(True, SEP, True), False, None, None, NOV)
+            # 1.3.1 (M3): on first contact a newer last_modified proves nothing about the cell
+            self.assertEqual(decide_flag(Entry(True, SEP, True), False, None, None, NOV), (RETIRE, None))
+            self.assertIsNone(writeback_for(Entry(True, SEP, True), RETIRE, False, None))
+            self.assertEqual(decide_flag(Entry(True, NOV, True), False, None, None, SEP), (APPLY, None))
+            # once the value is known, a calibre edit of the cell is seen by value and wins
+            verdict, desktop_at = decide_flag(Entry(True, SEP, True), False, None, None, NOV,
+                                              seen_value=True)
             self.assertEqual((verdict, desktop_at), (SKIP, NOV))
             self.assertEqual(writeback_for(Entry(True, SEP, True), verdict, False, desktop_at), (False, NOV))
 
