@@ -324,7 +324,8 @@ def flag_blobs_to_prefs(blobs):
 # library is recorded, one JSON object per line: when, book id, title, uuid, column,
 # old value, new value, and the stamp of the app entry that won. One file per
 # library (library_key) in the plugin's own folder of calibre's config directory,
-# never in the library; the oldest lines go once it passes CHANGE_LOG_MAX_LINES.
+# never in the library; the oldest lines go once it passes CHANGE_LOG_MAX_LINES, and
+# the log of a library dropped from the plugin's memory is removed with it.
 
 CHANGE_LOG_DIR = 'calibreader_sync_changes'     # under calibre's config_dir/plugins
 CHANGE_LOG_MAX_LINES = 10000
@@ -925,7 +926,29 @@ def sync_library(db, library_path, prefs, log_dir=None, approve=None, now=None):
             append_change_log(os.path.join(log_dir, key + '.log'), res.changes, format_iso(now))
         except OSError as exc:
             res.notes.append('The change log could not be written ({}).'.format(exc))
+    if log_dir and res.found_any_file:
+        prune_change_logs(log_dir, set(prefs.get('libraries') or ()) | {key})
     return res
+
+
+_LOG_NAME_RE = re.compile(r'^([A-Za-z0-9_-]+-[0-9a-f]{10})\.log$')
+
+
+def prune_change_logs(log_dir, keep):
+    '''(re-review nit) Remove the change logs of libraries the plugin no longer
+    remembers (dropped from the MAX_LIBRARIES window, or a folder that moved), so the
+    folder holds at most MAX_LIBRARIES logs. Only files named like ours.'''
+    try:
+        names = os.listdir(log_dir)
+    except OSError:
+        return
+    for name in names:
+        m = _LOG_NAME_RE.match(name)
+        if m and m.group(1) not in keep:
+            try:
+                os.remove(os.path.join(log_dir, name))
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
