@@ -1,14 +1,20 @@
-# Last modified: 2026-10-21--2257
+# Last modified: 2026-11-02--1416
 #
 # config.py — the plugin's settings dialog (Preferences > Plugins > CalibReader
 # Sync > Customize, or the "Settings…" item in the toolbar button's menu).
 #
-# The user picks which calibre columns receive % read and last read. Nothing
-# is written until they click OK. A column is created only through calibre's
-# own column dialog, after the user presses "Create column…" (the dialog is
-# where they confirm it), and calibre must restart before it can be used.
-# Settings are stored in the library's metadata.db preferences
-# (sync_core.SETTINGS_KEY), so they follow the library to other computers.
+# The user picks which calibre columns receive read status (1.3.0), % read and
+# last read. Nothing is written until they click OK. A column is created only
+# through calibre's own column dialog, after the user presses "Create column…"
+# (the dialog is where they confirm it), and calibre must restart before it can
+# be used. Settings are stored in the library's metadata.db preferences
+# (sync_core.SETTINGS_KEY), so they follow the library to other computers and
+# to the iPhone/iPad app, which reads the same read column (the Android app reads
+# #read_status only).
+#
+# 1.3.1: no read column is pre-selected or saved unless the user picks one (H1);
+# a chosen column that can't be used means read status is not synced (M1); OK
+# kicks a sync (L4); the wording says Android uses #read_status only (L3).
 #
 # Copyright (C) 2026 CalibReader
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU General
@@ -21,22 +27,25 @@ __license__   = 'GPL v3'
 __copyright__ = '2026, CalibReader'
 
 from qt.core import (
-    QCheckBox, QComboBox, QFrame, QGridLayout, QLabel, QPushButton, QSpinBox, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QFrame, QGridLayout, QLabel, QPushButton, QSpinBox, QTimer, QVBoxLayout,
+    QWidget,
 )
 
 try:
     from calibre_plugins.calibreader_sync.sync_core import (
-        MAX_THRESHOLD, POSITIONS_FILE, READ_COLUMN, SETTINGS_KEY, eligible_columns,
-        normalise_settings, read_column_copy_hint, settings_to_store, suggest_column,
+        MAX_THRESHOLD, POSITIONS_FILE, READ_COLUMN, READ_TYPES, SETTINGS_KEY, eligible_columns,
+        normalise_settings, read_column_hint, settings_to_store, suggest_column,
     )
 except ImportError:  # pragma: no cover - standalone / test import
     from sync_core import (
-        MAX_THRESHOLD, POSITIONS_FILE, READ_COLUMN, SETTINGS_KEY, eligible_columns,
-        normalise_settings, read_column_copy_hint, settings_to_store, suggest_column,
+        MAX_THRESHOLD, POSITIONS_FILE, READ_COLUMN, READ_TYPES, SETTINGS_KEY, eligible_columns,
+        normalise_settings, read_column_hint, settings_to_store, suggest_column,
     )
 
-# What "Create column…" proposes. The user can rename both in calibre's dialog.
+# What "Create column…" proposes. The user can rename them in calibre's dialog.
 NEW_COLUMNS = {
+    'read': dict(lookup_name=READ_COLUMN, column_heading='Read Status', datatype='bool',
+                 display={'description': 'Whether you have read the book, from CalibReader (Yes/No).'}),
     'percent': dict(lookup_name='#read_percent', column_heading='Read %', datatype='int',
                     display={'number_format': '{0:d}%',
                              'description': 'How far you have read the book in CalibReader (0-100).'}),
@@ -52,12 +61,42 @@ class ConfigWidget(QWidget):
         self.gui = gui
         self.db = gui.current_db.new_api
         self.custom = self.db.field_metadata.custom_field_metadata()
-        settings = normalise_settings(self.db.pref(SETTINGS_KEY, None))
+        raw = self.db.pref(SETTINGS_KEY, None)
+        settings = normalise_settings(raw)
         never_saved = settings['version'] is None
-        self.restart_note = None
+        read_chosen = isinstance(raw, dict) and 'read_column' in raw
+        self.combos = {}
+        self.new_columns = set()                # created in this dialog, usable after a restart
 
         v = QVBoxLayout(self)
 
+        self.restart_label = self._text('')
+        self.restart_label.setVisible(False)
+        v.addWidget(self.restart_label)
+
+        v.addWidget(self._heading('Read status'))
+        v.addWidget(self._text(
+            'CalibReader marks books read or unread in a Yes/No column. Pick the one you already '
+            'use, or create one. The CalibReader app for iPhone and iPad (1.0.1 or later) reads '
+            'the same column, and read status goes both ways. The Android app uses #read_status '
+            'only: with another column picked here, its marks still reach calibre, but it does '
+            'not see read status changed in calibre.'))
+        grid = QGridLayout()
+        # 1.3.1 (review H1): until the user has chosen, the combo shows #read_status
+        # and NOTHING else is pre-selected; a likely column of their own is only named
+        # in the note below. OK saves a read column only when one was chosen before or
+        # the user picked one here (self.read_chosen / self.read_initial).
+        self.read_chosen = read_chosen
+        self.read_initial = settings['read_column'] if read_chosen else READ_COLUMN
+        self._picker(grid, 0, 'read', 'Read status column:', self.read_initial)
+        grid.setColumnStretch(1, 1)
+        v.addLayout(grid)
+        self.read_note = self._text('')
+        v.addWidget(self.read_note)
+        self.combos['read'].currentIndexChanged.connect(self._update_read_note)
+        self._update_read_note()
+
+        v.addWidget(self._line())
         v.addWidget(self._heading('Reading progress'))
         v.addWidget(self._text(
             'CalibReader can copy how far you have read each book, and when you last read it, '
@@ -65,21 +104,12 @@ class ConfigWidget(QWidget):
             'goes one way, from the app to calibre.'.format(POSITIONS_FILE)))
 
         grid = QGridLayout()
-        self.combos = {}
         for row, (kind, label) in enumerate((('percent', '% read column:'),
                                              ('last_read', 'Last read column:'))):
             stored = settings['percent_column' if kind == 'percent' else 'last_read_column']
             if never_saved and not stored:
                 stored = suggest_column(self.custom, kind)
-            combo = self._combo(kind, stored)
-            button = QPushButton('Create column…', self)
-            button.setToolTip('Opens calibre\'s own dialog to add a column for this. '
-                              'calibre must restart before the new column can be used.')
-            button.clicked.connect(lambda checked=False, k=kind: self.create_column(k))
-            grid.addWidget(QLabel(label, self), row, 0)
-            grid.addWidget(combo, row, 1)
-            grid.addWidget(button, row, 2)
-            self.combos[kind] = combo
+            self._picker(grid, row, kind, label, stored)
 
         self.threshold = QSpinBox(self)
         self.threshold.setRange(0, MAX_THRESHOLD)
@@ -92,33 +122,7 @@ class ConfigWidget(QWidget):
         grid.setColumnStretch(1, 1)
         v.addLayout(grid)
 
-        self.restart_label = self._text('')
-        self.restart_label.setVisible(False)
-        v.addWidget(self.restart_label)
-
-        line = QFrame(self)
-        line.setFrameShape(QFrame.Shape.HLine)
-        v.addWidget(line)
-
-        v.addWidget(self._heading('Read status'))
-        meta = self.custom.get(READ_COLUMN)
-        if meta is not None and meta.get('datatype') == 'bool':
-            status = 'Read status goes into {} (Yes/No). This library has it.'.format(READ_COLUMN)
-        elif meta is not None:
-            status = ('{} is a {} column. Read status needs a Yes/No column, so it is not '
-                      'synced.'.format(READ_COLUMN, meta.get('datatype')))
-        else:
-            status = ('Read status goes into {0}, which this library does not have yet. Add it '
-                      'in Preferences > Add your own columns: lookup name read_status, type '
-                      'Yes/No. Then restart calibre.'.format(READ_COLUMN))
-            hint = read_column_copy_hint(self.custom)
-            if hint:
-                status += '\n\n' + hint
-        v.addWidget(self._text(status))
-
-        line2 = QFrame(self)
-        line2.setFrameShape(QFrame.Shape.HLine)
-        v.addWidget(line2)
+        v.addWidget(self._line())
         v.addWidget(self._heading('Automatic sync'))
         self.auto_sync = QCheckBox('Sync automatically', self)
         self.auto_sync.setChecked(settings['auto_sync'])
@@ -129,7 +133,11 @@ class ConfigWidget(QWidget):
             'bar; nothing pops up. The Sync Read Status button still works any time.'))
 
         v.addWidget(self._text(
-            'These settings are saved in this library, so they follow it to other computers.'))
+            'These settings are saved in this library, so they follow it to other computers. '
+            'Every value the plugin writes into the library is recorded, with the value it '
+            'replaced, in its change log (the arrow next to Sync Read Status, then Change log…). '
+            'The first sync into a read column you pick asks you first, with the number of '
+            'cells it will fill.'))
         v.addStretch(1)
 
     # -- building blocks ------------------------------------------------------
@@ -142,21 +150,68 @@ class ConfigWidget(QWidget):
         label.setWordWrap(True)
         return label
 
+    def _line(self):
+        line = QFrame(self)
+        line.setFrameShape(QFrame.Shape.HLine)
+        return line
+
+    def _picker(self, grid, row, kind, label, selected):
+        combo = self._combo(kind, selected)
+        button = QPushButton('Create column…', self)
+        button.setToolTip('Opens calibre\'s own dialog to add a column for this. '
+                          'calibre must restart before the new column can be used.')
+        button.clicked.connect(lambda checked=False, k=kind: self.create_column(k))
+        grid.addWidget(QLabel(label, self), row, 0)
+        grid.addWidget(combo, row, 1)
+        grid.addWidget(button, row, 2)
+        self.combos[kind] = combo
+
     def _combo(self, kind, selected):
         combo = QComboBox(self)
-        combo.addItem('Don\'t sync', '')
+        if kind != 'read':                      # read status always has a column
+            combo.addItem('Don\'t sync', '')
         for lookup, heading in eligible_columns(self.custom, kind):
             combo.addItem('{} ({})'.format(heading, lookup), lookup)
         if selected:
             index = combo.findData(selected)
             if index < 0:
-                # Configured, but not a column of this library (yet): keep it
-                # visible rather than silently switching the user to "Don't sync".
-                combo.addItem('{} (not in this library; restart calibre if you just '
-                              'created it)'.format(selected), selected)
+                # Configured, but not a usable column of this library (yet): keep it
+                # visible rather than silently switching the user to something else.
+                meta = self.custom.get(selected)
+                if isinstance(meta, dict):
+                    text = '{} ({} column: it can\'t be used for this)'.format(selected, meta.get('datatype'))
+                else:
+                    text = ('{} (not in this library yet; restart calibre if you just created '
+                            'it)'.format(selected))
+                combo.addItem(text, selected)
                 index = combo.count() - 1
             combo.setCurrentIndex(index)
         return combo
+
+    def _update_read_note(self, *args):
+        # 1.3.1 (review M1): a chosen column that can't be used means read status is
+        # not synced at all; it never goes into #read_status instead.
+        lookup = self.combos['read'].currentData()
+        meta = self.custom.get(lookup)
+        if isinstance(meta, dict) and meta.get('datatype') in READ_TYPES:
+            text = 'Read status goes into {} ({}).'.format(meta.get('name') or lookup, lookup)
+            if not self.read_chosen and lookup == READ_COLUMN:
+                hint = read_column_hint(self.custom, exclude=(lookup,), where='above')
+                if hint:
+                    text += '\n\n' + hint
+        elif isinstance(meta, dict):
+            text = ('{} is not a Yes/No column, so read status is not synced. Pick a Yes/No '
+                    'column.'.format(lookup))
+        elif lookup in self.new_columns:
+            text = ('{} can be used once calibre restarts. Until then read status is not synced '
+                    '(it is not written into any other column).'.format(lookup))
+        else:
+            text = ('{} is not in this library. Pick another column, or create one with Create '
+                    'column…. Until then read status is not synced.'.format(lookup))
+            hint = read_column_hint(self.custom, exclude=(lookup, READ_COLUMN), where='above')
+            if hint:
+                text += '\n\n' + hint
+        self.read_note.setText(text)
 
     # -- actions --------------------------------------------------------------
 
@@ -176,6 +231,7 @@ class ConfigWidget(QWidget):
             display=dict(spec['display']), generate_unused_lookup_name=True,
             freeze_lookup_name=False)
         if result == creator.Result.COLUMN_ADDED:
+            self.new_columns.add(message)
             combo = self.combos[kind]
             combo.addItem('{} (new: restart calibre to use it)'.format(message), message)
             combo.setCurrentIndex(combo.count() - 1)
@@ -186,11 +242,34 @@ class ConfigWidget(QWidget):
         elif result != creator.Result.CANCELED:
             error_dialog(self, 'Could not create the column', message, show=True)
 
+    def chosen_read_column(self):
+        '''The read column to save, or None: nothing is saved on the user's behalf
+        (1.3.1) unless they chose a column before or picked one in this dialog.'''
+        lookup = self.combos['read'].currentData()
+        if self.read_chosen or lookup != self.read_initial or lookup in self.new_columns:
+            return lookup
+        return None
+
     def settings(self):
         return settings_to_store(self.combos['percent'].currentData(),
                                  self.combos['last_read'].currentData(),
                                  self.threshold.value(),
-                                 self.auto_sync.isChecked())
+                                 self.auto_sync.isChecked(),
+                                 read_column=self.chosen_read_column())
 
     def save_settings(self):
-        self.db.set_pref(SETTINGS_KEY, self.settings())
+        before = normalise_settings(self.db.pref(SETTINGS_KEY, None))
+        after = self.settings()
+        self.db.set_pref(SETTINGS_KEY, after)
+        # 1.3.1 (review L4): sync once the dialog has closed. A newly picked read column
+        # that exists gets the button's run, which asks before its first sync fills it;
+        # anything else an automatic run (status bar only).
+        action = (getattr(self.gui, 'iactions', None) or {}).get('CalibReader Sync')
+        if action is None:
+            return
+        column = after.get('read_column')
+        usable = (self.custom.get(column) or {}).get('datatype') in READ_TYPES
+        if column and usable and (not before['read_column_set'] or column != before['read_column']):
+            QTimer.singleShot(0, action.sync_read_status)
+        else:
+            QTimer.singleShot(0, lambda: action.auto_sync('settings'))
