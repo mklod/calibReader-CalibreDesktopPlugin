@@ -829,9 +829,10 @@ if __name__ == '__main__':  # pragma: no cover
         def flags(self, **entries):
             self.write(SYNC_FILE, {'schema': 1, 'updated_at': stamp(1), 'books': entries})
 
-        def sync(self, settings=SETTINGS):
+        def sync(self, settings=SETTINGS, approved=None):
+            kwargs = {} if approved is None else {'approved': approved}
             res, self.flag_blobs, self.pos_blob = run_sync(
-                self.db, self.dir, settings, self.flag_blobs, self.pos_blob)
+                self.db, self.dir, settings, self.flag_blobs, self.pos_blob, **kwargs)
             return res
 
         def read_file(self):
@@ -1237,6 +1238,99 @@ if __name__ == '__main__':  # pragma: no cover
             res = self.sync(dict(SETTINGS, read_column='#finished'))
             self.assertIs(self.v('#finished', 1), True)
             self.assertEqual(res.flags_updated, 1)
+
+    class ChangeLogTests(Base):
+        '''M4 (review): every value the plugin writes into the library is recorded, old ->
+        new, so a wrong pick can be undone by hand (calibre has no undo for set_field).'''
+
+        AT = '2026-11-02T22:00:00.000Z'
+
+        def log_lines(self, path):
+            with open(path, encoding='utf-8') as f:
+                return [json.loads(line) for line in f]
+
+        def test_every_cell_write_is_logged_with_its_old_value(self):
+            self.db.values[('#read_status', 2)] = False
+            self.db.values[('title', 1)] = 'Dracula'
+            self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(9)},
+                          'uuid-b': {'value': True, 'updated_at': stamp(9)}})
+            res = self.sync()
+            path = os.path.join(self.dir, 'logs', 'library.log')
+            append_change_log(path, res.changes, self.AT)
+            got = sorted((c['book_id'], c['column'], c['old'], c['new']) for c in self.log_lines(path))
+            self.assertEqual(got, [(1, '#read_status', None, True), (2, '#read_status', False, True)])
+            first = [c for c in self.log_lines(path) if c['book_id'] == 1][0]
+            self.assertEqual((first['at'], first['title'], first['uuid'], first['entry']),
+                             (self.AT, 'Dracula', 'uuid-a', stamp(9)))
+
+        def test_progress_writes_are_logged_too(self):
+            self.db.values[('#read_percent', 1)] = 20
+            self.positions(**{'uuid-a': {'progress': 0.5, 'updated_at': stamp(9)}})
+            res = self.sync()
+            got = sorted((c['column'], c['old'], c['new']) for c in res.changes)
+            self.assertEqual(got, [('#last_read', None, '2026-10-09T12:00:00.000Z'), ('#read_percent', 20, 50)])
+
+        def test_nothing_written_nothing_logged(self):
+            self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(9)}})
+            self.sync()
+            self.assertEqual(self.sync().changes, [])
+
+        def test_the_log_is_capped(self):
+            path = os.path.join(self.dir, 'library.log')
+            for run in range(4):
+                append_change_log(path, [{'book_id': run * 10 + i, 'column': '#c', 'old': None, 'new': True}
+                                         for i in range(10)], self.AT, max_lines=25)
+            got = [c['book_id'] for c in self.log_lines(path)]
+            self.assertEqual(got, list(range(15, 20)) + list(range(20, 40)))
+
+    class FirstSyncConfirmationTests(Base):
+        '''H1/M4 (review): the first sync into a newly chosen read column waits for the
+        user's OK, which shows how many cells it would fill, before writing any of them.'''
+
+        def setUp(self):
+            Base.setUp(self)
+            self.db.field_metadata = FakeFieldMetadata(
+                dict(COLS, **{'#read': {'datatype': 'bool', 'name': 'Have read'}}))
+            self.db.values[('#read', 2)] = False
+            self.flags(**{u: {'value': True, 'updated_at': stamp(9)} for u in ('uuid-a', 'uuid-b', 'uuid-c')})
+            self.positions(**{'uuid-a': {'progress': 0.5, 'updated_at': stamp(9)}})
+
+        def test_first_sync_into_a_chosen_column_waits_for_an_ok_with_counts(self):
+            before = self.file_bytes()
+            res = self.sync(dict(SETTINGS, read_column='#read'))
+            self.assertEqual(res.confirm, {'column': '#read', 'heading': 'Have read', 'fill': 2, 'change': 1})
+            self.assertEqual([w for w in self.db.writes if w[0] == '#read'], [])
+            self.assertEqual(self.v('#read_percent', 1), 50)              # everything else syncs
+            self.assertEqual(res.flags_updated, 0)
+            self.assertNotIn('#read', self.flag_blobs)                    # nothing remembered either
+            self.assertEqual(self.file_bytes(), before)                   # and no stamps
+            self.assertTrue(any('2 empty' in n and '#read' in n for n in res.notes), res.notes)
+            self.assertIn('needs attention', res.status_line())
+            res = self.sync(dict(SETTINGS, read_column='#read'))          # still waiting
+            self.assertIsNotNone(res.confirm)
+            res = self.sync(dict(SETTINGS, read_column='#read'), approved={'#read'})
+            self.assertIsNone(res.confirm)
+            self.assertEqual(res.flags_updated, 3)
+            self.assertEqual([self.v('#read', b) for b in (1, 2, 3)], [True, True, True])
+            self.flags(**{'uuid-a': {'value': False, 'updated_at': stamp(10)}})
+            res = self.sync(dict(SETTINGS, read_column='#read'))          # later runs need no OK
+            self.assertIsNone(res.confirm)
+            self.assertIs(self.v('#read', 1), False)
+
+        def test_default_column_without_a_choice_needs_no_ok(self):
+            res = self.sync()                                             # 1.2.x: #read_status, never chosen
+            self.assertIsNone(res.confirm)
+            self.assertEqual(res.flags_updated, 3)
+
+        def test_a_chosen_read_status_without_memory_waits_too(self):
+            res = self.sync(dict(SETTINGS, read_column='#read_status'))
+            self.assertEqual(res.confirm['fill'], 3)
+
+        def test_no_ok_needed_when_nothing_would_change(self):
+            self.db.values.update({('#read', b): True for b in (1, 2, 3)})
+            res = self.sync(dict(SETTINGS, read_column='#read'))
+            self.assertIsNone(res.confirm)
+            self.assertIn('#read', self.flag_blobs)
 
     class WriteBackTests(Base):
         '''1.2.4: a calibre edit made after the plugin applied a phone entry, before the

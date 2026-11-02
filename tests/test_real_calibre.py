@@ -165,7 +165,7 @@ class RealCalibreBase(unittest.TestCase):
     def v(self, column, book_id):
         return self.lib.api.field_for(column, book_id)
 
-    def run_ui(self):
+    def run_ui(self, approve=None):
         '''The main sync path: ui.CalibReaderSyncAction._run, as the button and the
         automatic sync call it, with the plugin's real JSONConfig.'''
         import ui
@@ -189,7 +189,9 @@ class RealCalibreBase(unittest.TestCase):
             gui = Gui()
         from sync_core import SETTINGS_KEY, normalise_settings
         settings = normalise_settings(self.lib.api.pref(SETTINGS_KEY, None))
-        return ui.CalibReaderSyncAction._run(Action(), self.lib.api, settings)
+        if approve is None:
+            return ui.CalibReaderSyncAction._run(Action(), self.lib.api, settings)
+        return ui.CalibReaderSyncAction._run(Action(), self.lib.api, settings, approve=approve)
 
 
 class RealSyncPathTests(RealCalibreBase):
@@ -278,6 +280,48 @@ class RealColumnSwitchTests(RealCalibreBase):
         entry = self.lib.read_sync()['books'][u1]
         self.assertEqual((entry['value'], entry['updated_at']), (True, t1))
         self.assertEqual(res.flags_sent_back, 0)
+
+
+@unittest.skipUnless(HAVE_CALIBRE, 'needs calibre (run tests/run_calibre.sh)')
+class RealChangeLogTests(RealCalibreBase):
+    def log_lines(self):
+        folder = os.path.join(config_dir, 'plugins', 'calibreader_sync_changes')
+        lines = []
+        for name in sorted(os.listdir(folder)) if os.path.isdir(folder) else []:
+            with open(os.path.join(folder, name), encoding='utf-8') as f:
+                lines += [json.loads(line) for line in f]
+        return lines
+
+    def setUp(self):
+        RealCalibreBase.setUp(self)
+        folder = os.path.join(config_dir, 'plugins', 'calibreader_sync_changes')
+        shutil.rmtree(folder, ignore_errors=True)
+
+    def test_sync_writes_the_change_log_in_the_config_dir(self):
+        (b1, u1), (b2, u2) = self.lib.books(2)
+        self.lib.api.set_field('#read_status', {b1: None, b2: False})
+        self.lib.write_sync({u1: {'value': True, 'updated_at': '2030-01-01T00:00:00.000Z'},
+                             u2: {'value': True, 'updated_at': '2030-01-01T00:00:00.000Z'}})
+        self.run_ui()
+        got = sorted((c['book_id'], c['column'], c['old'], c['new']) for c in self.log_lines())
+        self.assertEqual(got, [(b1, '#read_status', None, True), (b2, '#read_status', False, True)])
+        self.assertEqual(self.log_lines()[0]['title'], self.v('title', self.log_lines()[0]['book_id']))
+
+    def test_first_sync_into_a_chosen_column_waits_for_the_ok(self):
+        (b1, u1), (b2, u2) = self.lib.books(2)
+        self.lib.add_column('read', 'Read')
+        self.lib.set_settings({'version': 1, 'read_column': '#read', 'percent_column': '',
+                               'last_read_column': '', 'progress_threshold': 1, 'auto_sync': True})
+        self.lib.write_sync({u1: {'value': True, 'updated_at': '2030-01-01T00:00:00.000Z'},
+                             u2: {'value': False, 'updated_at': '2030-01-01T00:00:00.000Z'}})
+        res = self.run_ui()
+        self.assertEqual((res.confirm['column'], res.confirm['fill']), ('#read', 2))
+        self.assertIsNone(self.v('#read', b1))
+        self.assertEqual(self.log_lines(), [])
+        res = self.run_ui(approve='#read')
+        self.assertEqual(res.flags_updated, 2)
+        self.assertEqual((self.v('#read', b1), self.v('#read', b2)), (True, False))
+        self.assertEqual(len(self.log_lines()), 2)
 
 
 @unittest.skipUnless(HAVE_CALIBRE, 'needs calibre (run tests/run_calibre.sh)')
