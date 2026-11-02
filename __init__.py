@@ -1,4 +1,4 @@
-# Last modified: 2026-10-22--2103
+# Last modified: 2026-11-02--1430
 #
 # CalibReader Sync — Calibre plugin
 # Reads the sidecars the CalibReader apps keep in the Calibre library folder
@@ -59,6 +59,15 @@
 # in CalibReader_sync.json, so the app can tell a later calibre edit from the
 # plugin's own write (sync_core.update_sync_file).
 #
+# v1.3.1 (fixes from the 1.3.0 review): no read column is pre-selected or saved
+# unless the user picks one, and only explicit read columns are named (H1); the
+# first sync into a chosen column asks first, with the number of cells it fills
+# (H1/M4); a chosen column that is gone is never replaced by #read_status (M1); a
+# bare-bool entry is applied once despite file-stamp churn (M2); a column switch
+# never pushes calibre's old value back on the strength of an unrelated edit (M3);
+# every write is logged old -> new (M4); the plugin's memory is per library (L1).
+# Tests, real calibre included: tests/run_tests.py, tests/run_calibre.sh (M5).
+#
 # Installation:
 #   1. Zip __init__.py, ui.py, config.py, sync_core.py, sidecar_merge.py,
 #      plugin-import-name-calibreader_sync.txt, images/icon.png and LICENSE
@@ -93,7 +102,7 @@ class CalibReaderSyncPlugin(InterfaceActionBase):
                              'app for iPhone and iPad')
     supported_platforms   = ['windows', 'osx', 'linux']
     author                = 'CalibReader'
-    version               = (1, 3, 0)
+    version               = (1, 3, 1)
     minimum_calibre_version = (9, 0, 0)
 
     #: Points Calibre at the InterfaceAction class, in ui.py so that only the GUI imports it.

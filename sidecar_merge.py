@@ -1,4 +1,4 @@
-# Last modified: 2026-10-22--2103
+# Last modified: 2026-11-02--1430
 #
 # sidecar_merge.py — pure decision logic for CalibReader_sync.json.
 #
