@@ -379,7 +379,8 @@ NOT_SEEN = object()   # no value record for this book yet
 
 
 def decide_flag(entry, current_value, applied_stamp, applied_last_modified,
-                book_last_modified, seen_value=NOT_SEEN, desktop_at=None, now=None):
+                book_last_modified, seen_value=NOT_SEEN, desktop_at=None, now=None,
+                applied_value=None):
     '''The read-flag rule. Returns (APPLY/RECORD/SKIP, desktop_at to store).
 
     `now` (1.2.4) caps the desktop-edit time: a `last_modified` in the future (a
@@ -389,14 +390,29 @@ def decide_flag(entry, current_value, applied_stamp, applied_last_modified,
     age: no last_modified or desktop-edit gate, on first contact or later. Only an
     entry this plugin already applied or recorded for the column stays retired (rule
     2), so a cell the user clears in calibre is not refilled by that same old entry;
-    a newer mark from the app fills it. A FILLED cell keeps the rules below.'''
+    a newer mark from the app fills it. A FILLED cell keeps the rules below.
+
+    `applied_value` (1.3.1, review M2) = the value of the entry last applied or recorded
+    for this book. A BARE entry (a legacy bool: its stamp is the FILE's updated_at, which
+    the apps move on every upload) with that same value is the same old mark, whatever
+    the file stamp says now: it is skipped, so a cell the user cleared or changed in
+    calibre is not refilled. Only a bare entry with the other value is a new mark.'''
     if now is not None and book_last_modified is not None and book_last_modified > now:
         desktop_mark = now
     else:
         desktop_mark = book_last_modified
+    has_record = applied_stamp is not None or applied_last_modified is not None
+    bare = entry.stamp is not None and not entry.dated
+    if bare and has_record and applied_value is not None and entry.value == applied_value:
+        if (seen_value is not NOT_SEEN and current_value != seen_value
+                and desktop_mark is not None):
+            desktop_at = later(desktop_at, desktop_mark)         # still note a calibre edit
+        return SKIP, desktop_at
     if current_value is None:
         if entry.stamp is None:                      # undated: only if nothing was ever applied
-            fresh = applied_stamp is None and applied_last_modified is None
+            fresh = not has_record
+        elif bare:                                   # a new bare mark: the other value (M2)
+            fresh = not has_record or (applied_value is not None and entry.value != applied_value)
         else:
             fresh = applied_stamp is None or entry.stamp > applied_stamp
         if fresh:
@@ -457,22 +473,37 @@ def load_flag_records(prefs_blob):
 
 
 def store_flag_record(prefs_blob, uuid, applied_stamp, applied_last_modified, seen_value, desktop_at,
-                      pending=None):
+                      pending=None, applied_value=None):
     '''One book's read-flag bookkeeping (in place). Keeps the 1.2.x keys, so an older
     plugin installed over this one still reads `stamp` and `lm`. `pending` (1.3.0) =
     (value, entry_stamp, applied_at) of an applied_* stamp the sync file could not
-    take this time (see load_pending_stamps).'''
+    take this time (see load_pending_stamps). `applied_value` (1.3.1) = the value of
+    the entry last applied or recorded, kept as 'av' (load_applied_values).'''
     rec = {
         'stamp': format_iso(applied_stamp),
         'lm': format_iso(applied_last_modified),
         'val': seen_value,
         'dt': format_iso(desktop_at),
     }
+    if applied_value is not None:
+        rec['av'] = bool(applied_value)
     if pending is not None:
         rec['pa'] = {'value': bool(pending[0]), 'stamp': format_iso(pending[1]),
                      'at': format_iso(pending[2])}
     prefs_blob[uuid.lower()] = rec
     return prefs_blob
+
+
+def load_applied_values(prefs_blob):
+    '''(1.3.1) `{uuid: value}` of the entry last applied or recorded per book (records
+    written by 1.3.0 and older have none).'''
+    out = {}
+    if not isinstance(prefs_blob, dict):
+        return out
+    for uuid, rec in prefs_blob.items():
+        if isinstance(uuid, str) and isinstance(rec, dict) and isinstance(rec.get('av'), bool):
+            out[uuid.lower()] = rec['av']
+    return out
 
 
 def load_pending_stamps(prefs_blob):
@@ -702,6 +733,20 @@ if __name__ == '__main__':  # pragma: no cover
             # undated: only while nothing was ever applied for the book
             self.assertEqual(decide_flag(Entry(True, None), None, None, None, NOV, seen_value=None)[0], APPLY)
             self.assertEqual(decide_flag(Entry(True, None), None, None, SEP, NOV, seen_value=True)[0], SKIP)
+
+        def test_bare_entry_with_the_applied_value_is_never_reapplied(self):
+            # M2: a bare bool's stamp is the FILE stamp; NOV here is just a later upload
+            bare = Entry(True, NOV, dated=False)
+            self.assertEqual(decide_flag(bare, None, SEP, SEP, OCT, seen_value=True,
+                                         applied_value=True)[0], SKIP)
+            self.assertEqual(decide_flag(bare, False, SEP, SEP, OCT, seen_value=False,
+                                         applied_value=True)[0], SKIP)
+            self.assertEqual(decide_flag(Entry(False, NOV, dated=False), None, SEP, SEP, OCT,
+                                         seen_value=None, applied_value=True)[0], APPLY)
+            self.assertEqual(decide_flag(Entry(True, NOV, dated=True), None, SEP, SEP, OCT,
+                                         seen_value=True, applied_value=True)[0], APPLY)   # dated: newer mark
+            blob = store_flag_record({}, 'A', SEP, SEP, True, None, applied_value=True)
+            self.assertEqual(load_applied_values(json.loads(json.dumps(blob))), {'a': True})
 
         def test_filled_cell_keeps_the_old_rules(self):
             verdict, desktop_at = decide_flag(Entry(True, SEP, True), False, None, None, NOV)

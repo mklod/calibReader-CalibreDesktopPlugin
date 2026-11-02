@@ -39,14 +39,14 @@ try:
     from calibre_plugins.calibreader_sync.sidecar_merge import (
         APPLY, KEY_APPLIED_AT, KEY_APPLIED_VALUE, KEY_UPDATED_AT, KEY_VALUE, NOT_SEEN, RECORD,
         UTC, Target, ceil_ms, decide_flag, format_iso, last_read_value, load_applied,
-        load_flag_records, load_pending_stamps, parse_iso, parse_positions, parse_sidecar,
+        load_applied_values, load_flag_records, load_pending_stamps, parse_iso, parse_positions, parse_sidecar,
         percent_for_column, plan, refresh_lm, store_applied, store_flag_record, writeback_for,
     )
 except ImportError:  # pragma: no cover - standalone / test import
     from sidecar_merge import (
         APPLY, KEY_APPLIED_AT, KEY_APPLIED_VALUE, KEY_UPDATED_AT, KEY_VALUE, NOT_SEEN, RECORD,
         UTC, Target, ceil_ms, decide_flag, format_iso, last_read_value, load_applied,
-        load_flag_records, load_pending_stamps, parse_iso, parse_positions, parse_sidecar,
+        load_applied_values, load_flag_records, load_pending_stamps, parse_iso, parse_positions, parse_sidecar,
         percent_for_column, plan, refresh_lm, store_applied, store_flag_record, writeback_for,
     )
 import datetime as _dt
@@ -588,17 +588,23 @@ def run_sync(db, library_path, settings, flag_blobs, pos_blob):
     if flag_col:
         entries = parse_sidecar(flags_data)
         records = load_flag_records(flag_blob)
+        applied_values = load_applied_values(flag_blob)
         pending = {u: p for u, p in load_pending_stamps(flag_blob).items() if u in uuid_to_id}
         skipped = []
         for uuid, book_id in uuid_to_id.items():
             value = db.field_for(flag_col, book_id)
             value = None if value is None else bool(value)
             stamp, lm, seen, dt = records.get(uuid, (None, None, NOT_SEEN, None))
+            av = applied_values.get(uuid)
             book_lm = _lm(db, book_id)
             entry = entries.get(uuid)
+            if (entry is not None and av is None and not entry.dated and entry.stamp is not None
+                    and stamp is not None and entry.stamp <= stamp):
+                av = entry.value        # a 1.3.0 record of this same bare entry (M2)
             if entry is not None:
                 lm_before[uuid] = book_lm
-                verdict, dt = decide_flag(entry, value, stamp, lm, book_lm, seen, dt, now)
+                verdict, dt = decide_flag(entry, value, stamp, lm, book_lm, seen, dt, now,
+                                          applied_value=av)
                 wb = writeback_for(entry, verdict, value, dt)
                 if wb is not None:
                     writebacks[uuid] = wb
@@ -611,7 +617,7 @@ def run_sync(db, library_path, settings, flag_blobs, pos_blob):
             elif seen is not NOT_SEEN and value != seen and book_lm is not None:
                 mark = book_lm if book_lm <= now else now
                 dt = mark if dt is None or mark > dt else dt
-            flag_state[uuid] = (stamp, lm, dt)
+            flag_state[uuid] = (stamp, lm, dt, av)
         res.flags_skipped = len(skipped)
         res.unmatched.update(u for u in entries if u not in uuid_to_id)
 
@@ -697,14 +703,15 @@ def run_sync(db, library_path, settings, flag_blobs, pos_blob):
     keep = stamps if failed else {}
     if note:
         res.notes.append(note)
-    for uuid, (stamp, lm, dt) in flag_state.items():
+    for uuid, (stamp, lm, dt, av) in flag_state.items():
         if uuid in flag_records:
-            stamp, lm = flag_records[uuid].stamp, lm_after[uuid]
+            stamp, lm, av = flag_records[uuid].stamp, lm_after[uuid], flag_records[uuid].value
         elif uuid in sent:
             stamp = sent[uuid]              # our own entry: never re-decided as a phone change
+            av = writebacks[uuid][0]
         value = db.field_for(flag_col, uuid_to_id[uuid])
         store_flag_record(flag_blob, uuid, stamp, lm, None if value is None else bool(value), dt,
-                          keep.get(uuid))
+                          keep.get(uuid), applied_value=av)
     for uuid, entry in pos_records.items():
         store_applied(pos_blob, uuid, entry.stamp, lm_after[uuid])
     # Our write for one kind of entry must not look like a desktop edit to the other.
