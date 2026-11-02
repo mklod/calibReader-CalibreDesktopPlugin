@@ -703,6 +703,10 @@ if __name__ == '__main__':  # pragma: no cover
     import tempfile
     import unittest
 
+    # calibre 9.x returns last_modified (and date columns) in the computer's local time,
+    # e.g. 2026-11-02 14:15:15.960620-08:00 after set_field; the fake does the same.
+    LOCAL = datetime.timezone(datetime.timedelta(hours=-8))
+
     class FakeFieldMetadata(object):
         def __init__(self, custom):
             self.custom = custom
@@ -729,7 +733,10 @@ if __name__ == '__main__':  # pragma: no cover
             return {b for (f, b) in self.values if f == 'uuid'}
 
         def field_for(self, name, book_id, default_value=None):
-            return self.values.get((name, book_id), default_value)
+            value = self.values.get((name, book_id), default_value)
+            if isinstance(value, datetime.datetime) and value.tzinfo is not None:
+                value = value.astimezone(LOCAL)    # real calibre hands dates back in local time
+            return value
 
         def tick(self, seconds=1):
             self.clock += datetime.timedelta(seconds=seconds, microseconds=777)
