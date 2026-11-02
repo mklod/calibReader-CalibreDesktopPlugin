@@ -1484,6 +1484,26 @@ if __name__ == '__main__':  # pragma: no cover
             self.assertIsNone(res.confirm)
             self.assertIs(self.v('#read', 1), False)
 
+        def test_consent_is_the_users_yes_not_memory(self):
+            # Re-review M4 probe: a first run with nothing to write must not count as consent.
+            prefs = {}
+            self.db.prefs[SETTINGS_KEY] = dict(SETTINGS, read_column='#read')
+            self.flags(**{'uuid-z': {'value': True, 'updated_at': stamp(9)}})   # no book of this library
+            res = sync_library(self.db, self.dir, prefs)
+            self.assertIsNone(res.confirm)                                     # nothing to ask yet
+            self.assertEqual([w for w in self.db.writes if w[0] == '#read'], [])
+            self.flags(**{u: {'value': True, 'updated_at': stamp(2)} for u in ('uuid-a', 'uuid-b', 'uuid-c')})
+            res = sync_library(self.db, self.dir, prefs)                       # the automatic run
+            self.assertIsNotNone(res.confirm)
+            self.assertEqual(res.confirm['fill'], 2)
+            self.assertEqual([w for w in self.db.writes if w[0] == '#read'], [])
+            res = sync_library(self.db, self.dir, prefs, approve='#read')       # the user's Yes
+            self.assertEqual(res.flags_updated, 3)
+            self.flags(**{'uuid-a': {'value': False, 'updated_at': stamp(12)}})
+            res = sync_library(self.db, self.dir, prefs)                       # consent stays
+            self.assertIsNone(res.confirm)
+            self.assertIs(self.v('#read', 1), False)
+
         def test_default_column_without_a_choice_needs_no_ok(self):
             res = self.sync()                                             # 1.2.x: #read_status, never chosen
             self.assertIsNone(res.confirm)

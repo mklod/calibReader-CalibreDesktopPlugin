@@ -325,6 +325,24 @@ class RealChangeLogTests(RealCalibreBase):
 
 
 @unittest.skipUnless(HAVE_CALIBRE, 'needs calibre (run tests/run_calibre.sh)')
+class RealConsentTests(RealCalibreBase):
+    def test_an_empty_first_run_is_not_consent(self):
+        # Re-review M4 probe on real calibre
+        books = self.lib.books(3)
+        self.lib.add_column('read', 'Read')
+        self.lib.set_settings({'version': 1, 'read_column': '#read', 'percent_column': '',
+                               'last_read_column': '', 'progress_threshold': 1, 'auto_sync': True})
+        self.lib.write_sync({'00000000-0000-0000-0000-000000000000': True})
+        res = self.run_ui()
+        self.assertIsNone(res.confirm)
+        self.lib.write_sync({u: {'value': True, 'updated_at': '2020-01-01T00:00:00.000Z'} for _, u in books})
+        res = self.run_ui()
+        self.assertIsNotNone(res.confirm, 'the automatic run filled the column without asking')
+        self.assertEqual(res.confirm['fill'], 3)
+        self.assertEqual([self.v('#read', b) for b, _ in books], [None, None, None])
+
+
+@unittest.skipUnless(HAVE_CALIBRE, 'needs calibre (run tests/run_calibre.sh)')
 class RealButtonTests(RealCalibreBase):
     '''The Sync Read Status button (ui.CalibReaderSyncAction.sync_read_status) with its
     dialogs stubbed: the first-sync question, then the summary.'''
