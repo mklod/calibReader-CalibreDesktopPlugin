@@ -441,12 +441,13 @@ class RealUpgradeTests(RealCalibreBase):
         res = self.run_ui()
         self.assertIsNone(self.v('#read_status', b1))                        # not refilled by the old entry
         self.assertEqual(res.flags_updated, 0)
-        # 1.3.1 (L1): the 1.2.5 memory moved under this library, on disk
+        # 1.3.1 (L1): the 1.2.5 memory copied under this library, on disk; the old keys stay
         from calibre.utils.config import JSONConfig
         on_disk = JSONConfig('plugins/calibreader_sync')
-        self.assertNotIn('applied', on_disk)
-        (state,) = on_disk['libraries'].values()
+        self.assertIn(u1, on_disk['applied'])
+        (key, state), = on_disk['libraries'].items()
         self.assertIn(u1, state['applied'])
+        self.assertEqual(on_disk['legacy_done'], [key])
 
 
 _APP = None

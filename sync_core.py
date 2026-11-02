@@ -835,22 +835,47 @@ def run_sync(db, library_path, settings, flag_blobs, pos_blob, approved=()):
 # calibre edits and wrote them back into its own sync file, and the memory grew with
 # every library ever synced. Now: prefs['libraries'][library_key] = {'applied',
 # 'applied_cols', 'applied_pos', 'confirmed', 'used'}, for the MAX_LIBRARIES most
-# recently synced libraries. The 1.3.0 / 1.2.x top-level memory moves, once, to the
-# first library that syncs with CalibReader files in it.
+# recently synced libraries.
+# Upgrade (re-review L1): the 1.3.0 / 1.2.x top-level memory is COPIED to each library
+# the first time it syncs, filtered to that library's own uuids, so every library
+# keeps what it had (moving it all to the first library made the others forget, and
+# refill cells the user had cleared). The top-level keys are left as they were (no
+# longer updated; a downgrade finds them); 'legacy_done' lists the libraries that got
+# their copy, so a library dropped from the window never gets the stale copy again.
 
 MAX_LIBRARIES = 8
-_STATE_KEYS = ('applied', 'applied_cols', 'applied_pos', 'approved')
+MAX_LEGACY_DONE = 64
+_LEGACY_KEYS = ('applied', 'applied_cols', 'applied_pos')
 
 
-def _load_library_state(prefs, key):
+def _library_uuids(db):
+    out = set()
+    for book_id in db.all_book_ids():
+        uuid = db.field_for('uuid', book_id)
+        if uuid:
+            out.add(uuid.lower())
+    return out
+
+
+def _load_library_state(prefs, key, db):
     '''(state, from_legacy) for one library.'''
     libraries = prefs.get('libraries')
     state = libraries.get(key) if isinstance(libraries, dict) else None
     if isinstance(state, dict):
         return state, False
-    if any(k in prefs for k in _STATE_KEYS):
-        return {k: prefs.get(k) for k in _STATE_KEYS}, True
-    return {}, False
+    if not any(isinstance(prefs.get(k), dict) and prefs.get(k) for k in _LEGACY_KEYS):
+        return {}, False
+    if key in (prefs.get('legacy_done') or ()):
+        return {}, False
+    uuids = _library_uuids(db)
+
+    def mine(blob):
+        return ({u: r for u, r in blob.items() if isinstance(u, str) and u.lower() in uuids}
+                if isinstance(blob, dict) else {})
+    cols = prefs.get('applied_cols')
+    return {'applied': mine(prefs.get('applied')),
+            'applied_cols': {c: mine(b) for c, b in cols.items()} if isinstance(cols, dict) else {},
+            'applied_pos': mine(prefs.get('applied_pos'))}, True
 
 
 def _store_library_state(prefs, key, state, now, from_legacy):
@@ -863,9 +888,8 @@ def _store_library_state(prefs, key, state, now, from_legacy):
             del libraries[k]
     prefs['libraries'] = libraries              # assignment is what commits a JSONConfig
     if from_legacy:
-        for k in _STATE_KEYS:
-            if k in prefs:
-                del prefs[k]
+        done = [k for k in (prefs.get('legacy_done') or ()) if k != key] + [key]
+        prefs['legacy_done'] = done[-MAX_LEGACY_DONE:]
 
 
 def sync_library(db, library_path, prefs, log_dir=None, approve=None, now=None):
@@ -876,7 +900,7 @@ def sync_library(db, library_path, prefs, log_dir=None, approve=None, now=None):
     OK'd for its first sync (res.confirm). Returns the SyncResult.'''
     now = now or _dt.datetime.now(UTC)
     key = library_key(db, library_path)
-    state, from_legacy = _load_library_state(prefs, key)
+    state, from_legacy = _load_library_state(prefs, key, db)
     settings = normalise_settings(db.pref(SETTINGS_KEY, None))
     # 'confirmed' (re-review M4): the read columns the user said Yes to; only a Yes adds
     # one, and it stays. ('approved' is the name an unreleased 1.3.1 build used.)
@@ -1956,18 +1980,22 @@ if __name__ == '__main__':  # pragma: no cover
             self.assertEqual(sorted(states['0001']['applied']), ['uuid-a', 'uuid-b'])
             self.assertEqual(sorted(states['0002']['applied']), ['uuid-x', 'uuid-y'])
 
-        def test_the_12x_memory_moves_to_the_first_library_that_syncs(self):
+        def test_the_12x_memory_is_copied_once_per_library(self):
             self.dbs[0].values[('#read_status', 1)] = True
-            self.prefs.update({'applied': {'uuid-a': {'stamp': stamp(2), 'lm': None, 'val': True, 'dt': None}},
-                               'applied_cols': {}, 'applied_pos': {}})
+            legacy = {'applied': {'uuid-a': {'stamp': stamp(2), 'lm': None, 'val': True, 'dt': None}},
+                      'applied_cols': {}, 'applied_pos': {}}
+            self.prefs.update(json.loads(json.dumps(legacy)))
             self.flags(0, **{'uuid-a': {'value': True, 'updated_at': stamp(2)}})
             res = self.sync_lib(0)
             self.assertEqual((res.flags_updated, res.flags_skipped), (0, 1))      # the 1.2.x record was used
-            self.assertNotIn('applied', self.prefs)
-            (state,) = self.prefs['libraries'].values()
-            self.assertIn('uuid-a', state['applied'])
-            self.flags(1, **{'uuid-a': {'value': True, 'updated_at': stamp(2)}})
-            self.assertEqual(self.sync_lib(1).flags_updated, 1)                        # a second library starts fresh
+            self.assertEqual(self.prefs['applied'], legacy['applied'])           # left as it was
+            (key,) = self.prefs['libraries']
+            self.assertEqual(self.prefs['legacy_done'], [key])
+            self.assertIn('uuid-a', self.prefs['libraries'][key]['applied'])
+            # evicted from the window later: it does not get the stale copy again
+            del self.prefs['libraries'][key]
+            state, from_legacy = _load_library_state(self.prefs, key, self.dbs[0])
+            self.assertEqual((state, from_legacy), ({}, False))
 
     class SettingsTests(unittest.TestCase):
         def test_read_column_round_trip(self):
