@@ -229,7 +229,7 @@ class RealColumnGoneTests(RealCalibreBase):
         self.lib.set_settings({'version': 1, 'read_column': '#read', 'percent_column': '',
                                'last_read_column': '', 'progress_threshold': 1, 'auto_sync': True})
         self.lib.write_sync({u1: {'value': True, 'updated_at': '2030-01-01T00:00:00.000Z'}})
-        self.run_ui()
+        self.run_ui(approve='#read')                               # the first sync's OK (1.3.1)
         self.assertIs(self.v('#read', b1), True)
         self.lib.delete_column('read')
         self.lib.write_sync({u1: {'value': True, 'updated_at': '2030-01-02T00:00:00.000Z'},
@@ -322,6 +322,71 @@ class RealChangeLogTests(RealCalibreBase):
         self.assertEqual(res.flags_updated, 2)
         self.assertEqual((self.v('#read', b1), self.v('#read', b2)), (True, False))
         self.assertEqual(len(self.log_lines()), 2)
+
+
+@unittest.skipUnless(HAVE_CALIBRE, 'needs calibre (run tests/run_calibre.sh)')
+class RealButtonTests(RealCalibreBase):
+    '''The Sync Read Status button (ui.CalibReaderSyncAction.sync_read_status) with its
+    dialogs stubbed: the first-sync question, then the summary.'''
+
+    def press(self, answer):
+        import ui
+        lib, asked, shown = self.lib, [], []
+
+        class Model(object):
+            def refresh(self):
+                pass
+
+        class View(object):
+            def model(self):
+                return Model()
+
+        class Gui(object):
+            library_path = lib.path
+            library_view = View()
+            current_db = lib.legacy
+
+        class Action(object):
+            gui = Gui()
+            _run = ui.CalibReaderSyncAction._run
+            _file_stamps = ui.CalibReaderSyncAction._file_stamps
+            _confirm_first_sync = ui.CalibReaderSyncAction._confirm_first_sync
+            sync_read_status = ui.CalibReaderSyncAction.sync_read_status
+
+        saved = ui.question_dialog, ui.info_dialog, ui.error_dialog
+        ui.question_dialog = lambda parent, title, msg, **kw: asked.append(msg) or answer
+        ui.info_dialog = ui.error_dialog = lambda parent, title, msg, **kw: shown.append(msg)
+        try:
+            Action().sync_read_status()
+        finally:
+            ui.question_dialog, ui.info_dialog, ui.error_dialog = saved
+        return asked, shown
+
+    def setUp(self):
+        RealCalibreBase.setUp(self)
+        (self.b1, u1), (self.b2, u2) = self.lib.books(2)
+        self.lib.add_column('read', 'Read')
+        self.lib.api.set_field('#read', {self.b2: False})
+        self.lib.set_settings({'version': 1, 'read_column': '#read', 'percent_column': '',
+                               'last_read_column': '', 'progress_threshold': 1, 'auto_sync': True})
+        self.lib.write_sync({u1: {'value': True, 'updated_at': '2030-01-01T00:00:00.000Z'},
+                             u2: {'value': True, 'updated_at': '2030-01-01T00:00:00.000Z'}})
+
+    def test_no_writes_nothing_and_says_it_is_waiting(self):
+        asked, shown = self.press(False)
+        self.assertEqual(len(asked), 1)
+        self.assertIn('1 empty cell(s)', asked[0])
+        self.assertIn('change 1 filled cell(s)', asked[0])
+        self.assertIsNone(self.v('#read', self.b1))
+        self.assertIn('waiting for your OK', shown[0])
+
+    def test_yes_fills_the_column(self):
+        asked, shown = self.press(True)
+        self.assertEqual(len(asked), 1)
+        self.assertEqual((self.v('#read', self.b1), self.v('#read', self.b2)), (True, True))
+        self.assertIn('Read status (#read): 2 book(s) updated.', shown[0])
+        asked, shown = self.press(True)                            # the next press asks nothing
+        self.assertEqual(asked, [])
 
 
 @unittest.skipUnless(HAVE_CALIBRE, 'needs calibre (run tests/run_calibre.sh)')

@@ -1,4 +1,4 @@
-# Last modified: 2026-10-22--2048
+# Last modified: 2026-11-02--1416
 #
 # config.py — the plugin's settings dialog (Preferences > Plugins > CalibReader
 # Sync > Customize, or the "Settings…" item in the toolbar button's menu).
@@ -22,7 +22,8 @@ __license__   = 'GPL v3'
 __copyright__ = '2026, CalibReader'
 
 from qt.core import (
-    QCheckBox, QComboBox, QFrame, QGridLayout, QLabel, QPushButton, QSpinBox, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QFrame, QGridLayout, QLabel, QPushButton, QSpinBox, QTimer, QVBoxLayout,
+    QWidget,
 )
 
 try:
@@ -125,7 +126,11 @@ class ConfigWidget(QWidget):
             'bar; nothing pops up. The Sync Read Status button still works any time.'))
 
         v.addWidget(self._text(
-            'These settings are saved in this library, so they follow it to other computers.'))
+            'These settings are saved in this library, so they follow it to other computers. '
+            'Every value the plugin writes into the library is recorded, with the value it '
+            'replaced, in its change log (the arrow next to Sync Read Status, then Change log…). '
+            'The first sync into a read column you pick asks you first, with the number of '
+            'cells it will fill.'))
         v.addStretch(1)
 
     # -- building blocks ------------------------------------------------------
@@ -246,4 +251,18 @@ class ConfigWidget(QWidget):
                                  read_column=self.chosen_read_column())
 
     def save_settings(self):
-        self.db.set_pref(SETTINGS_KEY, self.settings())
+        before = normalise_settings(self.db.pref(SETTINGS_KEY, None))
+        after = self.settings()
+        self.db.set_pref(SETTINGS_KEY, after)
+        # 1.3.1 (review L4): sync once the dialog has closed. A newly picked read column
+        # that exists gets the button's run, which asks before its first sync fills it;
+        # anything else an automatic run (status bar only).
+        action = (getattr(self.gui, 'iactions', None) or {}).get('CalibReader Sync')
+        if action is None:
+            return
+        column = after.get('read_column')
+        usable = (self.custom.get(column) or {}).get('datatype') in READ_TYPES
+        if column and usable and (not before['read_column_set'] or column != before['read_column']):
+            QTimer.singleShot(0, action.sync_read_status)
+        else:
+            QTimer.singleShot(0, lambda: action.auto_sync('settings'))

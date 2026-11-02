@@ -31,6 +31,7 @@ from __future__ import annotations
 __license__   = 'GPL v3'
 __copyright__ = '2026, CalibReader'
 
+import hashlib
 import json
 import os
 import re
@@ -317,6 +318,71 @@ def flag_blobs_to_prefs(blobs):
     return blobs.pop(READ_COLUMN, {}), blobs
 
 
+# --- the change log (1.3.1, review M4) ------------------------------------------
+#
+# calibre has no undo for set_field, so every value the plugin writes into a
+# library is recorded, one JSON object per line: when, book id, title, uuid, column,
+# old value, new value, and the stamp of the app entry that won. One file per
+# library (library_key) in the plugin's own folder of calibre's config directory,
+# never in the library; the oldest lines go once it passes CHANGE_LOG_MAX_LINES.
+
+CHANGE_LOG_DIR = 'calibreader_sync_changes'     # under calibre's config_dir/plugins
+CHANGE_LOG_MAX_LINES = 10000
+
+
+def library_key(db, library_path):
+    '''A per-library key for the plugin's own files and memory: calibre's library_id
+    plus a hash of the library's folder. A copied library keeps the same library_id
+    (it lives in metadata.db), so the folder tells copies apart.'''
+    lid = re.sub(r'[^A-Za-z0-9_-]', '', str(getattr(db, 'library_id', '') or ''))[:64] or 'library'
+    folder = os.path.normcase(os.path.realpath(library_path or ''))
+    return '{}-{}'.format(lid, hashlib.sha1(folder.encode('utf-8')).hexdigest()[:10])
+
+
+def change_log_path(config_dir, db, library_path):
+    return os.path.join(config_dir, 'plugins', CHANGE_LOG_DIR, library_key(db, library_path) + '.log')
+
+
+def _json_value(value):
+    if isinstance(value, _dt.datetime):
+        return format_iso(value)
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    return str(value)
+
+
+def append_change_log(path, changes, at, max_lines=CHANGE_LOG_MAX_LINES):
+    '''Append `changes` (SyncResult.changes) to the log at `path`, each line stamped
+    `at`; keep only the newest max_lines lines.'''
+    if not changes:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    lines = [json.dumps(dict([('at', at)] + list(c.items())), ensure_ascii=False) + '\n'
+             for c in changes]
+    existing = []
+    if os.path.exists(path):
+        with open(path, 'r', encoding='utf-8') as f:
+            existing = f.readlines()
+    if len(existing) + len(lines) <= max_lines:
+        with open(path, 'a', encoding='utf-8', newline='\n') as f:
+            f.writelines(lines)
+        return
+    keep = (existing + lines)[-max_lines:]
+    tmp = '{}.tmp.{}'.format(path, _uuid.uuid4().hex)
+    with open(tmp, 'w', encoding='utf-8', newline='\n') as f:
+        f.writelines(keep)
+    os.replace(tmp, path)
+
+
+def confirm_note(confirm):
+    '''(1.3.1) The summary line for a first sync waiting for the user's OK.'''
+    change = (' and change {} filled cell(s)'.format(confirm['change']) if confirm['change'] else '')
+    return ('Read status is waiting for your OK: this is the first sync into {} ({}), and it would '
+            'fill {} empty cell(s){} with the app\'s read marks. Click Sync Read Status to review '
+            'and confirm it. Nothing has been written into that column yet.').format(
+                confirm['heading'], confirm['column'], confirm['fill'], change)
+
+
 # --- one run ------------------------------------------------------------------
 
 class SyncResult(object):
@@ -337,6 +403,9 @@ class SyncResult(object):
         self.progress_columns = []     # the % read / last read columns usable this run
         self.columns_written = []      # e.g. ['#read_status', '#read_percent']
         self.notes = []                # plain-English problems worth showing
+        self.changes = []              # 1.3.1: every value written, old -> new (append_change_log)
+        self.confirm = None            # 1.3.1: {column, heading, fill, change} of a first sync
+                                       # into a chosen column waiting for the user's OK
 
     @property
     def found_any_file(self):
@@ -522,12 +591,18 @@ def write_back_flags(library_path, writebacks):
     return written, note
 
 
-def run_sync(db, library_path, settings, flag_blobs, pos_blob):
+def run_sync(db, library_path, settings, flag_blobs, pos_blob, approved=()):
     '''One sync. Returns (SyncResult, new_flag_blobs, new_pos_blob); these are the
     plugin's per-book bookkeeping (see sidecar_merge), to be stored by the caller.
     `flag_blobs` = {read column: {uuid: record}} (flag_blobs_from_prefs); only the
     blob of the column used this run is read or changed. Nothing is written to
-    calibre unless a rule says it may.'''
+    calibre unless a rule says it may.
+
+    1.3.1 (review H1/M4): the FIRST sync into a read column the user chose (no memory
+    for it yet) writes nothing into it, unless the column is in `approved`: it sets
+    res.confirm to the counts (empty cells it would fill, filled ones it would change)
+    for the user's OK, and everything else syncs as usual. The #read_status default of
+    a library where no read column was ever chosen works as in 1.2.x.'''
     settings = normalise_settings(settings)
     flag_blobs = {c: dict(b) for c, b in (flag_blobs or {}).items() if isinstance(b, dict)}
     flag_blob = {}
@@ -661,18 +736,38 @@ def run_sync(db, library_path, settings, flag_blobs, pos_blob):
         pos_updates, pos_records, skipped, _ = plan(targets, state)
         res.progress_skipped = len(skipped)
 
-    # Writes. Every set_field bumps the books' last_modified.
+    # 1.3.1: the first sync into a chosen read column waits for the user's OK.
+    gated = False
+    if (flag_col and flag_updates and settings['read_column_set'] and not flag_blobs.get(flag_col)
+            and flag_col not in (approved or ())):
+        fill = sum(1 for u in flag_updates if db.field_for(flag_col, uuid_to_id[u]) is None)
+        res.confirm = {'column': flag_col, 'heading': (custom.get(flag_col) or {}).get('name') or flag_col,
+                       'fill': fill, 'change': len(flag_updates) - fill}
+        res.notes.append(confirm_note(res.confirm))
+        flag_updates, flag_records, flag_state, writebacks, pending, retired = {}, {}, {}, {}, {}, {}
+        res.flags_skipped = 0
+        gated = True
+
+    # Writes. Every set_field bumps the books' last_modified. 1.3.1 (M4): each value
+    # written is recorded with the value it replaced (res.changes).
+    def write(column, mapping, stamps):
+        for book_id, uuid in sorted((uuid_to_id[u], u) for u in mapping):
+            res.changes.append({'book_id': book_id, 'title': _json_value(db.field_for('title', book_id)),
+                                'uuid': uuid, 'column': column,
+                                'old': _json_value(db.field_for(column, book_id)),
+                                'new': _json_value(mapping[uuid]), 'entry': format_iso(stamps.get(uuid))})
+        db.set_field(column, {uuid_to_id[u]: v for u, v in mapping.items()})
+        res.columns_written.append(column)
+
     if flag_updates:
-        db.set_field(flag_col, {uuid_to_id[u]: v for u, v in flag_updates.items()})
-        res.columns_written.append(flag_col)
-    pct_map = {uuid_to_id[u]: v[0] for u, v in pos_updates.items() if v[0] is not None}
-    last_map = {uuid_to_id[u]: v[1] for u, v in pos_updates.items() if v[1] is not None}
+        write(flag_col, flag_updates, {u: flag_records[u].stamp for u in flag_updates})
+    pos_stamps = {u: t.stamp for u, t in pos_records.items()}
+    pct_map = {u: v[0] for u, v in pos_updates.items() if v[0] is not None}
+    last_map = {u: v[1] for u, v in pos_updates.items() if v[1] is not None}
     if pct_map:
-        db.set_field(pct_col, pct_map)
-        res.columns_written.append(pct_col)
+        write(pct_col, pct_map, pos_stamps)
     if last_map:
-        db.set_field(last_col, last_map)
-        res.columns_written.append(last_col)
+        write(last_col, last_map, pos_stamps)
     res.flags_updated = len(flag_updates)
     res.progress_updated = len(pos_updates)
 
@@ -691,7 +786,7 @@ def run_sync(db, library_path, settings, flag_blobs, pos_blob):
     # write-backs (calibre's own value), are stamped too, with the book's current
     # last_modified rounded up to the ms; update_sync_file stamps each entry once.
     agreeing, wb_stamped = {}, {}
-    if flag_col:
+    if flag_col and not gated:
         def current_lm(uuid):
             return ceil_ms(lm_after.get(uuid) or _lm(db, uuid_to_id[uuid]) or _dt.datetime.now(UTC))
         for uuid, entry in entries.items():
@@ -725,9 +820,42 @@ def run_sync(db, library_path, settings, flag_blobs, pos_blob):
             refresh_lm(flag_blob, uuid, lm_before.get(uuid), lm_after[uuid])
         if uuid not in pos_records:
             refresh_lm(pos_blob, uuid, lm_before.get(uuid), lm_after[uuid])
-    if flag_col:
+    if flag_col and not gated:
         flag_blobs[flag_col] = flag_blob
     return res, flag_blobs, pos_blob
+
+
+def sync_library(db, library_path, prefs, log_dir=None, approve=None, now=None):
+    '''(1.3.1) One run as the plugin's GUI makes it (the button and the automatic sync,
+    ui.py): the library's settings, the plugin's memory in `prefs` (its JSONConfig, or
+    any dict), run_sync, the memory stored back, and the change log written into
+    `log_dir` (change_log_path). `approve` = a read column the user just OK'd for its
+    first sync (res.confirm). Returns the SyncResult.'''
+    now = now or _dt.datetime.now(UTC)
+    settings = normalise_settings(db.pref(SETTINGS_KEY, None))
+    approved = set(c for c in (prefs.get('approved') or ()) if isinstance(c, str))
+    if approve:
+        approved.add(approve)
+    res, flag_blobs, pos_blob = run_sync(
+        db, library_path, settings,
+        flag_blobs_from_prefs(prefs.get('applied', {}), prefs.get('applied_cols', {})),
+        prefs.get('applied_pos', {}), approved=approved)
+    approved = sorted(c for c in approved if not flag_blobs.get(c))   # an OK is used up by the sync
+    if res.found_any_file:
+        # Assignment is what commits a JSONConfig. Stored even when nothing was
+        # written: a RECORD verdict must persist so a retired entry is never
+        # reconsidered.
+        prefs['applied'], prefs['applied_cols'] = flag_blobs_to_prefs(flag_blobs)
+        prefs['applied_pos'] = pos_blob
+    if approved != sorted(prefs.get('approved') or ()):
+        prefs['approved'] = approved
+    if log_dir and res.changes:
+        try:
+            append_change_log(os.path.join(log_dir, library_key(db, library_path) + '.log'),
+                              res.changes, format_iso(now))
+        except OSError as exc:
+            res.notes.append('The change log could not be written ({}).'.format(exc))
+    return res
 
 
 # ---------------------------------------------------------------------------
@@ -1140,7 +1268,7 @@ if __name__ == '__main__':  # pragma: no cover
             self.db.tick(3600 * 24 * 9)                        # Oct 10: the user's own #read
             self.db.set_field('#read', {2: False, 3: False})   # a empty, b filled differently, c agrees
             self.db.desktop_edit('rating', 1, 8)               # a edited too: newer than its app entry
-            res = self.sync(dict(SETTINGS, read_column='#read'))
+            res = self.sync(dict(SETTINGS, read_column='#read'), approved={'#read'})
             self.assertIs(self.v('#read', 1), True)            # empty: filled from the old entry
             self.assertIs(self.v('#read', 2), False)           # filled: kept
             self.assertIs(self.v('#read', 3), False)           # filled, agrees
@@ -1404,7 +1532,7 @@ if __name__ == '__main__':  # pragma: no cover
 
         def test_chosen_column_gets_the_read_flag(self):
             self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(2)}, 'uuid-b': False})
-            res = self.sync(dict(SETTINGS, read_column='#read'))
+            res = self.sync(dict(SETTINGS, read_column='#read'), approved={'#read'})
             self.assertIs(self.v('#read', 1), True)
             self.assertIs(self.v('#read', 2), False)
             self.assertIsNone(self.v('#read_status', 1))     # the default column is left alone
@@ -1445,7 +1573,7 @@ if __name__ == '__main__':  # pragma: no cover
             self.assertEqual(self.sync().flags_updated, 1)    # into #read_status
             # The user picks #read (empty). With one shared memory the entry would be
             # "already applied" and #read would never get it.
-            res = self.sync(dict(SETTINGS, read_column='#read'))
+            res = self.sync(dict(SETTINGS, read_column='#read'), approved={'#read'})
             self.assertIs(self.v('#read', 1), True)
             self.assertEqual(res.flags_updated, 1)
             self.assertEqual(sorted(self.flag_blobs), ['#read', '#read_status'])
