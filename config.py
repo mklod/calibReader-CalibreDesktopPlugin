@@ -9,7 +9,12 @@
 # (the dialog is where they confirm it), and calibre must restart before it can
 # be used. Settings are stored in the library's metadata.db preferences
 # (sync_core.SETTINGS_KEY), so they follow the library to other computers and
-# to the apps, which read the same read column.
+# to the iPhone/iPad app, which reads the same read column (the Android app reads
+# #read_status only).
+#
+# 1.3.1: no read column is pre-selected or saved unless the user picks one (H1);
+# a chosen column that can't be used means read status is not synced (M1); OK
+# kicks a sync (L4); the wording says Android uses #read_status only (L3).
 #
 # Copyright (C) 2026 CalibReader
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU General
@@ -72,8 +77,10 @@ class ConfigWidget(QWidget):
         v.addWidget(self._heading('Read status'))
         v.addWidget(self._text(
             'CalibReader marks books read or unread in a Yes/No column. Pick the one you already '
-            'use, or create one. The CalibReader app reads the same column (app 1.0.1 or later), '
-            'and read status goes both ways.'))
+            'use, or create one. The CalibReader app for iPhone and iPad (1.0.1 or later) reads '
+            'the same column, and read status goes both ways. The Android app uses #read_status '
+            'only: with another column picked here, its marks still reach calibre, but it does '
+            'not see read status changed in calibre.'))
         grid = QGridLayout()
         # 1.3.1 (review H1): until the user has chosen, the combo shows #read_status
         # and NOTHING else is pre-selected; a likely column of their own is only named
