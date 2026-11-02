@@ -112,7 +112,9 @@ def normalise_settings(raw):
 
 def settings_to_store(percent_column, last_read_column, progress_threshold, auto_sync=True,
                       read_column=READ_COLUMN):
-    return normalise_settings({
+    '''The settings dict to store. read_column=None (1.3.1) leaves "read_column" out:
+    the user has not chosen a read column, and none is saved on their behalf.'''
+    out = normalise_settings({
         'version': SETTINGS_VERSION,
         'read_column': read_column or READ_COLUMN,
         'percent_column': percent_column or '',
@@ -120,6 +122,9 @@ def settings_to_store(percent_column, last_read_column, progress_threshold, auto
         'progress_threshold': progress_threshold,
         'auto_sync': bool(auto_sync),
     })
+    if read_column is None:
+        del out['read_column']
+    return out
 
 
 def eligible_columns(custom_columns, kind):
@@ -161,45 +166,55 @@ def suggest_column(custom_columns, kind):
 #
 # Many libraries already track read status in their own Yes/No column (#read,
 # #finished, KOReader Sync's #ko_statusbool). From 1.3.0 the user picks the read
-# column in Settings ("read_column"), and the apps follow the same choice. Until
-# the user has chosen, Settings offers #read_status if the library has it, else
-# the existing column that looks most like a read flag. Nothing is ever picked
-# without the user clicking OK in Settings.
+# column in Settings ("read_column"), and the apps follow the same choice.
+# 1.3.1 (review H1): a column is named as a likely read column only when its lookup
+# name or its whole heading says exactly that (#read, #have_read, #is_read,
+# #finished, #ko_statusbool; "Read", "Have read", "Is read", "Read status",
+# "Finished"). Matching parts of words named columns meaning the opposite (#abandoned
+# via "done", "Did not finish", #incomplete, #proofread, #ready...). And it is only
+# ever NAMED (a hint in Settings and in the summary): Settings never pre-selects it,
+# and saves a read column only when the user picked one.
 
-_READ_FLAG_RE = re.compile(r'read|finish|done|complete|statusbool', re.I)
-_NOT_READ_RE = re.compile(r'unread|not.?read|to.?read|want|tbr|wish', re.I)
-# Most likely first: "#read", a heading "Read" / "Have read", then finished, done...
-_READ_RANK = [re.compile(p, re.I) for p in (
-    r'^#read$', r'^read$|have.?read', r'finish', r'done', r'complete', r'read', r'statusbool')]
+_EXPLICIT_READ = [(re.compile(lookup), re.compile(heading) if heading else None) for lookup, heading in (
+    (r'^#read$', r'^read$'),                    # most likely first
+    (r'^#have_?read$', r'^have read$'),
+    (r'^#is_?read$', r'^is read$'),
+    (r'^#read_?status$', r'^read status$'),
+    (r'^#finished$', r'^finished$'),
+    (r'^#ko_statusbool$', None),                # KOReader Sync's read flag
+)]
 
 
 def _read_rank(lookup, heading):
-    for rank, rx in enumerate(_READ_RANK):
-        if rx.search(lookup) or rx.search(heading):
+    '''Position in _EXPLICIT_READ of the first pattern the column matches, or None.'''
+    lookup = (lookup or '').lower()
+    heading = ' '.join((heading or '').lower().replace('_', ' ').split())
+    for rank, (lookup_rx, heading_rx) in enumerate(_EXPLICIT_READ):
+        if lookup_rx.match(lookup) or (heading_rx is not None and heading_rx.match(heading)):
             return rank
-    return len(_READ_RANK)
+    return None
 
 
 def existing_read_columns(custom_columns, exclude=READ_COLUMN):
     '''[(lookup, heading)] of Yes/No columns, other than `exclude` (one lookup name
-    or several), whose lookup name or heading looks like a read flag (not "unread"
-    / "to read"), the most likely first.'''
+    or several), whose lookup name or whole heading says "read" explicitly (see
+    _EXPLICIT_READ), the most likely first.'''
     excluded = (exclude,) if isinstance(exclude, str) else tuple(exclude or ())
     out = []
     for lookup, meta in (custom_columns or {}).items():
         if lookup in excluded or not isinstance(meta, dict) or meta.get('datatype') != 'bool':
             continue
         heading = meta.get('name') or lookup
-        names = lookup + ' ' + heading
-        if _READ_FLAG_RE.search(names) and not _NOT_READ_RE.search(names):
-            out.append((lookup, heading))
-    return sorted(out, key=lambda x: (_read_rank(*x), x[1].lower(), x[0]))
+        rank = _read_rank(lookup, heading)
+        if rank is not None:
+            out.append((rank, heading.lower(), lookup, heading))
+    return [(lookup, heading) for _, _, lookup, heading in sorted(out)]
 
 
 def suggest_read_column(custom_columns):
-    '''The read column Settings offers before the user has chosen one: #read_status
-    if the library has it as Yes/No, else the likeliest existing read column, else
-    #read_status (to be created).'''
+    '''The read column to NAME before the user has chosen one (1.3.1: Settings shows it
+    as a hint and never pre-selects it): #read_status if the library has it as Yes/No,
+    else the likeliest explicit read column, else #read_status (to be created).'''
     meta = (custom_columns or {}).get(READ_COLUMN)
     if isinstance(meta, dict) and meta.get('datatype') in READ_TYPES:
         return READ_COLUMN
@@ -989,7 +1004,7 @@ if __name__ == '__main__':  # pragma: no cover
                     '#tbr': {'datatype': 'bool', 'name': 'TBR'},
                     '#owned': {'datatype': 'bool', 'name': 'Owned'}}
             self.assertEqual([c for c, _ in existing_read_columns(cols)],
-                             ['#read', '#done', '#ko_statusbool'])
+                             ['#read', '#ko_statusbool'])          # 1.3.1: "Done" is not explicit
 
     class ReadFlagByValueTests(Base):
         '''1.2.3: an unrelated calibre edit no longer drops a phone toggle; a real
@@ -1267,9 +1282,9 @@ if __name__ == '__main__':  # pragma: no cover
             cols = {'#fin': {'datatype': 'bool', 'name': 'Finished'},
                     '#hr': {'datatype': 'bool', 'name': 'Have read'},
                     '#is_done': {'datatype': 'bool', 'name': 'Done'}}
-            self.assertEqual([c for c, _ in existing_read_columns(cols)], ['#hr', '#fin', '#is_done'])
+            self.assertEqual([c for c, _ in existing_read_columns(cols)], ['#hr', '#fin'])
             hint = read_column_hint(dict(cols, **self.CUSTOM), exclude=('#hr', '#read_status'), where='above')
-            self.assertIn('Have read (#read) (also: Finished (#fin), Done (#is_done))', hint)
+            self.assertIn('Have read (#read) (also: Finished (#fin))', hint)
             self.assertTrue(hint.endswith('pick it as the read status column above.'))
             self.assertNotIn('#hr', hint)
 
@@ -1467,7 +1482,7 @@ if __name__ == '__main__':  # pragma: no cover
             db.set_pref(SETTINGS_KEY, json.loads(json.dumps(
                 settings_to_store('', '', 1, True, read_column='#read'))))
             self.assertEqual(normalise_settings(db.pref(SETTINGS_KEY))['read_column'], '#read')
-            self.assertEqual(settings_to_store('', '', 1, read_column=None)['read_column'], '#read_status')
+            self.assertNotIn('read_column', settings_to_store('', '', 1, read_column=None))   # 1.3.1
             for bad in (None, 5, 'read', '#Read', '#read status', ''):
                 self.assertEqual(normalise_settings({'read_column': bad})['read_column'], '#read_status')
             self.assertEqual(normalise_settings(None)['read_column'], '#read_status')

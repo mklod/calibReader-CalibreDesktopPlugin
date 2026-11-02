@@ -28,12 +28,12 @@ from qt.core import (
 try:
     from calibre_plugins.calibreader_sync.sync_core import (
         MAX_THRESHOLD, POSITIONS_FILE, READ_COLUMN, READ_TYPES, SETTINGS_KEY, eligible_columns,
-        normalise_settings, read_column_hint, settings_to_store, suggest_column, suggest_read_column,
+        normalise_settings, read_column_hint, settings_to_store, suggest_column,
     )
 except ImportError:  # pragma: no cover - standalone / test import
     from sync_core import (
         MAX_THRESHOLD, POSITIONS_FILE, READ_COLUMN, READ_TYPES, SETTINGS_KEY, eligible_columns,
-        normalise_settings, read_column_hint, settings_to_store, suggest_column, suggest_read_column,
+        normalise_settings, read_column_hint, settings_to_store, suggest_column,
     )
 
 # What "Create column…" proposes. The user can rename them in calibre's dialog.
@@ -74,10 +74,13 @@ class ConfigWidget(QWidget):
             'use, or create one. The CalibReader app reads the same column (app 1.0.1 or later), '
             'and read status goes both ways.'))
         grid = QGridLayout()
-        # Until the user has chosen: #read_status if the library has it, else their
-        # own read column if one looks likely. Saved only when they click OK.
-        self._picker(grid, 0, 'read', 'Read status column:',
-                     settings['read_column'] if read_chosen else suggest_read_column(self.custom))
+        # 1.3.1 (review H1): until the user has chosen, the combo shows #read_status
+        # and NOTHING else is pre-selected; a likely column of their own is only named
+        # in the note below. OK saves a read column only when one was chosen before or
+        # the user picked one here (self.read_chosen / self.read_initial).
+        self.read_chosen = read_chosen
+        self.read_initial = settings['read_column'] if read_chosen else READ_COLUMN
+        self._picker(grid, 0, 'read', 'Read status column:', self.read_initial)
         grid.setColumnStretch(1, 1)
         v.addLayout(grid)
         self.read_note = self._text('')
@@ -181,6 +184,10 @@ class ConfigWidget(QWidget):
                      else 'is not synced')
         if isinstance(meta, dict) and meta.get('datatype') in READ_TYPES:
             text = 'Read status goes into {} ({}).'.format(meta.get('name') or lookup, lookup)
+            if not self.read_chosen and lookup == READ_COLUMN:
+                hint = read_column_hint(self.custom, exclude=(lookup,), where='above')
+                if hint:
+                    text += '\n\n' + hint
         elif isinstance(meta, dict):
             text = '{} is not a Yes/No column, so read status {} instead.'.format(lookup, meanwhile)
         elif lookup in self.new_columns:
@@ -223,12 +230,20 @@ class ConfigWidget(QWidget):
         elif result != creator.Result.CANCELED:
             error_dialog(self, 'Could not create the column', message, show=True)
 
+    def chosen_read_column(self):
+        '''The read column to save, or None: nothing is saved on the user's behalf
+        (1.3.1) unless they chose a column before or picked one in this dialog.'''
+        lookup = self.combos['read'].currentData()
+        if self.read_chosen or lookup != self.read_initial or lookup in self.new_columns:
+            return lookup
+        return None
+
     def settings(self):
         return settings_to_store(self.combos['percent'].currentData(),
                                  self.combos['last_read'].currentData(),
                                  self.threshold.value(),
                                  self.auto_sync.isChecked(),
-                                 read_column=self.combos['read'].currentData())
+                                 read_column=self.chosen_read_column())
 
     def save_settings(self):
         self.db.set_pref(SETTINGS_KEY, self.settings())
