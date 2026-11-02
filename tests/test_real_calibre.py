@@ -489,6 +489,14 @@ class RealSettingsDialogTests(RealCalibreBase):
         w.save_settings()
         self.assertNotIn('read_column', self.stored())
 
+    def test_wording_says_android_uses_read_status_only(self):
+        # L3: Android reads #read_status only; only iPhone/iPad follow read_column
+        from qt.core import QLabel
+        text = ' '.join(label.text() for label in self.widget().findChildren(QLabel))
+        self.assertIn('iPhone and iPad', text)
+        self.assertIn('Android app uses #read_status only', text)
+        self.assertNotIn('The CalibReader app reads the same column', text)
+
     def test_picking_a_read_column_saves_it(self):
         self.lib.add_column('read', 'Read')
         w = self.widget()
