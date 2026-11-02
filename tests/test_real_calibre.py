@@ -497,7 +497,9 @@ class RealSettingsDialogTests(RealCalibreBase):
         w.save_settings()
         stored = self.stored()
         self.assertEqual(stored['percent_column'], '#read_percent')
-        self.assertIn(stored.get('read_column', '#read_status'), ('#read_status',))
+        # not even '#read_status': a stored choice switches on the no-fallback rule and the
+        # first-sync question (re-review H1 test gap)
+        self.assertNotIn('read_column', stored)
 
     def test_an_explicit_read_column_is_not_preselected_either(self):
         self.lib.delete_column('read_status')
