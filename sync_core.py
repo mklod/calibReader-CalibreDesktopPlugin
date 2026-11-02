@@ -1266,6 +1266,36 @@ if __name__ == '__main__':  # pragma: no cover
             self.assertIs(self.v('#read_status', 1), False)   # calibre's later edit stands
             self.assertEqual((res.flags_updated, res.flags_sent_back), (0, 1))
 
+        def test_explicit_choice_missing_writes_nothing(self):
+            # M1 (review): deleted, renamed, or created and calibre not restarted yet
+            self.db.values[('#read_status', 1)] = False
+            self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(9)}})
+            res = self.sync(dict(SETTINGS, read_column='#gone'))
+            self.assertEqual(self.db.writes, [])
+            self.assertIsNone(res.read_column)
+            self.assertEqual(len(res.notes), 1)
+            self.assertIn('#gone', res.notes[0])
+            self.assertNotIn('instead', res.notes[0])
+            self.assertIs(self.v('#read_status', 1), False)
+
+        def test_explicit_choice_unusable_still_syncs_progress(self):
+            self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(9)}})
+            self.positions(**{'uuid-a': {'progress': 0.5, 'updated_at': stamp(9)}})
+            for choice in ('#gone', '#finished'):           # missing; a Date column
+                res = self.sync(dict(SETTINGS, read_column=choice))
+                self.assertIsNone(res.read_column, choice)
+                self.assertIsNone(self.v('#read_status', 1), choice)
+                self.assertIsNone(self.v('#finished', 1), choice)
+            self.assertEqual(self.v('#read_percent', 1), 50)
+            self.assertEqual(self.flag_blobs.get('#read_status', {}), {})   # no memory taken for it either
+
+        def test_no_choice_saved_keeps_the_read_status_default(self):
+            self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(9)}})
+            settings = settings_to_store('#read_percent', '#last_read', 1, True, read_column=None)
+            res = self.sync(normalise_settings(settings))   # normalised twice, as ui.py does
+            self.assertEqual(res.read_column, '#read_status')
+            self.assertIs(self.v('#read_status', 1), True)
+
         def test_prefs_mapping_keeps_read_status_where_122_had_it(self):
             blobs = flag_blobs_from_prefs({'u': {'stamp': None}}, {'#read': {'v': {}}, '#read_status': {'x': 1},
                                                                   'bad': 3})

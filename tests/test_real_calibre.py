@@ -217,6 +217,29 @@ class RealSyncPathTests(RealCalibreBase):
 
 
 @unittest.skipUnless(HAVE_CALIBRE, 'needs calibre (run tests/run_calibre.sh)')
+class RealColumnGoneTests(RealCalibreBase):
+    def test_deleted_chosen_column_never_falls_back_to_read_status(self):
+        # M1: the user moved from #read_status to #read (#read_status keeps stale values),
+        # then deleted #read. A new phone mark must not land in #read_status.
+        (b1, u1), (b2, u2) = self.lib.books(2)
+        self.lib.add_column('read', 'Read')
+        self.lib.api.set_field('#read_status', {b1: False, b2: None})
+        self.lib.set_settings({'version': 1, 'read_column': '#read', 'percent_column': '',
+                               'last_read_column': '', 'progress_threshold': 1, 'auto_sync': True})
+        self.lib.write_sync({u1: {'value': True, 'updated_at': '2030-01-01T00:00:00.000Z'}})
+        self.run_ui()
+        self.assertIs(self.v('#read', b1), True)
+        self.lib.delete_column('read')
+        self.lib.write_sync({u1: {'value': True, 'updated_at': '2030-01-02T00:00:00.000Z'},
+                             u2: {'value': True, 'updated_at': '2030-01-02T00:00:00.000Z'}})
+        res = self.run_ui()
+        self.assertIs(self.v('#read_status', b1), False)
+        self.assertIsNone(self.v('#read_status', b2))
+        self.assertIsNone(res.read_column)
+        self.assertTrue(any('#read' in n for n in res.notes), res.notes)
+
+
+@unittest.skipUnless(HAVE_CALIBRE, 'needs calibre (run tests/run_calibre.sh)')
 class RealUpgradeTests(RealCalibreBase):
     '''Upgrade from 1.2.5: its own code ran a sync and stored its prefs; then 1.3.x runs.'''
 
