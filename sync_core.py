@@ -1959,6 +1959,23 @@ if __name__ == '__main__':  # pragma: no cover
             kept = sorted(k.split('-')[1] for k in self.prefs['libraries'])
             self.assertEqual(kept, sorted(str(n) for n in range(3, MAX_LIBRARIES + 3)))
 
+        def test_change_logs_of_forgotten_libraries_are_removed(self):
+            logs = os.path.join(self.dirs[0], 'logs')
+            os.makedirs(logs)
+            with open(os.path.join(logs, 'notes.txt'), 'w') as f:      # not ours: left alone
+                f.write('x')
+            self.flags(0, **{'uuid-a': True})
+            for n in range(MAX_LIBRARIES + 3):
+                db = FakeDB(COLS, {1: 'uuid-a'})
+                db.library_id = 'lib-{}'.format(n)
+                res = sync_library(db, self.dirs[0], self.prefs, log_dir=logs,
+                                   now=datetime.datetime(2026, 11, 1, tzinfo=UTC) + datetime.timedelta(hours=n))
+                self.assertEqual(len(res.changes), 1)
+            kept = sorted(f[:-4] for f in os.listdir(logs) if f.endswith('.log'))
+            self.assertEqual(kept, sorted(self.prefs['libraries']))
+            self.assertEqual(len(kept), MAX_LIBRARIES)
+            self.assertIn('notes.txt', os.listdir(logs))
+
         def test_old_memory_is_copied_to_each_library_not_moved_to_the_first(self):
             # Re-review L1 probe: two DIFFERENT libraries, 1.3.0 memory for both, B syncs first.
             a, b = self.dbs
