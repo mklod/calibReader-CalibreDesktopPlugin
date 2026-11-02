@@ -58,7 +58,8 @@ except ImportError:  # pragma: no cover - standalone / test import
 # ours to do, and this file has to survive switching libraries anyway.
 # 'applied' is the read flag's record for #read_status, 'applied_cols' the
 # records for any other read column (1.3.0), 'applied_pos' reading progress's,
-# 'approved' (1.3.1) read columns OK'd for their first sync (sync_core.sync_library).
+# 'approved' (1.3.1) read columns OK'd for their first sync. 1.3.1 (review L1):
+# all of it per library, under 'libraries' (sync_core.sync_library).
 # 1.3.1 (review M4): every value written into a library is logged, old -> new, in
 # calibre's config folder: plugins/calibreader_sync_changes/<library>.log.
 AUTO_DELAY_MS = 4000            # after calibre starts or a library opens

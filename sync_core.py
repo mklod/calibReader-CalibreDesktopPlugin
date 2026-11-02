@@ -825,34 +825,72 @@ def run_sync(db, library_path, settings, flag_blobs, pos_blob, approved=()):
     return res, flag_blobs, pos_blob
 
 
+# The plugin's memory, per library (1.3.1, review L1). Up to 1.3.0 one memory served
+# every library, so a copy of a library (same uuids) saw the other copy's values as
+# calibre edits and wrote them back into its own sync file, and the memory grew with
+# every library ever synced. Now: prefs['libraries'][library_key] = {'applied',
+# 'applied_cols', 'applied_pos', 'approved', 'used'}, for the MAX_LIBRARIES most
+# recently synced libraries. The 1.3.0 / 1.2.x top-level memory moves, once, to the
+# first library that syncs with CalibReader files in it.
+
+MAX_LIBRARIES = 8
+_STATE_KEYS = ('applied', 'applied_cols', 'applied_pos', 'approved')
+
+
+def _load_library_state(prefs, key):
+    '''(state, from_legacy) for one library.'''
+    libraries = prefs.get('libraries')
+    state = libraries.get(key) if isinstance(libraries, dict) else None
+    if isinstance(state, dict):
+        return state, False
+    if any(k in prefs for k in _STATE_KEYS):
+        return {k: prefs.get(k) for k in _STATE_KEYS}, True
+    return {}, False
+
+
+def _store_library_state(prefs, key, state, now, from_legacy):
+    libraries = dict(prefs.get('libraries') or {})
+    libraries[key] = dict(state, used=format_iso(now))
+    if len(libraries) > MAX_LIBRARIES:
+        oldest = sorted((k for k in libraries if k != key),
+                        key=lambda k: ((libraries[k] or {}).get('used') or '', k))
+        for k in oldest[:len(libraries) - MAX_LIBRARIES]:
+            del libraries[k]
+    prefs['libraries'] = libraries              # assignment is what commits a JSONConfig
+    if from_legacy:
+        for k in _STATE_KEYS:
+            if k in prefs:
+                del prefs[k]
+
+
 def sync_library(db, library_path, prefs, log_dir=None, approve=None, now=None):
     '''(1.3.1) One run as the plugin's GUI makes it (the button and the automatic sync,
-    ui.py): the library's settings, the plugin's memory in `prefs` (its JSONConfig, or
-    any dict), run_sync, the memory stored back, and the change log written into
-    `log_dir` (change_log_path). `approve` = a read column the user just OK'd for its
-    first sync (res.confirm). Returns the SyncResult.'''
+    ui.py): the library's settings, this library's memory from `prefs` (the plugin's
+    JSONConfig, or any dict), run_sync, the memory stored back, and the change log
+    written into `log_dir` (change_log_path). `approve` = a read column the user just
+    OK'd for its first sync (res.confirm). Returns the SyncResult.'''
     now = now or _dt.datetime.now(UTC)
+    key = library_key(db, library_path)
+    state, from_legacy = _load_library_state(prefs, key)
     settings = normalise_settings(db.pref(SETTINGS_KEY, None))
-    approved = set(c for c in (prefs.get('approved') or ()) if isinstance(c, str))
+    approved = set(c for c in (state.get('approved') or ()) if isinstance(c, str))
     if approve:
         approved.add(approve)
     res, flag_blobs, pos_blob = run_sync(
         db, library_path, settings,
-        flag_blobs_from_prefs(prefs.get('applied', {}), prefs.get('applied_cols', {})),
-        prefs.get('applied_pos', {}), approved=approved)
-    approved = sorted(c for c in approved if not flag_blobs.get(c))   # an OK is used up by the sync
+        flag_blobs_from_prefs(state.get('applied'), state.get('applied_cols')),
+        state.get('applied_pos'), approved=approved)
     if res.found_any_file:
-        # Assignment is what commits a JSONConfig. Stored even when nothing was
-        # written: a RECORD verdict must persist so a retired entry is never
-        # reconsidered.
-        prefs['applied'], prefs['applied_cols'] = flag_blobs_to_prefs(flag_blobs)
-        prefs['applied_pos'] = pos_blob
-    if approved != sorted(prefs.get('approved') or ()):
-        prefs['approved'] = approved
+        # Stored even when nothing was written: a RECORD verdict must persist so a
+        # retired entry is never reconsidered.
+        applied, applied_cols = flag_blobs_to_prefs(flag_blobs)
+        _store_library_state(prefs, key, {
+            'applied': applied, 'applied_cols': applied_cols, 'applied_pos': pos_blob,
+            'approved': sorted(c for c in approved if not flag_blobs.get(c)),   # an OK is used up
+        }, now, from_legacy)
     if log_dir and res.changes:
         try:
-            append_change_log(os.path.join(log_dir, library_key(db, library_path) + '.log'),
-                              res.changes, format_iso(now))
+            append_change_log(os.path.join(log_dir, key + '.log'), res.changes, format_iso(now))
         except OSError as exc:
             res.notes.append('The change log could not be written ({}).'.format(exc))
     return res
