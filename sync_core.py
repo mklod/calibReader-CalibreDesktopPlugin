@@ -1273,6 +1273,38 @@ if __name__ == '__main__':  # pragma: no cover
             self.assertTrue(hint.endswith('pick it as the read status column above.'))
             self.assertNotIn('#hr', hint)
 
+    class ReadColumnSuggestionTests(unittest.TestCase):
+        '''H1 (review 2026-11-02): only an explicit read column is ever named, never one
+        that merely contains "read", "done", "finish" or "complete" (or means the opposite),
+        and Settings saves a read column only when the user picked one.'''
+
+        OPPOSITES = {'#abandoned': 'Abandoned', '#dnf': 'Did not finish', '#unfinished': 'Unfinished',
+                     '#incomplete': 'Incomplete', '#proofread': 'Proofread', '#ready': 'Ready',
+                     '#already_owned': 'Already owned', '#readaloud': 'Read aloud', '#thread': 'Thread',
+                     '#not_read': 'Not read', '#done_reading_soon': 'Done reading soon'}
+
+        def test_suggestion_never_offers_an_opposite_column(self):
+            for lookup, heading in self.OPPOSITES.items():
+                cols = {lookup: {'datatype': 'bool', 'name': heading}}
+                self.assertEqual(suggest_read_column(cols), '#read_status', lookup)
+                self.assertEqual(existing_read_columns(cols), [], lookup)
+                self.assertEqual(read_column_hint(cols), '', lookup)
+
+        def test_only_explicit_read_columns_are_named(self):
+            for lookup, heading in (('#read', 'Have read'), ('#have_read', 'Have read'),
+                                    ('#isread', 'Is read'), ('#finished', 'Finished'),
+                                    ('#ko_statusbool', 'KOReader status'), ('#x1', 'Read'),
+                                    ('#x2', 'Have Read'), ('#x3', 'read status')):
+                cols = {lookup: {'datatype': 'bool', 'name': heading}}
+                self.assertEqual(suggest_read_column(cols), lookup, lookup)
+            # a heading that only contains one of the words is not explicit
+            self.assertEqual(suggest_read_column({'#x': {'datatype': 'bool', 'name': 'Read in 2024'}}),
+                             '#read_status')
+
+        def test_untouched_read_choice_is_not_stored(self):
+            self.assertNotIn('read_column', settings_to_store('#read_percent', '', 1, True, read_column=None))
+            self.assertEqual(settings_to_store('', '', 1, True, read_column='#read')['read_column'], '#read')
+
     class AppliedStampTests(Base):
         '''1.3.0 (bug 4): each entry the plugin applies gets applied_value + applied_at.'''
 

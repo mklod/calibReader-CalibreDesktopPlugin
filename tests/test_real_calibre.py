@@ -250,3 +250,73 @@ class RealUpgradeTests(RealCalibreBase):
         res = self.run_ui()
         self.assertIsNone(self.v('#read_status', b1))                        # not refilled by the old entry
         self.assertEqual(res.flags_updated, 0)
+
+
+_APP = None
+
+
+def qt_app():
+    global _APP
+    from qt.core import QApplication
+    if QApplication.instance() is None:
+        from calibre.gui2 import Application
+        _APP = Application([])
+    return QApplication.instance()
+
+
+@unittest.skipUnless(HAVE_CALIBRE, 'needs calibre (run tests/run_calibre.sh)')
+class RealSettingsDialogTests(RealCalibreBase):
+    '''The Settings widget (config.ConfigWidget) on a real library: what OK stores.'''
+
+    def widget(self):
+        qt_app()
+        import config
+
+        class Gui(object):
+            current_db = self.lib.legacy
+            library_path = self.lib.path
+            iactions = {}
+        return config.ConfigWidget(Gui())
+
+    def stored(self):
+        from sync_core import SETTINGS_KEY
+        return self.lib.api.pref(SETTINGS_KEY, None)
+
+    def pick(self, combo, lookup):
+        index = combo.findData(lookup)
+        self.assertGreaterEqual(index, 0, lookup)
+        combo.setCurrentIndex(index)
+
+    def test_ok_for_another_reason_never_picks_a_read_column(self):
+        # H1: a 1.2.x library without #read_status but with a Yes/No "Did not finish"
+        self.lib.delete_column('read_status')
+        self.lib.add_column('dnf', 'Did not finish')
+        self.lib.add_column('read_percent', 'Read %', 'int')
+        self.lib.set_settings({'version': 1, 'percent_column': '', 'last_read_column': '',
+                               'progress_threshold': 1, 'auto_sync': True})
+        w = self.widget()
+        self.pick(w.combos['percent'], '#read_percent')          # the reason they opened Settings
+        w.save_settings()
+        stored = self.stored()
+        self.assertEqual(stored['percent_column'], '#read_percent')
+        self.assertIn(stored.get('read_column', '#read_status'), ('#read_status',))
+
+    def test_an_explicit_read_column_is_not_preselected_either(self):
+        self.lib.delete_column('read_status')
+        self.lib.add_column('read', 'Read')
+        w = self.widget()
+        self.assertEqual(w.combos['read'].currentData(), '#read_status')
+        self.assertIn('Read (#read)', w.read_note.text())         # named as a hint
+        w.save_settings()
+        self.assertNotIn('read_column', self.stored())
+
+    def test_picking_a_read_column_saves_it(self):
+        self.lib.add_column('read', 'Read')
+        w = self.widget()
+        self.pick(w.combos['read'], '#read')
+        w.save_settings()
+        self.assertEqual(self.stored()['read_column'], '#read')
+        w = self.widget()                                          # reopened: still #read, kept on OK
+        self.assertEqual(w.combos['read'].currentData(), '#read')
+        w.save_settings()
+        self.assertEqual(self.stored()['read_column'], '#read')
