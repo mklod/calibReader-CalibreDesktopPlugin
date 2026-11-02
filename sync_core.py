@@ -592,17 +592,22 @@ def write_back_flags(library_path, writebacks):
 
 
 def run_sync(db, library_path, settings, flag_blobs, pos_blob, approved=()):
+    # `approved` = the read columns the user has said Yes to (sync_library keeps them
+    # per library as 'confirmed').
     '''One sync. Returns (SyncResult, new_flag_blobs, new_pos_blob); these are the
     plugin's per-book bookkeeping (see sidecar_merge), to be stored by the caller.
     `flag_blobs` = {read column: {uuid: record}} (flag_blobs_from_prefs); only the
     blob of the column used this run is read or changed. Nothing is written to
     calibre unless a rule says it may.
 
-    1.3.1 (review H1/M4): the FIRST sync into a read column the user chose (no memory
-    for it yet) writes nothing into it, unless the column is in `approved`: it sets
-    res.confirm to the counts (empty cells it would fill, filled ones it would change)
-    for the user's OK, and everything else syncs as usual. The #read_status default of
-    a library where no read column was ever chosen works as in 1.2.x.'''
+    1.3.1 (review H1/M4): nothing is written into a read column the user CHOSE until
+    they have said Yes to it (the column is in `approved`): a run that would write
+    sets res.confirm to the counts (empty cells it would fill, filled ones it would
+    change) for their OK, and everything else syncs as usual. Consent is that Yes
+    only, never "the column already has memory" (re-review: a first run with nothing
+    to write stored memory, and the next run filled cells without asking). The
+    #read_status default of a library where no read column was ever chosen works as
+    in 1.2.x.'''
     settings = normalise_settings(settings)
     flag_blobs = {c: dict(b) for c, b in (flag_blobs or {}).items() if isinstance(b, dict)}
     flag_blob = {}
@@ -736,9 +741,9 @@ def run_sync(db, library_path, settings, flag_blobs, pos_blob, approved=()):
         pos_updates, pos_records, skipped, _ = plan(targets, state)
         res.progress_skipped = len(skipped)
 
-    # 1.3.1: the first sync into a chosen read column waits for the user's OK.
+    # 1.3.1: writes into a chosen read column wait for the user's Yes to that column.
     gated = False
-    if (flag_col and flag_updates and settings['read_column_set'] and not flag_blobs.get(flag_col)
+    if (flag_col and flag_updates and settings['read_column_set']
             and flag_col not in (approved or ())):
         fill = sum(1 for u in flag_updates if db.field_for(flag_col, uuid_to_id[u]) is None)
         res.confirm = {'column': flag_col, 'heading': (custom.get(flag_col) or {}).get('name') or flag_col,
@@ -829,7 +834,7 @@ def run_sync(db, library_path, settings, flag_blobs, pos_blob, approved=()):
 # every library, so a copy of a library (same uuids) saw the other copy's values as
 # calibre edits and wrote them back into its own sync file, and the memory grew with
 # every library ever synced. Now: prefs['libraries'][library_key] = {'applied',
-# 'applied_cols', 'applied_pos', 'approved', 'used'}, for the MAX_LIBRARIES most
+# 'applied_cols', 'applied_pos', 'confirmed', 'used'}, for the MAX_LIBRARIES most
 # recently synced libraries. The 1.3.0 / 1.2.x top-level memory moves, once, to the
 # first library that syncs with CalibReader files in it.
 
@@ -873,7 +878,10 @@ def sync_library(db, library_path, prefs, log_dir=None, approve=None, now=None):
     key = library_key(db, library_path)
     state, from_legacy = _load_library_state(prefs, key)
     settings = normalise_settings(db.pref(SETTINGS_KEY, None))
-    approved = set(c for c in (state.get('approved') or ()) if isinstance(c, str))
+    # 'confirmed' (re-review M4): the read columns the user said Yes to; only a Yes adds
+    # one, and it stays. ('approved' is the name an unreleased 1.3.1 build used.)
+    approved = set(c for c in list(state.get('confirmed') or ()) + list(state.get('approved') or ())
+                   if isinstance(c, str))
     if approve:
         approved.add(approve)
     res, flag_blobs, pos_blob = run_sync(
@@ -886,7 +894,7 @@ def sync_library(db, library_path, prefs, log_dir=None, approve=None, now=None):
         applied, applied_cols = flag_blobs_to_prefs(flag_blobs)
         _store_library_state(prefs, key, {
             'applied': applied, 'applied_cols': applied_cols, 'applied_pos': pos_blob,
-            'approved': sorted(c for c in approved if not flag_blobs.get(c)),   # an OK is used up
+            'confirmed': sorted(approved),
         }, now, from_legacy)
     if log_dir and res.changes:
         try:
@@ -1402,7 +1410,7 @@ if __name__ == '__main__':  # pragma: no cover
         def test_a_later_phone_mark_lands_in_the_new_column(self):
             self.switch_after_rating_edit()
             self.flags(**{'uuid-a': {'value': True, 'updated_at': stamp(4)}})   # made Oct 4, synced late
-            res = self.sync(dict(SETTINGS, read_column='#finished'))
+            res = self.sync(dict(SETTINGS, read_column='#finished'), approved={'#finished'})
             self.assertIs(self.v('#finished', 1), True)
             self.assertEqual(res.flags_updated, 1)
 
@@ -1480,7 +1488,7 @@ if __name__ == '__main__':  # pragma: no cover
             self.assertEqual(res.flags_updated, 3)
             self.assertEqual([self.v('#read', b) for b in (1, 2, 3)], [True, True, True])
             self.flags(**{'uuid-a': {'value': False, 'updated_at': stamp(10)}})
-            res = self.sync(dict(SETTINGS, read_column='#read'))          # later runs need no OK
+            res = self.sync(dict(SETTINGS, read_column='#read'), approved={'#read'})   # consent kept
             self.assertIsNone(res.confirm)
             self.assertIs(self.v('#read', 1), False)
 
