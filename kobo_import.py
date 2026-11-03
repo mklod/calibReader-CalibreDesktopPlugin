@@ -1,4 +1,4 @@
-# Last modified: 2026-11-02--1447
+# Last modified: 2026-11-02--1916
 #
 # kobo_import.py — Kobo reading positions (Calibre-Web's app.db) into
 # CalibReader_positions.json, the sidecar the CalibReader apps already read.
@@ -283,6 +283,21 @@ def other_library(app_db, library_path):
     return None
 
 
+# N1: books whose Kobo place failed to map (or was refused) in this calibre
+# session, by (library, app.db, uuid) -> the Kobo stamp that failed. They are
+# not parsed again until the Kobo moves (a new stamp), so a failing set never
+# re-parses EPUBs on calibre's GUI thread run after run.
+_FAILED = {}
+
+
+def forget_failures():
+    _FAILED.clear()
+
+
+def _failure_key(library_path, app_db, uuid):
+    return (os.path.realpath(library_path), os.path.realpath(app_db), uuid.lower())
+
+
 FUTURE_SLACK = _dt.timedelta(minutes=10)   # M2
 MAX_BOOKS = 25                             # L1: books mapped per run (the rest next run)
 DISTRUST_POINTS = 25.0                     # M5: location vs ProgressPercent, in % points
@@ -324,6 +339,7 @@ def import_positions(library_path, app_db, lookup, user=None, log=None, max_book
     with_source = unresolved = 0
     mapped = {}                       # uuid -> entry
     attempted = 0
+    candidates = []                   # every row that would be mapped (this run or later)
     keys = {k.lower(): k for k in data['positions']}
     for row in rows:
         stamp = _parse_iso(row['updated_at']) if row['updated_at'] else None
@@ -355,6 +371,11 @@ def import_positions(library_path, app_db, lookup, user=None, log=None, max_book
         if not epub_path or not os.path.isfile(epub_path):
             res.skipped[uuid] = 'no EPUB (CalibReader opens the EPUB)'
             continue
+        fkey = _failure_key(library_path, app_db, uuid)
+        if _FAILED.get(fkey) == row['updated_at']:
+            res.skipped[uuid] = 'failed before; tried again when the Kobo moves'
+            continue
+        candidates.append((fkey, row['updated_at']))
         if attempted >= max_books:
             res.more = True
             continue
@@ -379,9 +400,11 @@ def import_positions(library_path, app_db, lookup, user=None, log=None, max_book
                 if abs(ours - pct) > DISTRUST_POINTS:
                     res.skipped[uuid] = ('Kobo location ({:.0f} % into the book) does not fit its {:.0f} %'
                                          .format(ours, pct))
+                    _FAILED[fkey] = row['updated_at']
                     continue
         except Exception as exc:
             res.skipped[uuid] = 'could not read the EPUB ({})'.format(exc)
+            _FAILED[fkey] = row['updated_at']
             continue
         finally:
             for b in (epub, kepub):
@@ -389,6 +412,7 @@ def import_positions(library_path, app_db, lookup, user=None, log=None, max_book
                     b.close()
         if place is None:
             res.skipped[uuid] = 'Kobo place does not match this book'
+            _FAILED[fkey] = row['updated_at']
             continue
         mapped[uuid] = {
             'chapter': place['chapter'],
@@ -414,6 +438,11 @@ def import_positions(library_path, app_db, lookup, user=None, log=None, max_book
         res.notes.append('{} of {} Kobo places do not match the books here: this Calibre-Web looks like it serves '
                          'another calibre library. Nothing imported.'.format(unresolved, with_source))
         res.mapped = {}
+        res.more = False              # N1: a refused run never continues
+        # The whole set is the wrong library: none of it is tried again
+        # until its Kobo stamp changes.
+        for fkey, stamp in candidates:
+            _FAILED[fkey] = stamp
         return res
     if not mapped:
         return res
