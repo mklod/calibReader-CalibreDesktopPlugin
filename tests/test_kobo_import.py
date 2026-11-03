@@ -22,6 +22,7 @@ from unittest import mock
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
+import kobo_import  # noqa: E402
 from kobo_import import KOBO_DEVICE_ID, import_positions, kobo_stamp, read_kobo_bookmarks  # noqa: E402
 
 EPUB = os.path.join(HERE, 'fixtures', 'metamorphosis.epub')
@@ -400,6 +401,49 @@ class ImportTests(unittest.TestCase):
         res = import_positions(self.lib, self.app_db, self.lookup, user='admin', max_books=1)
         self.assertEqual((len(res.written), res.more), (1, True))
         res = import_positions(self.lib, self.app_db, self.lookup, user='admin', max_books=1)
+        self.assertEqual((len(res.written), res.more), (1, False))
+
+    # -- re-check N1: a refused / failing run must not loop ----------------------------
+    def _many_unresolved(self, n=40):
+        for i in range(n):
+            bid = 100 + i
+            self.books[bid] = ('22222222-0000-0000-0000-%012d' % bid, EPUB, None)
+            self.add(1, bid, '2026-10-30 21:03:48', 'OEBPS/Text/not-here-%d.xhtml' % i, 'KoboSpan', 'kobo.1.1', 40.0, 10.0)
+
+    def test_N1_three_refused_runs_never_ask_for_more(self):
+        kobo_import.forget_failures()
+        self._many_unresolved()
+        for _ in range(3):
+            res = self.run_import()
+            self.assertEqual(res.written, [])
+            self.assertFalse(res.more, res.notes)
+
+    def test_N1_failed_books_are_not_mapped_again_until_their_stamp_changes(self):
+        kobo_import.forget_failures()
+        self._many_unresolved()
+        self.run_import()
+        import kobo_import as ki
+        with mock.patch('kobo_import.map_bookmark', wraps=ki.map_bookmark) as m:
+            res = self.run_import()
+        self.assertEqual(m.call_count, 0)
+        self.assertFalse(res.more)
+        # The Kobo moves one of them: that one is tried again.
+        con = sqlite3.connect(self.app_db)
+        con.execute("UPDATE kobo_bookmark SET last_modified='2026-10-31 08:00:00' WHERE id=1")
+        con.commit(); con.close()
+        with mock.patch('kobo_import.map_bookmark', wraps=ki.map_bookmark) as m:
+            self.run_import()
+        self.assertEqual(m.call_count, 1)
+
+    def test_N1_a_chunk_of_good_books_still_continues(self):
+        kobo_import.forget_failures()
+        for i in range(3):
+            bid = 200 + i
+            self.books[bid] = ('33333333-0000-0000-0000-%012d' % bid, EPUB, None)
+            self.add(1, bid, '2026-10-30 21:03:48', CH1, None, None, 12.0, 50.0)
+        res = import_positions(self.lib, self.app_db, self.lookup, user='admin', max_books=2)
+        self.assertEqual((len(res.written), res.more), (2, True))
+        res = import_positions(self.lib, self.app_db, self.lookup, user='admin', max_books=2)
         self.assertEqual((len(res.written), res.more), (1, False))
 
 
