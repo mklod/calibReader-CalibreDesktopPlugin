@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--1118
+# Last modified: 2026-11-05--1125
 #
 # test_kobo_ku.py — the Kobo Utilities (USB) route, Kobo -> CalibReader (plugin 1.7.0, tester
 # preview): kobo_ku.py. Design: docs/handoffs/104-kobo-sync/KOBO-UTILITIES.md section 8.
@@ -248,13 +248,31 @@ class MappingTests(unittest.TestCase):
         self.assertAlmostEqual(place['progress'], 0.63)
 
     def test_percent_only(self):
+        # NIT 3 ruling (review step 4): from the Kobo's % minus 2 points, snapped to the START of the
+        # chapter that position falls in; precision stays "percent"; never skip unread text
         place, why = kobo_ku.map_ku(self.epub, None, percent=40)
         self.assertEqual(place['precision'], kobo_ku.PERCENT)
-        self.assertAlmostEqual(self.pct_of(place), 40, delta=0.5)
+        self.assertEqual((place['chapter'], place['textAnchor']), (3, 0))      # Part II: 28.2-57.3 %
+        self.assertAlmostEqual(place['progress'], self.pct_of(place) / 100.0, places=5)
         for pct in (0, 100, None):
             place, why = kobo_ku.map_ku(self.epub, None, percent=pct)
             self.assertIsNone(place, pct)
             self.assertTrue(why)
+
+    def test_a_percent_only_place_never_lands_after_the_kobos(self):
+        # The Kobo at the very start of Part III (57.3 % of the text) reports 58 % (its own measure is
+        # not the text's). The old text-fraction mapping put the reader ~1,000 characters into Part
+        # III, past the Kobo's place; the ruling lands at the start of Part II, before it.
+        real = (4, 0)
+        place, why = kobo_ku.map_ku(self.epub, None, percent=58)
+        self.assertLessEqual((place['chapter'], place['textAnchor']), real)
+        self.assertEqual(place['textAnchor'], 0)
+        self.assertEqual(place['precision'], kobo_ku.PERCENT)
+        # every whole %: a chapter start, at or before (the Kobo's % - 2) of the text
+        for pct in range(1, 100):
+            place, why = kobo_ku.map_ku(self.epub, None, percent=pct)
+            self.assertEqual(place['textAnchor'], 0, pct)
+            self.assertLessEqual(self.pct_of(place), max(0, pct - 2) + 1e-9, pct)
 
     def test_an_href_not_in_this_book_is_no_place(self):
         place, why = kobo_ku.map_ku(self.epub, kobo_ku.parse_location('text/ch99.xhtml#kobo.1.1'), percent=40,
