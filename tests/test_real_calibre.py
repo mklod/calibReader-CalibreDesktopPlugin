@@ -1309,6 +1309,15 @@ class RealKoboUtilitiesTests(RealCalibreBase):
         entries = self.entries()
         self.assertFalse([e for e in entries.values() if e.get('deviceId') == 'kobo-utilities'])
 
+    def test_the_summary_names_a_book_not_imported_and_why(self):
+        (b1, u1), = self.books[:1]
+        self.fill(b1, KU_CH.format(1) + '#kobo.999.1', 4, datetime.datetime(2026, 11, 1, 10, 0, tzinfo=UTC))
+        self.set_ku()
+        res = self.run_ui(manual=True)
+        title = self.lib.api.field_for('title', b1)
+        lines = [line for line in res.kobo_ku_lines if title in line]
+        self.assertTrue(lines and 'kobo.999.1' in lines[0] and 'not in the KEPUB' in lines[0], res.kobo_ku_lines)
+
     def test_a_newer_calibre_web_place_wins(self):
         (b1, u1), = self.books[:1]
         with open(os.path.join(self.lib.path, 'CalibReader_positions.json'), 'w', encoding='utf-8') as f:
