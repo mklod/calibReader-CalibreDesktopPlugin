@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--1223
+# Last modified: 2026-11-05--1243
 #
 # config.py — the plugin's settings dialog (Preferences > Plugins > CalibReader
 # Sync > Customize, or the "Settings…" item in the toolbar button's menu).
@@ -276,8 +276,9 @@ class ConfigWidget(QWidget):
         # Re-review S1-R2: forget the library's verdict on the Kobo's numbering
         self.ku_recheck = QPushButton('Re-check numbering', self)
         self.ku_recheck.setToolTip('Forget whether this library\'s Kobo copies were numbered by calibre or by another '
-                                   'tool (for example after you sent your books again with calibre). The next Kobo '
-                                   'places decide again: at the start of their chapter until 5 have been checked.')
+                                   'tool, and which books were edited after they were sent (click it after sending '
+                                   'your books, or the edited ones, to the Kobo again). The next Kobo places decide '
+                                   'again: at the start of their chapter until 5 have been checked.')
         self.ku_recheck.clicked.connect(lambda checked=False: self._recheck_numbering())
         self.ku_recheck.setEnabled(bool(stored))
         v.addWidget(self.ku_recheck)

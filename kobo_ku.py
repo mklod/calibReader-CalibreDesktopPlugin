@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--1223
+# Last modified: 2026-11-05--1243
 #
 # kobo_ku.py — Kobo reading places stored by the Kobo Utilities calibre plugin (USB sync)
 # into CalibReader_positions.json (plugin 1.7.0, tester preview). Kobo -> CalibReader only.
@@ -101,10 +101,15 @@ FOREIGN_NOTE = ('most of the Kobo\'s sentence ids in this library are not in cal
 UNDECIDED_NOTE = ('fewer than 5 of the Kobo\'s sentence places in this library have been checked against calibre\'s '
                   'own KEPUB numbering yet, so they are passed on as the start of their chapter for now; they move to '
                   'their sentence once the numbering is confirmed')
-# Re-review S1-R2: a book edited after the Kobo read it maps its found ids late (measured).
-EDITED_NOTE = ('this book was edited after the Kobo read it (its EPUB is newer, and one of the Kobo\'s sentence ids is '
-               'no longer in calibre\'s numbering of it), so its places are passed on as the start of their chapter '
-               'until the Kobo stores a place read after the edit')
+UNDECIDED_LINE = ('the Kobo\'s sentence places in this library are being checked against calibre\'s own KEPUB numbering '
+                  '({} more needed), so for now they are passed on as the start of their chapter; they move to their '
+                  'sentence once the numbering is confirmed')                      # NIT-R3-3: the summary line
+# Re-review rounds 2-3, S1-R2: a book edited after it was sent maps its found ids late (measured), and a Kobo
+# reading after the edit does not mean the Kobo has the edited copy (only sending it again does).
+EDITED_NOTE = ('this book\'s copy on the Kobo is numbered differently from calibre\'s KEPUB of its EPUB today (it was '
+               'edited after it was sent: one of the Kobo\'s sentence ids is missing, or the EPUB changed since the '
+               'plugin first saw it), so its places are passed on as the start of their chapter until you send it to '
+               'the Kobo again and click "Re-check numbering" in Settings')
 # Re-review NIT-R1-1: the only names the cache ever removes.
 _OWN_NAMES = re.compile(r'^(?:[0-9a-f]{24}\.kepub|[0-9a-f]{24}\.\d+\.\d+\.tmp|work-\d+-\d+-.*)$')
 
@@ -807,10 +812,17 @@ class MemoryFile(object):
 def reset_numbering(memory):
     '''Re-review S1-R2: "Re-check numbering" in Settings: forget the library's verdict on the Kobo's
     numbering (foreign or calibre-numbered); the next places decide again from scratch (at their
-    chapter start until FOREIGN_MIN are checked). Books' own "edited" flags stay.'''
+    chapter start until FOREIGN_MIN are checked). Re-review round 3 (S1-R2, NIT-R3-2): the books'
+    "edited" flags and first-seen EPUB states go too (after sending edited books to the Kobo again).'''
     meta = dict(memory.get('.') or {})
     meta.update({'spans': 0, 'missing': 0, 'foreign': False, 'decided': False})
     memory['.'] = meta
+    for key, record in list(memory.items()):
+        if key != '.' and isinstance(record, dict) and ('edited' in record or 'epub_seen' in record):
+            record = dict(record)
+            record.pop('edited', None)
+            record.pop('epub_seen', None)
+            memory[key] = record
     return memory
 
 
@@ -941,8 +953,10 @@ def import_ku(library_path, source, values, lookup, memory, kepub_for=None, now=
         if isinstance(before, dict) and before.get('h') == h:
             continue                                   # 8.6: unchanged since it was last looked at
         record = {'h': h, 'lr': last_read, 'seen': now_s}
-        if isinstance(before, dict) and before.get('edited'):
-            record['edited'] = before['edited']          # S1-R2: kept until the Kobo reads after the edit
+        if isinstance(before, dict):
+            for key in ('edited', 'epub_seen'):          # S1-R2: per book, until Re-check or another EPUB change
+                if before.get(key):
+                    record[key] = before[key]
         current = data['positions'].get(keys.get(u, uuid))
         if last_read:
             stamp, kind = last_read, 'last-read'
@@ -1021,11 +1035,12 @@ def import_ku(library_path, source, values, lookup, memory, kepub_for=None, now=
             run_seen += sample
             run_missing += isinstance(why, MissingSpan)
             try:
-                epub_date = _iso(_dt.datetime.fromtimestamp(os.path.getmtime(epub_path), _dt.timezone.utc))
+                st = os.stat(epub_path)
+                epub_state = [st.st_mtime_ns, st.st_size]
             except OSError:
-                epub_date = None
+                epub_state = None
             spans.append((u, uuid, place, why, alt, alt_why, record, kinfo, parsed, loc, pct, last_read, stamp, kind,
-                          epub_path, kepub_path, epub_date))
+                          epub_path, kepub_path, epub_state))
             continue
         if place is None:
             # NIT 7: a 0 % / 100 % with no location is the Kobo's status, not a problem to report
@@ -1045,19 +1060,25 @@ def import_ku(library_path, source, values, lookup, memory, kepub_for=None, now=
     if foreign:
         res.foreign = FOREIGN_NOTE
     elif undecided and spans:
-        res.undecided = UNDECIDED_NOTE
+        res.undecided = UNDECIDED_LINE.format(FOREIGN_MIN - seen)
     for (u, uuid, place, why, alt, alt_why, record, kinfo, parsed, loc, pct, last_read, stamp, kind,
-         epub_path, kepub_path, epub_date) in spans:
-        # S1-R2: a book edited after the Kobo read it: flagged on a missing id when its EPUB is newer
-        # than the Kobo's reading (no Kobo date: taken as possibly edited); cleared once the Kobo
-        # stores a place read after the EPUB's date
+         epub_path, kepub_path, epub_state) in spans:
+        # S1-R2 (re-review round 3, as ruled): a book is "edited" (its Kobo copy numbered differently from
+        # calibre's KEPUB of its EPUB today) on ANY missing span id (calibre-made copies never miss one),
+        # or when its EPUB changed after the plugin first saw it. The flag stays until "Re-check
+        # numbering" or until the EPUB changes again (then that file is the new first-seen state);
+        # a Kobo reading after the edit does not clear it.
         edited = record.get('edited')
-        if edited and last_read and epub_date and _parse_iso(last_read) > _parse_iso(epub_date):
-            edited = None
+        if edited and epub_state and edited != epub_state:
+            edited = None                                # the EPUB changed again: decide again from this file
             record.pop('edited', None)
-        if (not edited and isinstance(why, MissingSpan) and epub_date
-                and (not last_read or _parse_iso(epub_date) > _parse_iso(last_read))):
-            edited = record['edited'] = epub_date
+            record['epub_seen'] = epub_state
+        if epub_state and not record.get('epub_seen'):
+            record['epub_seen'] = epub_state             # the first time a span of this book is mapped
+        if not edited and epub_state and record.get('epub_seen') != epub_state:
+            edited = record['edited'] = epub_state       # changed after the plugin first saw it
+        if not edited and isinstance(why, MissingSpan):
+            edited = record['edited'] = epub_state or True
         coarse = (kinfo.get('uncertain') or (FOREIGN_NOTE if foreign else None) or (EDITED_NOTE if edited else None)
                   or (UNDECIDED_NOTE if undecided else None))
         if coarse:

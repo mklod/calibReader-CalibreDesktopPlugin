@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--1241
+# Last modified: 2026-11-05--1243
 #
 # test_kobo_ku.py — the Kobo Utilities (USB) route, Kobo -> CalibReader (plugin 1.7.0, tester
 # preview): kobo_ku.py. Design: docs/handoffs/104-kobo-sync/KOBO-UTILITIES.md section 8.
@@ -1508,10 +1508,10 @@ class EditedBookTests(ImportBase):
 
     def test_S1R2_the_flag_clears_when_the_epub_changes_again(self):
         self.run_import({1: (self.MISSING, None, '2026-11-01T10:00:00Z')})
-        self.edited('2026-11-06')                                               # changed again (sent again?)
-        self.run_import({1: (self.PRESENT, None, '2026-11-07T10:00:00Z')})
+        self.edited('2026-11-03')                                               # changed again (sent again?)
+        self.run_import({1: (self.PRESENT, None, '2026-11-04T10:00:00Z')})
         self.assertEqual(self.entry()['kobo']['precision'], kobo_ku.SPAN)
-        self.run_import({1: (self.OTHER, None, '2026-11-08T10:00:00Z')})       # the new file is the new baseline
+        self.run_import({1: (self.OTHER, None, '2026-11-05T09:00:00Z')})       # the new file is the new baseline
         self.assertEqual(self.entry()['kobo']['precision'], kobo_ku.SPAN)
 
     def test_S1R2_recheck_numbering_clears_the_books_flags_too(self):
