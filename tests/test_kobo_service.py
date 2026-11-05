@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0710
+# Last modified: 2026-11-05--0723
 #
 # Step 3 (plugin 1.6.0, tester preview): the Kobo sync without calibre running.
 # kobo_service.run_once is what the launchd job runs (calibre-debug -e <copy>/kobo_service.py
@@ -302,7 +302,9 @@ class RunTests(ServiceBase):
         with mock.patch('kobo_import.Book', side_effect=AssertionError('no book opened')):
             out = self.run_job()
         self.assertEqual(out.status, 'no-change')
-        self.assertEqual(len(self.log_text().splitlines()), 3)     # one line per run
+        runs = [line for line in self.log_text().splitlines() if not line.startswith(' ')]
+        self.assertEqual(len(runs), 3)                              # one line per run (+ indented details)
+        self.assertTrue(runs[-1].split('] ', 1)[1].startswith('no change'), runs)
         self.touch_app()
         self.assertEqual(self.run_job().status, 'done')
         # and at least once an hour anyway

@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0710
+# Last modified: 2026-11-05--0723
 #
 # test_real_calibre.py — CalibReader Sync against REAL calibre (LibraryDatabase, set_field,
 # metadata.db, JSONConfig, the Settings widget), not the in-memory FakeDB of sync_core.py.
@@ -583,6 +583,25 @@ class RealServiceTests(RealKoboRunTests):
         self.assertEqual(self.positions(), before)
         self.assertEqual((pres.sent, len(self.cw.requests)), ([], 1))
 
+    def test_a_job_push_while_calibre_is_open_is_not_a_kobo_move_either(self):
+        # R2-N2: calibre ran (and read the journal) BEFORE the job pushed; its next run must
+        # see the job's push, not a session copy from before it.
+        import kobo_service
+        self.plugin_installed()
+        self.set_kobo(service=True)                          # sending off: calibre's run sends nothing
+        res = self.run_ui(manual=True)
+        self.wait_push()
+        self.assertEqual((res.kobo_imported, self.cw.requests), (0, []))
+        self.set_kobo(push=True, push_since=self.SINCE, service=True)
+        out = kobo_service.run_once(self.lib.path, config_dir=config_dir)
+        self.assertEqual(out.pres.sent, [self.uuid], out.notes)
+        before = self.positions()
+        res = self.run_ui(manual=True)                       # the same calibre session
+        pres = self.wait_push()
+        self.assertEqual(res.kobo_imported, 0, res.notes)
+        self.assertEqual(self.positions(), before)
+        self.assertEqual(len(self.cw.requests), 1)
+
     def test_a_push_by_calibre_is_not_a_kobo_move_for_the_job(self):
         import kobo_service
         self.plugin_installed()
@@ -1007,16 +1026,31 @@ class RealSettingsDialogTests(RealCalibreBase):
                 self.assertEqual((library, cfg, db), (self.lib.path, config_dir, app_db))
                 self.assertTrue(read('kobo_service.py').startswith(b'# Last modified'))
                 self.assertTrue(self.widget().kobo_service.isChecked())     # reopened: still on
+                self.widget().save_kobo()                       # OK again: the copy is refreshed
+                self.assertEqual(install.call_count, 2)
+                w = self.widget()
+                w.kobo_service.setChecked(False)
+                w.save_kobo()                                   # unticked: taken down
+                self.assertEqual(uninstall.call_args[0][0], self.lib.path)
+                self.assertIs(PREFS['kobo'][self.lib.path]['service'], False)
                 install.return_value = (False, 'launchctl could not load the background job (exit 5: x).')
                 w = self.widget()
+                w.kobo_service.setChecked(True)
                 with mock.patch.object(type(w), '_show_error') as shown:
-                    w.save_kobo()                               # OK again: refresh; it fails
+                    w.save_kobo()                               # ticked, but launchd refuses it
                 self.assertIs(PREFS['kobo'][self.lib.path]['service'], False)
                 self.assertIn('exit 5', shown.call_args[0][0])
+                self.assertFalse(self.widget().kobo_service.isChecked())
                 w = self.widget()
-                self.assertFalse(w.kobo_service.isChecked())
+                w.kobo_service.setChecked(True)
+                install.return_value = (True, 'on')
                 w.save_kobo()
-                self.assertGreaterEqual(uninstall.call_count, 1)
+                calls = uninstall.call_count
+                w = self.widget()
+                w.kobo_db.setText('')                           # Kobo sync switched off: the job too
+                w.save_kobo()
+                self.assertEqual(uninstall.call_count, calls + 1)
+                self.assertNotIn(self.lib.path, PREFS['kobo'])
         finally:
             PREFS['kobo'] = {}
 
