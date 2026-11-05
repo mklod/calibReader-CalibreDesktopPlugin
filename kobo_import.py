@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0556
+# Last modified: 2026-11-05--0712
 #
 # kobo_import.py — Kobo reading positions (Calibre-Web's app.db) into
 # CalibReader_positions.json, the sidecar the CalibReader apps already read.
@@ -29,6 +29,10 @@
 # app's places to the Kobo through Calibre-Web's own Kobo API. The import skips
 # a Kobo bookmark that is our own push coming back (is_echo: Calibre-Web stamps
 # it with server time, so it looks newer than the app's place).
+#
+# 1.6.0 (step 3): the CLI takes the library's Kobo lock (kobo_service.LibraryLock;
+# busy = exit 75, nothing done) and remembers its pushes in calibre's own journal
+# by default, the one echo memory it shares with calibre and the background job.
 #
 # Copyright (C) 2026 CalibReader
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU General
@@ -629,9 +633,10 @@ def metadata_lookup(library_path):
 def main(argv=None):  # pragma: no cover - CLI
     import argparse
     try:
-        from calibre_plugins.calibreader_sync import kobo_push
+        from calibre_plugins.calibreader_sync import kobo_push, kobo_service
     except ImportError:  # standalone
         import kobo_push
+        import kobo_service
     ap = argparse.ArgumentParser(description='Import Kobo reading places from Calibre-Web into CalibReader_positions.json'
                                              ' (and, with --push, send CalibReader\'s places to the Kobo)')
     ap.add_argument('--library', required=True)
@@ -641,12 +646,25 @@ def main(argv=None):  # pragma: no cover - CLI
                     help='also send CalibReader\'s place to the Kobo through Calibre-Web (tester preview; off without it)')
     ap.add_argument('--calibre-web', default=kobo_push.DEFAULT_CALIBRE_WEB,
                     help='Calibre-Web address (default %(default)s)')
-    ap.add_argument('--state', default=kobo_push.DEFAULT_STATE_FILE,
-                    help='where the places sent to the Kobo are remembered (default %(default)s)')
+    ap.add_argument('--state', default=kobo_service.default_state_file(),
+                    help='where the places sent to the Kobo are remembered (default %(default)s: calibre\'s own '
+                         'journal, shared with the plugin and the background job)')
     ap.add_argument('--since',
                     help='send only places read after this time (ISO 8601, UTC); default: the time of the first '
                          '--push run for this library, kept in --state')
     a = ap.parse_args(argv)
+    # 1.6.0: one writer per library at a time (calibre, the background job, this CLI).
+    lock = kobo_service.LibraryLock(a.library, 'the command line')
+    if not lock.acquire():
+        print('note:', kobo_service.busy_note(lock.holder()))
+        return kobo_service.BUSY
+    try:
+        return _main_locked(a, kobo_push)
+    finally:
+        lock.release()
+
+
+def _main_locked(a, kobo_push):  # pragma: no cover - CLI
     state = kobo_push.load_state(a.state, a.library)
     since = a.since
     if a.push and not since:

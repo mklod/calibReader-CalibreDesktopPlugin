@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0659
+# Last modified: 2026-11-05--0712
 #
 # kobo_push.py — CalibReader's reading place to the Kobo, through Calibre-Web
 # (step 2 of the Kobo sync, plugin 1.5.0, tester preview).
@@ -77,7 +77,7 @@ except ImportError:  # pragma: no cover - standalone / test import
         BOOK_PERCENT, CHAPTER_PERCENT, CHAPTER_START, SPAN, Book, kobo_location, map_bookmark,
     )
 
-VERSION = '1.5.0'
+VERSION = '1.6.0'
 DEFAULT_CALIBRE_WEB = 'http://127.0.0.1:8083'
 DEFAULT_STATE_FILE = os.path.join('~', '.calibreader_sync', 'kobo_push_state.json')
 TIMEOUT = 10                   # seconds, wall clock, per request (name lookup included)
@@ -796,10 +796,12 @@ def sync_kobo(library_path, app_db, lookup, user=None, push=False, base_url=DEFA
 
 
 class StateFile(object):
-    '''The CLI's memory (the plugin keeps the same in calibre's prefs): per library
-    folder (real path), what was sent per book, and 'push_since', when sending was
-    turned on for this library (its first --push run). One JSON file on this
-    computer: {library: {'push_since': iso, uuid: record, ...}}.'''
+    '''The push memory on disk: per library folder (real path), what was sent per book,
+    and 'push_since', when the CLI's sending was turned on for this library (its first
+    --push run). One JSON file on this computer: {library: {'push_since': iso, uuid:
+    record, ...}}. 1.6.0 (R2-N2): calibre's journal (ui.KOBO_JOURNAL) is THE file: the
+    plugin, the background job (kobo_service) and the CLI (its default --state) all use
+    it, one at a time (kobo_service.LibraryLock), each loading it afresh per run.'''
 
     def __init__(self, path, library_path):
         self.path = os.path.expanduser(path)
@@ -813,6 +815,7 @@ class StateFile(object):
         except (OSError, ValueError):
             pass
         mine = self.table.get(self.key)
+        self.had_part = isinstance(mine, dict)     # this library has a part in the file
         mine = dict(mine) if isinstance(mine, dict) else {}
         since = mine.pop('push_since', None)
         self.since = since if isinstance(since, str) and since else None
@@ -823,8 +826,6 @@ class StateFile(object):
         first and kept (re-review R1-S2: one file, several libraries, a worker thread).'''
         with _STATE_LOCK:
             mine = dict(self.memory)
-            if self.since:
-                mine['push_since'] = self.since
             table = {}
             try:
                 with open(self.path, 'rb') as f:
@@ -833,6 +834,14 @@ class StateFile(object):
                     table = loaded
             except (OSError, ValueError):
                 table = dict(self.table)
+            if self.since:
+                mine['push_since'] = self.since
+            else:
+                # 1.6.0: a writer without a start time of its own (calibre, the job) keeps
+                # the one the CLI set for this library.
+                theirs = table.get(self.key)
+                if isinstance(theirs, dict) and isinstance(theirs.get('push_since'), str):
+                    mine['push_since'] = theirs['push_since']
             table[self.key] = mine
             self.table = table
             folder = os.path.dirname(self.path)

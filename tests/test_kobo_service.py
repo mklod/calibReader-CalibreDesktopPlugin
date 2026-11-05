@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0723
+# Last modified: 2026-11-05--0721
 #
 # Step 3 (plugin 1.6.0, tester preview): the Kobo sync without calibre running.
 # kobo_service.run_once is what the launchd job runs (calibre-debug -e <copy>/kobo_service.py
