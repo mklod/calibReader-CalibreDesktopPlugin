@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0858
+# Last modified: 2026-11-05--1000
 #
 # Step 3 (plugin 1.6.0, tester preview): the Kobo sync without calibre running.
 # kobo_service.run_once is what the launchd job runs (calibre-debug -e <copy>/kobo_service.py
@@ -1072,3 +1072,33 @@ class ReviewNitTests(ServiceBase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class KoboUtilitiesJobTests(ServiceBase):
+    '''1.7.0 (step 4): the background job does not run the Kobo Utilities route: KU's columns
+    only change while calibre runs (KU is a calibre plugin), where calibre's plugin imports them.
+    It says so once in its log; it is not a failure.'''
+
+    def set_ku_prefs(self):
+        with open(kobo_service.prefs_path(self.config), encoding='utf-8') as f:
+            prefs = json.load(f)
+        prefs['kobo_ku'] = {self.lib: {'sources': [{'id': 'ku', 'label': 'Kobo Utilities',
+                                                    'location': '#kobo_reading_location', 'percent': '',
+                                                    'last_read': '', 'boundReader': None}]}}
+        with open(kobo_service.prefs_path(self.config), 'w', encoding='utf-8', newline='\n') as f:
+            json.dump(prefs, f, indent=2)
+
+    def test_the_job_skips_the_ku_route_with_one_log_line(self):
+        self.set_ku_prefs()
+        self.kobo(60, '2026-10-30 21:03:48', tkp.CH.format(2), 'KoboSpan', 'kobo.5.1', 40.0, 3.0)
+        out = self.run_job()
+        self.assertEqual(out.status, 'done', out.notes)
+        self.assertEqual(self.log_text().count('Kobo Utilities (USB)'), 1, self.log_text())
+        self.touch_app()
+        self.run_job()
+        self.assertEqual(self.log_text().count('Kobo Utilities (USB)'), 1, self.log_text())
+
+    def test_without_ku_settings_no_line(self):
+        self.kobo(60, '2026-10-30 21:03:48', tkp.CH.format(2), 'KoboSpan', 'kobo.5.1', 40.0, 3.0)
+        self.run_job()
+        self.assertNotIn('Kobo Utilities', self.log_text())
