@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--1220
+# Last modified: 2026-11-05--1223
 #
 # test_real_calibre.py — CalibReader Sync against REAL calibre (LibraryDatabase, set_field,
 # metadata.db, JSONConfig, the Settings widget), not the in-memory FakeDB of sync_core.py.
@@ -1152,10 +1152,16 @@ class RealKoboUtilitiesTests(RealCalibreBase):
             os.remove(ui.KU_MEMORY)
         RealCalibreBase.tearDown(self)
 
-    def set_ku(self, location='#kobo_reading_location', percent='#kobo_percent_read', last_read='#kobo_last_read'):
+    def set_ku(self, location='#kobo_reading_location', percent='#kobo_percent_read', last_read='#kobo_last_read',
+               decided=False):
         import kobo_ku
         import ui
         ui.PREFS['kobo_ku'] = {self.lib.path: kobo_ku.prefs_entry(location, percent, last_read)}
+        if decided:
+            # a library already judged calibre-numbered (re-review B1-R2: until then, chapter starts)
+            source = kobo_ku.source_from_prefs(ui.PREFS['kobo_ku'][self.lib.path])
+            kobo_ku.MemoryFile(ui.KU_MEMORY).save(self.lib.path, kobo_ku.source_signature(source), {'.': {
+                'since': '2026-10-01T00:00:00.000Z', 'spans': 5, 'missing': 0, 'foreign': False, 'decided': True}})
 
     def fill(self, book, location, percent=None, last_read=None):
         api = self.lib.api
@@ -1200,7 +1206,7 @@ class RealKoboUtilitiesTests(RealCalibreBase):
         # a device-prefixed shape, and calibre's blank paragraph-start span (kobo.3.1, "\n")
         self.fill(b2, 'file:///mnt/onboard/Kafka/The Metamorphosis - Franz Kafka.kepub.epub!!' + KU_CH.format(1)
                   + '#kobo.3.1', 4, datetime.datetime(2026, 11, 1, 11, 0, tzinfo=UTC))
-        self.set_ku()
+        self.set_ku(decided=True)
         self.lib.reopen()
         before = self.metadata_hash()
         res = self.run_ui()
@@ -1232,7 +1238,7 @@ class RealKoboUtilitiesTests(RealCalibreBase):
         stored = os.path.join(TESTS, 'fixtures', 'metamorphosis.kepub')
         self.lib.api.add_format(b1, 'KEPUB', stored)
         self.fill(b1, KU_CH.format(1) + '#kobo.10.2', 4, datetime.datetime(2026, 11, 1, 10, 0, tzinfo=UTC))
-        self.set_ku()
+        self.set_ku(decided=True)
         res = self.run_ui()
         self.assertEqual(res.kobo_ku_imported, 1, res.notes)
         entry = self.entries()[u1]

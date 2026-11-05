@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--1220
+# Last modified: 2026-11-05--1223
 #
 # test_kobo_ku.py — the Kobo Utilities (USB) route, Kobo -> CalibReader (plugin 1.7.0, tester
 # preview): kobo_ku.py. Design: docs/handoffs/104-kobo-sync/KOBO-UTILITIES.md section 8.
@@ -440,6 +440,9 @@ SPAN_VALUE = CH.format(1) + '#kobo.10.2'
 class ImportTests(ImportBase):
 
     def test_a_ku_span_lands_in_the_positions_file(self):
+        # a library already judged calibre-numbered (re-review B1-R2: until then, chapter starts)
+        self.memory['.'] = {'since': '2026-10-01T00:00:00.000Z', 'spans': 5, 'missing': 0, 'foreign': False,
+                            'decided': True}
         res = self.run_import({1: (SPAN_VALUE, 4, '2026-11-01T10:00:00Z')})
         self.assertEqual(res.written, [self.uuids[1]], (res.skipped, res.notes))
         e = self.positions()[self.uuids[1]]
@@ -1280,7 +1283,7 @@ class ForeignNumberingTests(ImportBase):
                                2: (self.PRESENT[0], None, '2026-11-01T10:00:02Z')})
         self.assertEqual(self.entry(2)['kobo']['precision'], kobo_ku.CHAPTER)
         self.assertFalse(self.memory['.'].get('foreign'))
-        self.assertTrue(res.foreign)
+        self.assertTrue(res.undecided)                  # B1-R2: undecided, said as such
 
     def stamp(self, i, day=1):
         return '2026-11-{:02d}T10:00:{:02d}Z'.format(day, i)

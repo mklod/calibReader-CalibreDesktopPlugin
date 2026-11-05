@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--1141
+# Last modified: 2026-11-05--1223
 #
 # config.py — the plugin's settings dialog (Preferences > Plugins > CalibReader
 # Sync > Customize, or the "Settings…" item in the toolbar button's menu).
@@ -273,6 +273,14 @@ class ConfigWidget(QWidget):
         self.ku_status = self._text('')
         self.ku_status.setTextFormat(Qt.TextFormat.PlainText)
         v.addWidget(self.ku_status)
+        # Re-review S1-R2: forget the library's verdict on the Kobo's numbering
+        self.ku_recheck = QPushButton('Re-check numbering', self)
+        self.ku_recheck.setToolTip('Forget whether this library\'s Kobo copies were numbered by calibre or by another '
+                                   'tool (for example after you sent your books again with calibre). The next Kobo '
+                                   'places decide again: at the start of their chapter until 5 have been checked.')
+        self.ku_recheck.clicked.connect(lambda checked=False: self._recheck_numbering())
+        self.ku_recheck.setEnabled(bool(stored))
+        v.addWidget(self.ku_recheck)
         self.ku_clash_note = self._text('')
         self.ku_clash_note.setTextFormat(Qt.TextFormat.PlainText)
         v.addWidget(self.ku_clash_note)
@@ -347,6 +355,16 @@ class ConfigWidget(QWidget):
             self._show_ku_error(problem)
             return False
         return True
+
+    def _recheck_numbering(self):
+        if not self._ku_saved:
+            return
+        from calibre.constants import config_dir
+        memory_file = kobo_ku.MemoryFile(kobo_ku.memory_path(config_dir))
+        signature = kobo_ku.source_signature(self._ku_saved)
+        memory = memory_file.load(self.gui.library_path, signature)
+        memory_file.save(self.gui.library_path, signature, kobo_ku.reset_numbering(memory))
+        self._update_ku_status(self._ku_saved)
 
     def _ku_prefs(self):
         prefs = self._prefs()

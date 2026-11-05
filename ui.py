@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--1141
+# Last modified: 2026-11-05--1223
 #
 # CalibReader Sync — the toolbar action (GUI only).
 # calibre imports this module only in its main window, through
@@ -525,6 +525,8 @@ class CalibReaderSyncAction(InterfaceAction):
             lines.append('Kobo Utilities (USB): ' + ku.uncertain + '.')
         if ku.foreign:
             lines.append('Kobo Utilities (USB): ' + ku.foreign + '.')     # re-review S1-R1
+        if ku.undecided:
+            lines.append('Kobo Utilities (USB): ' + ku.undecided + '.')   # re-review B1-R2
         if not ku.busy:
             lines.append('Kobo Utilities (USB): ' + kobo_ku.store_line(ku.last_store))
             hint = kobo_ku.staleness_hint(ku.last_store, PREFS.get('kobo_ku_device_seen') or None)

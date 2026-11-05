@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--1141
+# Last modified: 2026-11-05--1223
 #
 # kobo_ku.py — Kobo reading places stored by the Kobo Utilities calibre plugin (USB sync)
 # into CalibReader_positions.json (plugin 1.7.0, tester preview). Kobo -> CalibReader only.
@@ -93,10 +93,18 @@ KTE_NOTE = ('the Kobo Touch Extended driver plugin is installed in calibre, so t
 # 343,676: a library is "foreign" once at least FOREIGN_MIN span values were looked at and FOREIGN_SHARE
 # or more of them were missing from the KEPUB calibre sends.
 FOREIGN_MIN = 5
-FOREIGN_SHARE = 0.4
+FOREIGN_SHARE = 0.2         # re-review B1-R2: 20 % (calibre-made: 0 %, Kobo Touch Extended: 66-79 % per book)
 FOREIGN_NOTE = ('most of the Kobo\'s sentence ids in this library are not in calibre\'s own KEPUB numbering (another '
                 'tool, such as Kobo Touch Extended, made the Kobo\'s copies), so the Kobo\'s sentence is passed on as '
                 'the start of its chapter')
+# Re-review B1-R2: until FOREIGN_MIN places decided, every span is written at its chapter start.
+UNDECIDED_NOTE = ('fewer than 5 of the Kobo\'s sentence places in this library have been checked against calibre\'s '
+                  'own KEPUB numbering yet, so they are passed on as the start of their chapter for now; they move to '
+                  'their sentence once the numbering is confirmed')
+# Re-review S1-R2: a book edited after the Kobo read it maps its found ids late (measured).
+EDITED_NOTE = ('this book was edited after the Kobo read it (its EPUB is newer, and one of the Kobo\'s sentence ids is '
+               'no longer in calibre\'s numbering of it), so its places are passed on as the start of their chapter '
+               'until the Kobo stores a place read after the edit')
 # Re-review NIT-R1-1: the only names the cache ever removes.
 _OWN_NAMES = re.compile(r'^(?:[0-9a-f]{24}\.kepub|[0-9a-f]{24}\.\d+\.\d+\.tmp|work-\d+-\d+-.*)$')
 
@@ -796,6 +804,16 @@ class MemoryFile(object):
             kobo_service._write_atomic(self.path, json.dumps(data, ensure_ascii=False).encode('utf-8'))
 
 
+def reset_numbering(memory):
+    '''Re-review S1-R2: "Re-check numbering" in Settings: forget the library's verdict on the Kobo's
+    numbering (foreign or calibre-numbered); the next places decide again from scratch (at their
+    chapter start until FOREIGN_MIN are checked). Books' own "edited" flags stay.'''
+    meta = dict(memory.get('.') or {})
+    meta.update({'spans': 0, 'missing': 0, 'foreign': False, 'decided': False})
+    memory['.'] = meta
+    return memory
+
+
 def memory_path(config_dir):
     return os.path.join(config_dir, 'plugins', 'calibreader_sync_ku_seen.json')
 
@@ -850,6 +868,7 @@ class KuImportResult(object):
         self.problems = {}         # uuid -> why, for books whose Kobo place could not be used (summary)
         self.uncertain = ''        # B1-R1: Kobo Touch Extended installed: spans passed on as their chapter start
         self.foreign = ''          # S1-R1: another converter's numbering in this library (summary)
+        self.undecided = ''        # B1-R2: the library's numbering is not decided yet (summary)
         self.titles = {}           # uuid -> title (ui.py fills it for the summary)
 
     def status_line(self):
@@ -922,6 +941,8 @@ def import_ku(library_path, source, values, lookup, memory, kepub_for=None, now=
         if isinstance(before, dict) and before.get('h') == h:
             continue                                   # 8.6: unchanged since it was last looked at
         record = {'h': h, 'lr': last_read, 'seen': now_s}
+        if isinstance(before, dict) and before.get('edited'):
+            record['edited'] = before['edited']          # S1-R2: kept until the Kobo reads after the edit
         current = data['positions'].get(keys.get(u, uuid))
         if last_read:
             stamp, kind = last_read, 'last-read'
@@ -999,36 +1020,118 @@ def import_ku(library_path, source, values, lookup, memory, kepub_for=None, now=
             sample = bool(place and place.get('span_found')) or isinstance(why, MissingSpan)
             run_seen += sample
             run_missing += isinstance(why, MissingSpan)
-            spans.append((u, uuid, place, why, alt, alt_why, record, kinfo, parsed, loc, pct, last_read, stamp, kind))
+            try:
+                epub_date = _iso(_dt.datetime.fromtimestamp(os.path.getmtime(epub_path), _dt.timezone.utc))
+            except OSError:
+                epub_date = None
+            spans.append((u, uuid, place, why, alt, alt_why, record, kinfo, parsed, loc, pct, last_read, stamp, kind,
+                          epub_path, kepub_path, epub_date))
             continue
         if place is None:
             # NIT 7: a 0 % / 100 % with no location is the Kobo's status, not a problem to report
             pending[u] = dict(record, status='status' if parsed is None else 'no-place')
             res.skipped[uuid] = why
             continue
-        mapped[u] = (uuid, _ku_entry(place, parsed, loc, pct, last_read, stamp, kind, kinfo), record, False)
+        mapped[u] = (uuid, _ku_entry(place, parsed, loc, pct, last_read, stamp, kind, kinfo), record, None)
     # S1-R1: is this library's Kobo numbering calibre's? (counts kept across runs; "foreign" sticks)
     meta = dict(memory.get('.') or {})
     seen, missing = meta.get('spans', 0) + run_seen, meta.get('missing', 0) + run_missing
     foreign = bool(meta.get('foreign')) or (seen >= FOREIGN_MIN and missing >= FOREIGN_SHARE * seen)
-    provisional = not foreign and seen < FOREIGN_MIN and missing > 0
+    # B1-R2: undecided (fewer than FOREIGN_MIN places checked) = every span at its chapter start
+    undecided = not foreign and seen < FOREIGN_MIN
+    decided = not foreign and not undecided
     newly_foreign = foreign and not meta.get('foreign')
-    if foreign or (provisional and spans):
+    newly_decided = decided and not meta.get('decided')
+    if foreign:
         res.foreign = FOREIGN_NOTE
-    for (u, uuid, place, why, alt, alt_why, record, kinfo, parsed, loc, pct, last_read, stamp, kind) in spans:
-        coarse = kinfo.get('uncertain') or (FOREIGN_NOTE if (foreign or provisional) else None)
+    elif undecided and spans:
+        res.undecided = UNDECIDED_NOTE
+    for (u, uuid, place, why, alt, alt_why, record, kinfo, parsed, loc, pct, last_read, stamp, kind,
+         epub_path, kepub_path, epub_date) in spans:
+        # S1-R2: a book edited after the Kobo read it: flagged on a missing id when its EPUB is newer
+        # than the Kobo's reading (no Kobo date: taken as possibly edited); cleared once the Kobo
+        # stores a place read after the EPUB's date
+        edited = record.get('edited')
+        if edited and last_read and epub_date and _parse_iso(last_read) > _parse_iso(epub_date):
+            edited = None
+            record.pop('edited', None)
+        if (not edited and isinstance(why, MissingSpan) and epub_date
+                and (not last_read or _parse_iso(epub_date) > _parse_iso(last_read))):
+            edited = record['edited'] = epub_date
+        coarse = (kinfo.get('uncertain') or (FOREIGN_NOTE if foreign else None) or (EDITED_NOTE if edited else None)
+                  or (UNDECIDED_NOTE if undecided else None))
         if coarse:
+            exact = place if (place is not None and place.get('precision') in (SPAN, SPAN_APPROX)) else None
             place, why = alt, alt_why                    # never after the Kobo's place: its chapter start
             if place is not None:
                 place = dict(place, note=coarse)
+                if exact is not None:
+                    place['spanAnchor'] = exact['textAnchor']   # NIT-R2-3: for the testers' reports
             if kinfo.get('uncertain'):
                 res.uncertain = kinfo['uncertain']
+            if coarse is UNDECIDED_NOTE:
+                record['coarse'] = 'undecided'           # B1-R2: upgraded once the numbering is decided
         if place is None:
             pending[u] = dict(record, status='no-place')
             res.skipped[uuid] = why
             continue
         place.pop('span_found', None)
-        mapped[u] = (uuid, _ku_entry(place, parsed, loc, pct, last_read, stamp, kind, kinfo), record, False)
+        mapped[u] = (uuid, _ku_entry(place, parsed, loc, pct, last_read, stamp, kind, kinfo), record, None)
+    if newly_decided:
+        # B1-R2: judged calibre-numbered: our chapter starts written while undecided go to their sentence.
+        # Only our own entry for the same Kobo value, unchanged since we wrote it; the place as any
+        # span is mapped (never after the Kobo's: the earlier of two numberings); the Kobo's stamp + 1 ms,
+        # so an app that already took the chapter start (same stamp) takes the sentence, and a place
+        # read in the app later stays newer (DESIGN.md step 4, re-review round 2).
+        positions = data['positions']
+        keys = {k.lower(): k for k in positions}
+        for book_id, (loc, pct, last_read) in values.items():
+            info = lookup(book_id)
+            if not info or not info[0] or not isinstance(loc, str):
+                continue
+            uuid, epub_path = info[0], info[1]
+            kepub_path = info[2] if len(info) > 2 else None
+            u = uuid.lower()
+            before = memory.get(u)
+            current = positions.get(keys.get(u, uuid))
+            if (u in mapped or not isinstance(before, dict) or before.get('status') != 'written'
+                    or before.get('coarse') != 'undecided' or before.get('edited') or not _ours(current, loc)
+                    or not epub_path or kepub_for is None):
+                continue
+            parsed = parse_location(loc)
+            pct_v = _pct(_number(pct))
+            epub = None
+            opened = []
+            kinfo = {}
+
+            def kepub(book_id=book_id, epub_path=epub_path, kepub_path=kepub_path, opened=opened, kinfo=kinfo):
+                kpath, why, extra = kepub_for(book_id, epub_path, kepub_path)
+                kinfo.update(extra or {})
+                paths = [kpath] if isinstance(kpath, str) else [k for k in (kpath or []) if k]
+                books = []
+                for path_ in paths:
+                    book = Book(path_)
+                    opened.append(book)
+                    books.append(book)
+                return ((books if len(books) > 1 else books[0]) if books else None), why
+            try:
+                epub = Book(epub_path)
+                place, why = map_ku(epub, parsed, pct_v, kepub=kepub)
+            except Exception:
+                place = None
+            finally:
+                for b in [epub] + opened:
+                    if b is not None:
+                        b.close()
+            if place is None or place.get('precision') not in (SPAN, SPAN_APPROX) or kinfo.get('uncertain'):
+                continue
+            place.pop('span_found', None)
+            k = current.get('kobo') or {}
+            entry = _ku_entry(place, parsed, loc.strip(), pct_v, _stamp(last_read), _plus_ms(current.get('updated_at')),
+                              k.get('stamp'), kinfo)
+            record = dict(before)
+            record.pop('coarse', None)
+            mapped[u] = (uuid, entry, record, current.get('updated_at'))
     if newly_foreign:
         # S1-R1: span places written before the library was known to be foreign may be after the
         # Kobo's place: our own entries (still ours, same location) go back to their chapter start.
@@ -1061,8 +1164,8 @@ def import_ku(library_path, source, values, lookup, memory, kepub_for=None, now=
             entry = _ku_entry(place, parsed, loc.strip(), _pct(_number(pct)), _stamp(last_read),
                               current.get('updated_at'), k.get('stamp'), {key: k[key] for key in ('kepub', 'calibre')
                                                                           if key in k})
-            mapped[u] = (uuid, entry, dict(before), True)
-    meta.update({'spans': seen, 'missing': missing, 'foreign': foreign})
+            mapped[u] = (uuid, entry, dict(before), current.get('updated_at'))
+    meta.update({'spans': seen, 'missing': missing, 'foreign': foreign, 'decided': decided})
     if first_run:
         meta.setdefault('since', now_s)
     if meta != (memory.get('.') or {}):
@@ -1081,9 +1184,9 @@ def import_ku(library_path, source, values, lookup, memory, kepub_for=None, now=
         for u, (uuid, entry, record, own_fix) in mapped.items():
             key = keys.get(u, uuid)
             current = table.get(key)
-            if own_fix:
-                # S1-R1: replaces only our own entry for the same Kobo value, whatever the stamps
-                if not (_ours(current, entry['kobo']['location']) and current.get('updated_at') == entry['updated_at']):
+            if own_fix is not None:
+                # S1-R1 / B1-R2: replaces only our own entry for the same Kobo value, as we wrote it
+                if not (_ours(current, entry['kobo']['location']) and current.get('updated_at') == own_fix):
                     continue
             elif isinstance(current, dict) and not _is_newer(entry['updated_at'], current.get('updated_at')):
                 pending[u] = dict(record, status='kept')
@@ -1117,6 +1220,12 @@ def import_ku(library_path, source, values, lookup, memory, kepub_for=None, now=
     return res
 
 
+def _plus_ms(stamp):
+    '''"…T10:00:01.000Z" -> "…T10:00:01.001Z" (B1-R2's upgrade stamp).'''
+    t = _parse_iso(stamp)
+    return _iso(t + _dt.timedelta(milliseconds=1)) if t is not None else stamp
+
+
 def _ours(current, location):
     '''Is the positions entry this plugin's Kobo Utilities entry for this very Kobo value?'''
     return (isinstance(current, dict) and current.get('deviceId') == KU_DEVICE_ID
@@ -1131,6 +1240,8 @@ def _ku_entry(place, parsed, loc, pct, last_read, stamp, kind, kinfo):
         kobo['fragment'] = parsed['fragment']
     if place.get('note'):
         kobo['note'] = place['note']
+    if place.get('spanAnchor') is not None:
+        kobo['spanAnchor'] = place['spanAnchor']
     kobo.update(kinfo or {})
     return {'chapter': place['chapter'], 'page': 0, 'scrollY': 0, 'progress': place['progress'],
             'textAnchor': place['textAnchor'], 'updated_at': stamp, 'deviceId': KU_DEVICE_ID, 'kobo': kobo}
