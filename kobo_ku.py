@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--1243
+# Last modified: 2026-11-05--1300
 #
 # kobo_ku.py — Kobo reading places stored by the Kobo Utilities calibre plugin (USB sync)
 # into CalibReader_positions.json (plugin 1.7.0, tester preview). Kobo -> CalibReader only.
@@ -107,9 +107,11 @@ UNDECIDED_LINE = ('the Kobo\'s sentence places in this library are being checked
 # Re-review rounds 2-3, S1-R2: a book edited after it was sent maps its found ids late (measured), and a Kobo
 # reading after the edit does not mean the Kobo has the edited copy (only sending it again does).
 EDITED_NOTE = ('this book\'s copy on the Kobo is numbered differently from calibre\'s KEPUB of its EPUB today (it was '
-               'edited after it was sent: one of the Kobo\'s sentence ids is missing, or the EPUB changed since the '
-               'plugin first saw it), so its places are passed on as the start of their chapter until you send it to '
-               'the Kobo again and click "Re-check numbering" in Settings')
+               'edited after it was sent: one of the Kobo\'s sentence ids is missing, the EPUB changed since the '
+               'plugin first saw it, or the EPUB is newer than the copy on the connected Kobo), so its places are '
+               'passed on as the start of their chapter until you send it to the Kobo again and click "Re-check '
+               'numbering" in Settings')
+KOBO_COPY_SLACK = 600       # (b): seconds an EPUB may be newer than its Kobo copy (clocks) before it counts as edited
 # Re-review NIT-R1-1: the only names the cache ever removes.
 _OWN_NAMES = re.compile(r'^(?:[0-9a-f]{24}\.kepub|[0-9a-f]{24}\.\d+\.\d+\.tmp|work-\d+-\d+-.*)$')
 
@@ -809,6 +811,29 @@ class MemoryFile(object):
             kobo_service._write_atomic(self.path, json.dumps(data, ensure_ascii=False).encode('utf-8'))
 
 
+def kobo_copy_times(booklists):
+    '''Residual (b), re-review round 4: {calibre book id: when the Kobo's copy was made (epoch seconds)}
+    from calibre's OWN in-memory list of the connected Kobo's books, `Main.booklists()` (calibre/gui2/
+    ui.py, the same in 9.0-9.14: the device views' models, filled by calibre at connect). Each calibre
+    device Book has `application_id` (the calibre book id calibre matched it to) and `datetime` (a UTC
+    struct_time: the Kobo's DateCreated, else the file's ctime). The newest copy per book; None when
+    there is nothing usable. Pure: reads the objects, no device I/O.'''
+    import calendar
+    out = {}
+    for booklist in booklists or ():
+        for book in booklist or ():
+            book_id = getattr(book, 'application_id', None)
+            when = getattr(book, 'datetime', None)
+            if book_id is None or when is None:
+                continue
+            try:
+                t = float(calendar.timegm(tuple(when)[:9]))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            out[book_id] = max(out.get(book_id, t), t)
+    return out or None
+
+
 def reset_numbering(memory):
     '''Re-review S1-R2: "Re-check numbering" in Settings: forget the library's verdict on the Kobo's
     numbering (foreign or calibre-numbered); the next places decide again from scratch (at their
@@ -820,8 +845,8 @@ def reset_numbering(memory):
     for key, record in list(memory.items()):
         if key != '.' and isinstance(record, dict) and ('edited' in record or 'epub_seen' in record):
             record = dict(record)
-            record.pop('edited', None)
-            record.pop('epub_seen', None)
+            for field in ('edited', 'epub_seen', 'edited_by'):
+                record.pop(field, None)
             memory[key] = record
     return memory
 
@@ -909,7 +934,7 @@ def _iso(t):
 
 
 def import_ku(library_path, source, values, lookup, memory, kepub_for=None, now=None, log=None,
-              max_books=MAX_BOOKS, budget=REGEN_BUDGET, clock=time.monotonic):
+              max_books=MAX_BOOKS, budget=REGEN_BUDGET, clock=time.monotonic, kobo_copies=None):
     '''One import of the Kobo Utilities columns. `values`: {book_id: (location, percent, last
     read)} (read_columns_db / read_columns_sqlite). `lookup(book_id)` -> (uuid, EPUB path,
     KEPUB path) or None. `memory`: this library's + column set's records {uuid: record}, updated
@@ -925,6 +950,25 @@ def import_ku(library_path, source, values, lookup, memory, kepub_for=None, now=
         res.notes.append(err.replace('Kobo places', 'Kobo Utilities places'))
         return res
     first_run = '.' not in memory
+    copies_flagged = False
+    if kobo_copies:
+        # residual (b): a book whose EPUB is newer than its copy on the connected Kobo was edited after it
+        # was sent: flagged (until "Re-check numbering"), before any of its places is mapped
+        for book_id in values:
+            copy_time = kobo_copies.get(book_id)
+            info = lookup(book_id) if copy_time is not None else None
+            if not info or not info[0] or not info[1]:
+                continue
+            try:
+                st = os.stat(info[1])
+            except OSError:
+                continue
+            if st.st_mtime > copy_time + KOBO_COPY_SLACK:
+                u = info[0].lower()
+                before = memory.get(u) if isinstance(memory.get(u), dict) else {}
+                if not before.get('edited'):
+                    memory[u] = dict(before, edited=[st.st_mtime_ns, st.st_size], edited_by='kobo copy older')
+                    copies_flagged = True
     has_date_column = bool(source.get('last_read'))
     keys = {k.lower(): k for k in data['positions']}
     pending = {}                       # uuid -> record, saved once the run is through
@@ -1069,10 +1113,8 @@ def import_ku(library_path, source, values, lookup, memory, kepub_for=None, now=
         # numbering" or until the EPUB changes again (then that file is the new first-seen state);
         # a Kobo reading after the edit does not clear it.
         edited = record.get('edited')
-        if edited and epub_state and edited != epub_state:
-            edited = None                                # the EPUB changed again: decide again from this file
-            record.pop('edited', None)
-            record['epub_seen'] = epub_state
+        # S1-R4a (re-review round 4, supersedes round 3's "the EPUB changes again clears it"): a later EPUB
+        # change is not a re-send; only "Re-check numbering" clears the flag.
         if epub_state and not record.get('epub_seen'):
             record['epub_seen'] = epub_state             # the first time a span of this book is mapped
         if not edited and epub_state and record.get('epub_seen') != epub_state:
@@ -1115,9 +1157,19 @@ def import_ku(library_path, source, values, lookup, memory, kepub_for=None, now=
             u = uuid.lower()
             before = memory.get(u)
             current = positions.get(keys.get(u, uuid))
-            if (u in mapped or not isinstance(before, dict) or before.get('status') != 'written'
+            if (u in mapped or u in pending or not isinstance(before, dict) or before.get('status') != 'written'
                     or before.get('coarse') != 'undecided' or before.get('edited') or not _ours(current, loc)
                     or not epub_path or kepub_for is None):
+                continue
+            # S1-R4b: a book whose EPUB changed since it was first seen (or was never recorded) is not
+            # upgraded: it is flagged edited (the Kobo still has the copy sent before the change)
+            try:
+                st = os.stat(epub_path)
+                state = [st.st_mtime_ns, st.st_size]
+            except OSError:
+                state = None
+            if state is None or before.get('epub_seen') != state:
+                pending[u] = dict(before, edited=state or True)
                 continue
             parsed = parse_location(loc)
             pct_v = _pct(_number(pct))
@@ -1237,7 +1289,7 @@ def import_ku(library_path, source, values, lookup, memory, kepub_for=None, now=
     for uuid, why in res.skipped.items():
         if isinstance(uuid, str) and (pending.get(uuid.lower()) or {}).get('status') in PROBLEMS:
             res.problems[uuid] = why
-    res.memory_changed = bool(first_run or pending or meta_changed)
+    res.memory_changed = bool(first_run or pending or meta_changed or copies_flagged)
     return res
 
 

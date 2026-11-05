@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--1223
+# Last modified: 2026-11-05--1300
 #
 # CalibReader Sync — the toolbar action (GUI only).
 # calibre imports this module only in its main window, through
@@ -495,7 +495,8 @@ class CalibReaderSyncAction(InterfaceAction):
                         api.format_abspath(book_id, 'KEPUB'))
             cache = kobo_ku.KepubCache()
             kepub_for = kobo_ku.make_kepub_for(lambda book_id: api.formats(book_id) or (), cache)
-            res = kobo_ku.import_ku(library, source, values, lookup, memory, kepub_for=kepub_for)
+            res = kobo_ku.import_ku(library, source, values, lookup, memory, kepub_for=kepub_for,
+                                    kobo_copies=self._kobo_copies())
             if res.memory_changed:
                 try:
                     memory_file.save(library, signature, memory)
@@ -511,6 +512,23 @@ class CalibReaderSyncAction(InterfaceAction):
             return res
         finally:
             lock.release()
+
+    def _kobo_copies(self):
+        '''Residual (b), re-review round 4: when a Kobo is connected, {calibre book id: when its Kobo copy
+        was made} from calibre's OWN in-memory list of the device's books (Main.booklists(), filled by
+        calibre at connect; calibre 9.0-9.14). Read-only: never device I/O, never KoboReader.sqlite. None
+        when no Kobo is connected or the list is not there (then nothing changes).'''
+        try:
+            device = getattr(getattr(self.gui, 'device_manager', None), 'connected_device', None)
+            if device is None:
+                return None
+            name = '{} {}'.format(type(device).__name__, getattr(device, 'name', '') or '')
+            if 'kobo' not in name.lower():
+                return None
+            booklists = getattr(self.gui, 'booklists', None)
+            return kobo_ku.kobo_copy_times(booklists()) if callable(booklists) else None
+        except Exception:
+            return None
 
     def _ku_lines(self, ku):
         lines = []
