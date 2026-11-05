@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0413
+# Last modified: 2026-11-05--0516
 #
 # sync_core.py — one sync run, without the GUI.
 #
@@ -408,6 +408,7 @@ class SyncResult(object):
         self.kobo_imported = 0         # 1.4.0: Kobo places put into the positions file (ui.py)
         self.kobo_pushed = 0           # 1.5.0: app places sent to the Kobo via Calibre-Web (ui.py)
         self.kobo_push_lines = []      # 1.5.0: what was sent, with the precision (summary only)
+        self.kobo_push_started = False # 1.5.0 round 1: the push went to a worker thread (ui.py)
         self.changes = []              # 1.3.1: every value written, old -> new (append_change_log)
         self.confirm = None            # 1.3.1: {column, heading, fill, change} of a first sync
                                        # into a chosen column waiting for the user's OK

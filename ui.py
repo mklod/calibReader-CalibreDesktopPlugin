@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0413
+# Last modified: 2026-11-05--0516
 #
 # CalibReader Sync — the toolbar action (GUI only).
 # calibre imports this module only in its main window, through
@@ -23,6 +23,13 @@
 # library folder in this plugin's prefs ('kobo_pushed'), so the import does not
 # read our own push back as a Kobo move.
 #
+# v1.5.0 review round 1: the push runs on a worker thread (S4), never on calibre's
+# GUI thread: the import still runs in the run itself, the push reports back
+# through a Qt signal (status bar + the saved memory). Only places read after the
+# box was ticked are sent (PREFS['kobo'][library]['push_since'], B3). After
+# Calibre-Web failed, automatic runs do not send for BACKOFF seconds; the button
+# always tries.
+#
 # v1.3.1: one run is sync_core.sync_library (tested under real calibre in
 # tests/test_real_calibre.py). The first sync into a chosen read column waits for
 # the user's OK (a question with the counts, from the button; a status-bar note from
@@ -40,9 +47,11 @@ from calibre.constants import config_dir
 from calibre.gui2.actions import InterfaceAction
 from calibre.gui2 import error_dialog, info_dialog, open_local_file, question_dialog
 from calibre.utils.config import JSONConfig
-from qt.core import QMenu, QTimer, QToolButton
+from qt.core import QMenu, QObject, QTimer, QToolButton, pyqtSignal
 
 import os
+import threading
+import time
 
 # Pure logic — no calibre imports, so it can be unit-tested outside the GUI.
 # Inside calibre the plugin is loaded as the package `calibreader_sync` (see
@@ -59,9 +68,15 @@ except ImportError:  # pragma: no cover - standalone / test import
         normalise_settings, sync_library,
     )
 try:
-    from calibre_plugins.calibreader_sync.kobo_push import calibre_web_url, push_enabled, sync_kobo
+    from calibre_plugins.calibreader_sync.kobo_import import import_positions
+    from calibre_plugins.calibreader_sync.kobo_push import (
+        BACKOFF, KoboPushResult, calibre_web_url, now_iso, push_enabled, push_positions, with_kepub_beside,
+    )
 except ImportError:  # pragma: no cover - standalone / test import
-    from kobo_push import calibre_web_url, push_enabled, sync_kobo
+    from kobo_import import import_positions
+    from kobo_push import (
+        BACKOFF, KoboPushResult, calibre_web_url, now_iso, push_enabled, push_positions, with_kepub_beside,
+    )
 
 # Per-book bookkeeping lives in the plugin's OWN prefs, never in the user's
 # library: adding a column to someone's library to track sync state is not
@@ -83,6 +98,9 @@ CHANGE_LOGS = os.path.join(config_dir, 'plugins', CHANGE_LOG_DIR)
 # CalibReader's place to the Kobo"; off by default) and 'cw_url' (Calibre-Web's
 # address, '' = http://127.0.0.1:8083). PREFS['kobo_pushed'] = {library path:
 # {uuid: what was sent}}: the echo guard's memory (never the shared sidecar).
+# Review round 1 (B3): 'push_since' in the entry = when the box was ticked (UTC);
+# only app places stamped after it are sent. config.save_kobo sets it when the box
+# goes from off to on and drops it when unticked.
 PREFS.defaults['kobo'] = {}
 PREFS.defaults['kobo_pushed'] = {}
 
@@ -90,6 +108,20 @@ PREFS.defaults['kobo_pushed'] = {}
 def kobo_settings(library_path):
     entry = (PREFS.get('kobo', {}) or {}).get(library_path) or {}
     return entry if entry.get('app_db') else None
+
+
+class _PushBridge(QObject):
+    '''Hands the worker's push result to the GUI thread: the bridge lives on the GUI
+    thread, so a signal emitted on the worker is delivered there (queued).'''
+    done = pyqtSignal(object)
+
+    def __init__(self, callback):
+        QObject.__init__(self)
+        self._callback = callback
+        self.done.connect(self._deliver)
+
+    def _deliver(self, payload):
+        self._callback(payload)
 
 
 class CalibReaderSyncAction(InterfaceAction):
@@ -178,11 +210,23 @@ class CalibReaderSyncAction(InterfaceAction):
             if line:
                 self.gui.status_bar.show_message('CalibReader Sync: ' + line, 10000)
 
-    def _run_kobo(self, api):
+    def _kobo_memory(self, library):
+        '''What was sent to the Kobo for this library (the echo guard's memory), one dict
+        shared by the import (GUI thread) and the push worker, saved to PREFS when the
+        worker is done.'''
+        memories = getattr(self, '_kobo_memories', None)
+        if memories is None:
+            memories = self._kobo_memories = {}
+        if library not in memories:
+            memories[library] = dict((PREFS.get('kobo_pushed', {}) or {}).get(library) or {})
+        return memories[library]
+
+    def _run_kobo(self, api, manual=False):
         '''Kobo places from Calibre-Web's app.db into CalibReader_positions.json
         (1.4.0 tester preview), before the sync reads that file; then (1.5.0, only
-        when the user turned it on) the app's places to the Kobo through
-        Calibre-Web. -> (import result, push result or None), or None when not set up.'''
+        when the user turned it on) the app's places to the Kobo through Calibre-Web,
+        on a worker thread (review round 1 S4). -> the import result, or None when
+        not set up.'''
         library = self.gui.library_path
         kobo = kobo_settings(library)
         if not kobo:
@@ -194,28 +238,84 @@ class CalibReaderSyncAction(InterfaceAction):
                 return None
             return (api.field_for('uuid', book_id), api.format_abspath(book_id, 'EPUB'),
                     api.format_abspath(book_id, 'KEPUB'))
-        pushed = dict(PREFS.get('kobo_pushed', {}) or {})
-        memory = dict(pushed.get(library) or {})
-        before = dict(memory)
-        kres, pres = sync_kobo(library, kobo['app_db'], lookup, user=kobo.get('user') or None,
-                               push=push_enabled(kobo), base_url=calibre_web_url(kobo), memory=memory)
-        if memory != before:
-            pushed[library] = memory
-            PREFS['kobo_pushed'] = pushed       # assignment commits a JSONConfig
-        return kres, pres
+        lookup = with_kepub_beside(lookup)      # S2: a KEPUB Calibre-Web added while calibre ran
+        memory = self._kobo_memory(library)
+        kres = import_positions(library, kobo['app_db'], lookup, user=kobo.get('user') or None, pushed=memory)
+        if push_enabled(kobo):
+            since = kobo.get('push_since')
+            if not since:
+                # B3: ticked before 'push_since' existed (or by hand): sending starts now.
+                since = now_iso()
+                table = dict(PREFS.get('kobo', {}) or {})
+                entry = dict(table.get(library) or kobo)
+                entry['push_since'] = since
+                table[library] = entry
+                PREFS['kobo'] = table
+            self._start_kobo_push(library, kobo, lookup, memory, since, manual)
+        return kres
 
-    def _run(self, api, settings=None, approve=None):
+    def _start_kobo_push(self, library, kobo, lookup, memory, since, manual):
+        '''Start the push on a worker thread (S4). Not while one is running; after a
+        Calibre-Web failure, not for BACKOFF seconds unless the user pressed the button.'''
+        worker = getattr(self, '_kobo_worker', None)
+        if worker is not None and worker.is_alive():
+            self._push_status = 'busy'
+            return False
+        if not manual and time.monotonic() < getattr(self, '_push_backoff_until', 0):
+            self._push_status = 'backoff'
+            return False
+        bridge = getattr(self, '_push_bridge', None)
+        if bridge is None:
+            bridge = self._push_bridge = _PushBridge(self._kobo_push_done)
+        app_db, user, base_url = kobo['app_db'], kobo.get('user') or None, calibre_web_url(kobo)
+
+        def work():
+            try:
+                pres = push_positions(library, app_db, lookup, base_url=base_url, memory=memory, user=user,
+                                      since=since)
+            except Exception as exc:            # never let the worker die silently
+                pres = KoboPushResult()
+                pres.notes.append('Sending to the Kobo failed ({}).'.format(exc))
+            bridge.done.emit((library, pres))
+        self._push_pending = True
+        self._push_status = 'started'
+        worker = threading.Thread(target=work, name='CalibReader Sync: send to the Kobo', daemon=True)
+        self._kobo_worker = worker
+        worker.start()
+        return True
+
+    def _kobo_push_done(self, payload):
+        '''On the GUI thread, when the worker is done: save what was sent, back off after
+        a Calibre-Web failure, one status-bar line, and the next chunk if any.'''
+        library, pres = payload
+        self._push_pending = False
+        self._last_push = pres
+        memory = self._kobo_memory(library)
+        table = dict(PREFS.get('kobo_pushed', {}) or {})
+        if table.get(library) != memory:
+            table[library] = dict(memory)
+            PREFS['kobo_pushed'] = table        # assignment commits a JSONConfig
+        if pres.failure in ('network', 'timeout', 'server', 'address'):
+            self._push_backoff_until = time.monotonic() + BACKOFF
+        line = pres.status_line() or (('Kobo: ' + pres.notes[0]) if pres.notes else '')
+        status_bar = getattr(self.gui, 'status_bar', None)
+        if line and status_bar is not None:
+            status_bar.show_message('CalibReader Sync: ' + line, 10000)
+        if pres.more and library == getattr(self.gui, 'library_path', None):
+            self._kick.start(AUTO_DELAY_MS)
+
+    def _run(self, api, settings=None, approve=None, manual=False):
         # settings: unused since 1.3.1 (sync_library reads the library's own); kept so
         # callers written for 1.3.0 still work.
         # 1.4.0 L2: the Kobo import (and 1.5.0's push) never stops the read-status sync.
+        self._push_status = None
         try:
-            kobo, kobo_error = self._run_kobo(api), None
+            kres, kobo_error = self._run_kobo(api, manual=manual), None
         except Exception as exc:
-            kobo, kobo_error = None, 'Kobo sync failed ({}); read status and progress still synced.'.format(exc)
-        kres, pres = kobo if kobo is not None else (None, None)
+            kres, kobo_error = None, 'Kobo sync failed ({}); read status and progress still synced.'.format(exc)
         # L1: a run maps at most kobo_import.MAX_BOOKS books; the rest follow soon.
         # A refused or failing run never sets `more` (N1), so this never loops.
-        if (kres is not None and kres.more) or (pres is not None and pres.more):
+        if kres is not None and kres.more:
             self._kick.start(AUTO_DELAY_MS)
         res = sync_library(api, self.gui.library_path, PREFS, log_dir=CHANGE_LOGS, approve=approve)
         if res.columns_written:
@@ -223,10 +323,13 @@ class CalibReaderSyncAction(InterfaceAction):
         if kres is not None:
             res.notes.extend(kres.notes)
             res.kobo_imported = len(kres.written)
-        if pres is not None:
-            res.notes.extend(pres.notes)
-            res.kobo_pushed = len(pres.sent)
-            res.kobo_push_lines = list(pres.lines)
+        status = self._push_status
+        if status == 'started':
+            res.kobo_push_started = True
+            res.kobo_push_lines = ['Kobo: CalibReader\'s places are being sent to Calibre-Web in the background; '
+                                   'the status bar shows the result.']
+        elif status == 'busy':
+            res.kobo_push_lines = ['Kobo: still sending the last places to Calibre-Web.']
         if kobo_error:
             res.notes.append(kobo_error)
         return res
@@ -263,9 +366,9 @@ class CalibReaderSyncAction(InterfaceAction):
         db = self.gui.current_db.new_api
         settings = normalise_settings(db.pref(SETTINGS_KEY, None))
 
-        res = self._run(db, settings)
+        res = self._run(db, settings, manual=True)
         if res.confirm and self._confirm_first_sync(res.confirm):
-            res = self._run(db, settings, approve=res.confirm['column'])
+            res = self._run(db, settings, approve=res.confirm['column'], manual=True)
         self._seen = self._file_stamps()
 
         if not res.found_any_file:

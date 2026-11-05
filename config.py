@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0413
+# Last modified: 2026-11-05--0516
 #
 # config.py — the plugin's settings dialog (Preferences > Plugins > CalibReader
 # Sync > Customize, or the "Settings…" item in the toolbar button's menu).
@@ -50,9 +50,9 @@ except ImportError:  # pragma: no cover - standalone / test import
         normalise_settings, read_column_hint, settings_to_store, suggest_column,
     )
 try:
-    from calibre_plugins.calibreader_sync.kobo_push import DEFAULT_CALIBRE_WEB
+    from calibre_plugins.calibreader_sync.kobo_push import DEFAULT_CALIBRE_WEB, clean_address, now_iso
 except ImportError:  # pragma: no cover - standalone / test import
-    from kobo_push import DEFAULT_CALIBRE_WEB
+    from kobo_push import DEFAULT_CALIBRE_WEB, clean_address, now_iso
 
 # What "Create column…" proposes. The user can rename them in calibre's dialog.
 NEW_COLUMNS = {
@@ -183,8 +183,8 @@ class ConfigWidget(QWidget):
             'When you have read further in CalibReader than on the Kobo, calibre sends that place to '
             'Calibre-Web, which hands it to the Kobo at its next sync. Only forward: never a place behind '
             'the Kobo\'s. It goes through Calibre-Web\'s own Kobo connection at the address below '
-            '(app.db is still only read). To the sentence when the book has a KEPUB in this library, '
-            'otherwise to the chapter and percentage.'))
+            '(app.db is still only read). Only places you read after ticking this box are sent. To the '
+            'sentence when the book has a KEPUB in this library; otherwise the Kobo gets the percentages only.'))
         grid = QGridLayout()
         self.kobo_url = QLineEdit(kobo.get('cw_url', ''), self)
         self.kobo_url.setPlaceholderText(DEFAULT_CALIBRE_WEB)
@@ -342,9 +342,16 @@ class ConfigWidget(QWidget):
         table = dict(PREFS.get('kobo', {}) or {})
         path = self.kobo_db.text().strip()
         if path:
-            table[self.gui.library_path] = {'app_db': path, 'user': self.kobo_user.text().strip(),
-                                            'push': bool(self.kobo_push.isChecked()),
-                                            'cw_url': self.kobo_url.text().strip()}
+            before = table.get(self.gui.library_path) or {}
+            push = bool(self.kobo_push.isChecked())
+            entry = {'app_db': path, 'user': self.kobo_user.text().strip(), 'push': push,
+                     # N7: a pasted Kobo sync link (…/kobo/<token>) is cut to the address
+                     'cw_url': clean_address(self.kobo_url.text())[0]}
+            if push:
+                # B3: sending starts when the box goes from off to on; OK again keeps the time.
+                kept = before.get('push_since') if before.get('push') is True else None
+                entry['push_since'] = kept or now_iso()
+            table[self.gui.library_path] = entry
         else:
             table.pop(self.gui.library_path, None)
         PREFS['kobo'] = table                   # assignment commits a JSONConfig
