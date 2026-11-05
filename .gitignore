@@ -2,3 +2,4 @@
 __pycache__/
 .venv-cw/
 /e2e/
+/e2e-service/

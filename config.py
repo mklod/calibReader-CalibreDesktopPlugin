@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0516
+# Last modified: 2026-11-05--0714
 #
 # config.py — the plugin's settings dialog (Preferences > Plugins > CalibReader
 # Sync > Customize, or the "Settings…" item in the toolbar button's menu).
@@ -20,6 +20,12 @@
 # by default (nothing is ever sent while it is off), and Calibre-Web's address
 # (default http://127.0.0.1:8083). Both in the same per-library Kobo prefs.
 #
+# 1.6.0 (tester preview): "Keep syncing when calibre is closed (macOS, tester preview)",
+# unchecked by default. OK with it ticked sets up the background job (kobo_service.install:
+# a copy of the Kobo modules, a launchd LaunchAgent for this library, loaded at once);
+# unticked (or the app.db path cleared) takes it down. A status line shows launchd's view
+# and the job's last run. Stored as 'service' in the same per-library Kobo prefs.
+#
 # 1.3.1: no read column is pre-selected or saved unless the user picks one (H1);
 # a chosen column that can't be used means read status is not synced (M1); OK
 # kicks a sync (L4); the wording says Android uses #read_status only (L3).
@@ -33,6 +39,8 @@ from __future__ import annotations
 
 __license__   = 'GPL v3'
 __copyright__ = '2026, CalibReader'
+
+import os
 
 from qt.core import (
     QCheckBox, QComboBox, QFrame, QGridLayout, QLabel, QLineEdit, QPushButton, QSpinBox, QTimer,
@@ -51,8 +59,10 @@ except ImportError:  # pragma: no cover - standalone / test import
     )
 try:
     from calibre_plugins.calibreader_sync.kobo_push import DEFAULT_CALIBRE_WEB, clean_address, now_iso
+    from calibre_plugins.calibreader_sync import kobo_service
 except ImportError:  # pragma: no cover - standalone / test import
     from kobo_push import DEFAULT_CALIBRE_WEB, clean_address, now_iso
+    import kobo_service
 
 # What "Create column…" proposes. The user can rename them in calibre's dialog.
 NEW_COLUMNS = {
@@ -192,6 +202,22 @@ class ConfigWidget(QWidget):
         grid.addWidget(self.kobo_url, 0, 1)
         grid.setColumnStretch(1, 1)
         v.addLayout(grid)
+        # 1.6.0: the same Kobo work with calibre closed (a launchd job), off unless ticked.
+        mac = kobo_service.supported()
+        self.kobo_service = QCheckBox('Keep syncing when calibre is closed (macOS, tester preview)', self)
+        self.kobo_service.setChecked(mac and kobo.get('service') is True)
+        self.kobo_service.setEnabled(mac)
+        v.addWidget(self.kobo_service)
+        v.addWidget(self._text(
+            'calibre does the Kobo work above only while it is running. Tick this and a small background job '
+            'does the same with calibre closed: every 5 minutes, and soon after Calibre-Web records a Kobo sync. '
+            'It uses calibre\'s own Python and these settings (untick "Also send…" and it stops sending too). '
+            'Calibre-Web must keep running. Log: ~/Library/Logs/CalibReaderSync/kobo.log.'
+            if mac else 'macOS only for now.'))
+        self.kobo_service_status = self._text(
+            kobo_service.status_text(self.gui.library_path) if mac else '')
+        self.kobo_service_status.setVisible(mac)
+        v.addWidget(self.kobo_service_status)
         v.addWidget(self._text('Saved on this computer only, for this library.'))
         v.addStretch(1)
 
@@ -351,10 +377,43 @@ class ConfigWidget(QWidget):
                 # B3: sending starts when the box goes from off to on; OK again keeps the time.
                 kept = before.get('push_since') if before.get('push') is True else None
                 entry['push_since'] = kept or now_iso()
+            service = bool(self.kobo_service.isChecked() and kobo_service.supported())
+            entry['service'] = service
             table[self.gui.library_path] = entry
         else:
-            table.pop(self.gui.library_path, None)
+            service, entry = False, None
+            before = table.pop(self.gui.library_path, None) or {}
         PREFS['kobo'] = table                   # assignment commits a JSONConfig
+        self._save_service(PREFS, entry, service, before.get('service') is True)
+
+    def _save_service(self, PREFS, entry, service, was):
+        '''1.6.0: set the background job up (ticked), or take it down (unticked, or Kobo
+        sync switched off). The job reads the settings just saved, so they go first.'''
+        library = self.gui.library_path
+        if service:
+            from calibre.constants import config_dir
+            try:
+                from calibre_plugins.calibreader_sync.ui import resource_reader
+            except ImportError:  # pragma: no cover - tests under calibre-debug load ui directly
+                from ui import resource_reader
+            ok, message = kobo_service.install(library, config_dir, entry['app_db'], resource_reader())
+            if not ok:
+                table = dict(PREFS.get('kobo', {}) or {})
+                saved = dict(table.get(library) or entry)
+                saved['service'] = False
+                table[library] = saved
+                PREFS['kobo'] = table
+                self._show_error(message)
+        elif was or os.path.exists(kobo_service.plist_path(kobo_service.label_for(library))):
+            ok, message = kobo_service.uninstall(library)
+            if not ok:
+                self._show_error(message)
+
+    def _show_error(self, message):
+        from calibre.gui2 import error_dialog
+        error_dialog(self, 'CalibReader Sync: background job',
+                     'Keeping the Kobo in sync with calibre closed could not be {}.\n\n{}'.format(
+                         'set up' if self.kobo_service.isChecked() else 'turned off', message), show=True)
 
     def save_settings(self):
         self.save_kobo()
