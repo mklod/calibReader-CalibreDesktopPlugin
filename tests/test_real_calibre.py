@@ -1432,7 +1432,7 @@ class RealKoboUtilitiesSettingsTests(RealCalibreBase):
         shown = []
         w._show_ku_error = shown.append
         w.save_ku()
-        self.assertTrue(shown)
+        self.assertTrue(shown and '#genre_note' in shown[0], shown)       # NIT-R1-4: which column to change
         self.assertNotIn(self.lib.path, ui.PREFS.get('kobo_ku', {}) or {})
 
 

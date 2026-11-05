@@ -906,17 +906,23 @@ class TwoNumberingsTests(unittest.TestCase):
 
 
 class KoboTouchExtendedImportTests(ImportBase):
-    '''S1: with the Kobo Touch Extended driver plugin installed, a span is approximate.'''
+    '''Re-review B1-R1 (supersedes round 1's span~): with the Kobo Touch Extended driver plugin
+    installed, a span goes to the START of its chapter, precision "chapter" (the app compares span~
+    strictly and would move readers past unread text: up to 27 % of Gatsby late, measured).'''
 
     def kepub_for(self, book_id, epub_path, kepub_path):
-        return KEPUB, None, {'kepub': 'stored KEPUB', 'uncertain': 'the Kobo Touch Extended driver plugin is installed'}
+        return KEPUB, None, {'kepub': 'stored KEPUB', 'uncertain': kobo_ku.KTE_NOTE}
 
-    def test_a_span_is_marked_approximate_and_said_once(self):
-        res = self.run_import({1: (SPAN_VALUE, 4, '2026-11-01T10:00:00Z')})
-        e = self.positions()[self.uuids[1]]
-        self.assertEqual(e['kobo']['precision'], kobo_ku.SPAN_APPROX)
-        self.assertIn('Kobo Touch Extended', e['kobo']['note'])
+    def test_a_span_goes_to_its_chapter_start_and_it_is_said_once(self):
+        res = self.run_import({1: (SPAN_VALUE, 4, '2026-11-01T10:00:00Z'),
+                               2: ('OEBPS/7446794606207039498_5200-h-1.htm.xhtml#kobo.999.1', 4,
+                                   '2026-11-01T10:00:00Z')})
+        for u in (self.uuids[1], self.uuids[2]):          # a span not in the KEPUB: its chapter too
+            e = self.positions()[u]
+            self.assertEqual((e['chapter'], e['textAnchor'], e['kobo']['precision']), (2, 0, kobo_ku.CHAPTER))
+            self.assertIn('Kobo Touch Extended', e['kobo']['note'])
         self.assertIn('Kobo Touch Extended', res.uncertain)
+        self.assertIn('start of its chapter', res.uncertain)     # NIT-R1-2: the wording says what happened
 
 
 @unittest.skipUnless(kobo_ku.calibre_kepubify() is not None, 'needs calibre\'s kepubify (calibre-debug)')
@@ -959,6 +965,64 @@ class CalibreNumberingTests(unittest.TestCase):
         finally:
             shutil.rmtree(work, ignore_errors=True)
 
+    def kte_values(self, epub_path, kte_path, every=40):
+        """(true place, location) for every `every`-th Kobo Touch Extended span of the book."""
+        epub, dev = Book(epub_path), Book(kte_path)
+        out = []
+        try:
+            n = 0
+            for ch in range(len(epub.chapters)):
+                kch = [p.lower() for p in dev.chapters].index(epub.chapters[ch].lower())
+                for sid in dev.text(kch).ids:
+                    if not re.match(r'^kobo\.\d+\.\d+$', sid):
+                        continue
+                    n += 1
+                    if n % every:
+                        continue
+                    true = kobo_ku.resolve_span(epub, dev, ch, sid)
+                    if true is not None:
+                        out.append(((ch, true[0]), epub.chapters[ch] + '#' + sid))
+        finally:
+            epub.close()
+            dev.close()
+        return out
+
+    def run_kte(self, kte):
+        """Metamorphosis on a Kobo with a Kobo Touch Extended KEPUB; the library has the EPUB only."""
+        import ku_kte_port
+        work = tempfile.mkdtemp(prefix='cr-ku-kte-')
+        try:
+            kte_path = ku_kte_port.kte_kepub(EPUB, os.path.join(work, 'kte.kepub'))
+            cache = kobo_ku.KepubCache(os.path.join(work, 'cache'))
+            kepub_for = kobo_ku.make_kepub_for(lambda b: {'EPUB'}, cache, ['kepub', 'epub'], True, kte=kte)
+            pairs = self.kte_values(EPUB, kte_path)
+            uuids = {i: '{:08d}-aaaa-bbbb-cccc-dddddddddddd'.format(i) for i in range(len(pairs))}
+            lib = os.path.join(work, 'lib')
+            os.makedirs(lib)
+            values = {i: (loc, None, '2026-11-01T10:{:02d}:{:02d}Z'.format(i // 60, i % 60)) for i, (_, loc) in enumerate(pairs)}
+            memory = {}
+            res = kobo_ku.import_ku(lib, SOURCE, values, lambda b: (uuids[b], EPUB, None), memory, kepub_for=kepub_for,
+                                    now=NOW, max_books=10 ** 6, budget=float('inf'))
+            with open(os.path.join(lib, 'CalibReader_positions.json'), encoding='utf-8') as f:
+                table = json.load(f)['positions']
+            after = sum(1 for i, (true, _) in enumerate(pairs)
+                        if uuids[i] in table and (table[uuids[i]]['chapter'], table[uuids[i]]['textAnchor']) > true)
+            return res, memory, after, len(pairs), table
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+    def test_B1R1_kobo_touch_extended_installed_never_lands_after(self):
+        res, memory, after, n, table = self.run_kte(kte=True)
+        self.assertGreater(n, 20)
+        self.assertEqual(after, 0)
+        self.assertEqual({e['kobo']['precision'] for e in table.values()}, {kobo_ku.CHAPTER})
+
+    def test_S1R1_kobo_touch_extended_numbering_is_detected_without_the_driver(self):
+        res, memory, after, n, table = self.run_kte(kte=False)
+        self.assertTrue(memory['.']['foreign'])
+        self.assertEqual(after, 0)
+        self.assertTrue(res.foreign)
+
     def test_S2_a_conversion_leaves_no_temp_folder_behind(self):
         from calibre.ptempfile import base_dir
         work = tempfile.mkdtemp(prefix='cr-ku-s2-')
@@ -982,8 +1046,8 @@ class CacheReviewTests(unittest.TestCase):
         c = self.make()
         p, _ = c.path_for(7, self.src)
         old = time.time() - 3600
-        stale_file = os.path.join(self.cache, 'abc.123.456.tmp')
-        stale_dir = os.path.join(self.cache, 'work-123-456')
+        stale_file = os.path.join(self.cache, '0123456789abcdef01234567.123.456.tmp')
+        stale_dir = os.path.join(self.cache, 'work-123-456-x7k2')
         os.makedirs(os.path.join(stale_dir, 'OEBPS'))
         for f in (stale_file, os.path.join(stale_dir, 'OEBPS', 'x.html')):
             with open(f, 'wb') as fh:
@@ -1015,6 +1079,104 @@ class SummaryNoiseTests(ImportBase):
         self.assertIn(self.uuids[1], res.skipped)
         self.assertNotIn(self.uuids[1], res.problems)
         self.assertIn(self.uuids[2], res.problems)
+
+
+class CacheOwnNamesTests(unittest.TestCase):
+    """Re-review NIT-R1-1: evict removes only the cache's own names (a CLI --cache pointed at a
+    folder that is not dedicated to it must not lose anything else)."""
+    setUp, tearDown, regenerate, make = CacheTests.setUp, CacheTests.tearDown, CacheTests.regenerate, CacheTests.make
+
+    def test_foreign_files_and_folders_survive(self):
+        c = self.make(cap=1)
+        c.path_for(7, self.src)
+        old = time.time() - 3600
+        keep_file = os.path.join(self.cache, 'notes.txt')
+        keep_dir = os.path.join(self.cache, 'photos')
+        os.makedirs(keep_dir)
+        for f in (keep_file, os.path.join(keep_dir, 'a.jpg')):
+            with open(f, 'wb') as fh:
+                fh.write(b'x')
+            os.utime(f, (old, old))
+        os.utime(keep_dir, (old, old))
+        c.evict()
+        self.assertTrue(os.path.exists(keep_file) and os.path.exists(os.path.join(keep_dir, 'a.jpg')))
+
+
+class ForeignNumberingTests(ImportBase):
+    """Re-review S1-R1: a library whose Kobo copies were numbered by another converter (Kobo Touch
+    Extended, even uninstalled): most of the Kobo's span ids are not in calibre's numbering (76 % of
+    Kobo Touch Extended's, measured; 0 of 343,676 calibre-made ones). Over at least FOREIGN_MIN
+    span values with FOREIGN_SHARE or more missing, the library is remembered as "foreign" and its
+    spans go to the start of their chapter, the earlier span entries we wrote included; with fewer
+    values, a missing span makes the run's spans coarse without remembering anything."""
+
+    PRESENT = ('OEBPS/7446794606207039498_5200-h-1.htm.xhtml#kobo.10.2', 'OEBPS/7446794606207039498_5200-h-2.htm.xhtml#kobo.5.1')
+
+    def setUp(self):
+        ImportBase.setUp(self)
+        self.uuids = {i: '{:08d}-aaaa-bbbb-cccc-dddddddddddd'.format(i) for i in range(1, 13)}
+
+    def missing(self, i):
+        return 'OEBPS/7446794606207039498_5200-h-1.htm.xhtml#kobo.9{:02d}.1'.format(i)
+
+    def entry(self, i):
+        return self.positions()[self.uuids[i]]
+
+    def test_a_calibre_numbered_library_stays_exact(self):
+        values = {i: (self.PRESENT[i % 2], None, '2026-11-01T10:00:{:02d}Z'.format(i)) for i in range(1, 7)}
+        res = self.run_import(values)
+        self.assertEqual(len(res.written), 6)
+        self.assertEqual({self.entry(i)['kobo']['precision'] for i in range(1, 7)}, {kobo_ku.SPAN})
+        self.assertFalse(res.foreign)
+        self.assertFalse(self.memory['.'].get('foreign'))
+
+    def test_mostly_missing_span_ids_mark_the_library_foreign(self):
+        values = {i: (self.missing(i), None, '2026-11-01T10:00:{:02d}Z'.format(i)) for i in range(1, 5)}
+        values.update({i: (self.PRESENT[i % 2], None, '2026-11-01T10:00:{:02d}Z'.format(i)) for i in (5, 6)})
+        res = self.run_import(values)
+        self.assertTrue(self.memory['.']['foreign'])
+        self.assertIn('another', res.foreign)
+        self.assertEqual(len(res.written), 6)              # the missing ones too: their chapter is right
+        for i in range(1, 7):
+            e = self.entry(i)
+            self.assertEqual((e['textAnchor'], e['kobo']['precision']), (0, kobo_ku.CHAPTER), i)
+        # sticky: a later span value of this library is coarse too, and said again
+        res = self.run_import({9: (self.PRESENT[0], None, '2026-11-02T10:00:00Z')})
+        self.assertEqual(self.entry(9)['kobo']['precision'], kobo_ku.CHAPTER)
+        self.assertTrue(res.foreign)
+
+    def test_few_values_with_a_missing_span_are_coarse_but_not_remembered(self):
+        res = self.run_import({1: (self.missing(1), None, '2026-11-01T10:00:01Z'),
+                               2: (self.PRESENT[0], None, '2026-11-01T10:00:02Z')})
+        self.assertEqual(self.entry(2)['kobo']['precision'], kobo_ku.CHAPTER)
+        self.assertFalse(self.memory['.'].get('foreign'))
+        self.assertTrue(res.foreign)
+
+    def test_once_foreign_our_earlier_span_entries_go_back_to_their_chapter_start(self):
+        self.run_import({1: (self.PRESENT[0], None, '2026-11-01T10:00:01Z')})
+        self.assertEqual(self.entry(1)['kobo']['precision'], kobo_ku.SPAN)   # one value, nothing missing yet
+        values = {1: (self.PRESENT[0], None, '2026-11-01T10:00:01Z')}
+        values.update({i: (self.missing(i), None, '2026-11-01T10:00:{:02d}Z'.format(i)) for i in range(2, 6)})
+        values[6] = (self.PRESENT[1], None, '2026-11-01T10:00:06Z')
+        res = self.run_import(values)
+        self.assertTrue(self.memory['.']['foreign'])
+        e = self.entry(1)
+        self.assertEqual((e['textAnchor'], e['kobo']['precision'], e['updated_at']),
+                         (0, kobo_ku.CHAPTER, '2026-11-01T10:00:01.000Z'))
+        self.assertIn(self.uuids[1], res.written)
+
+    def test_an_app_place_after_our_entry_is_not_touched_by_the_correction(self):
+        self.run_import({1: (self.PRESENT[0], None, '2026-11-01T10:00:01Z')})
+        app = {'chapter': 4, 'textAnchor': 5, 'progress': 0.6, 'page': 0, 'scrollY': 0,
+               'updated_at': '2026-11-03T10:00:00.000Z', 'deviceId': 'phone-1'}
+        data = json.load(open(self.path, encoding='utf-8'))
+        data['positions'][self.uuids[1]] = app
+        with open(self.path, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+        values = {1: (self.PRESENT[0], None, '2026-11-01T10:00:01Z')}
+        values.update({i: (self.missing(i), None, '2026-11-01T10:00:{:02d}Z'.format(i)) for i in range(2, 7)})
+        self.run_import(values)
+        self.assertEqual(self.entry(1), app)
 
 
 if __name__ == '__main__':
