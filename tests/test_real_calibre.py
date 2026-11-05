@@ -25,7 +25,10 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from unittest import mock
 
 TESTS = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(TESTS)
@@ -165,9 +168,11 @@ class RealCalibreBase(unittest.TestCase):
     def v(self, column, book_id):
         return self.lib.api.field_for(column, book_id)
 
-    def run_ui(self, approve=None):
-        '''The main sync path: ui.CalibReaderSyncAction._run, as the button and the
-        automatic sync call it, with the plugin's real JSONConfig.'''
+    def action(self):
+        '''A stand-in for the toolbar action: the plugin's own methods on a plain object
+        (kept for the whole test: the Kobo push memory, worker and back-off live on it).'''
+        if getattr(self, '_action', None) is not None:
+            return self._action
         import ui
 
         class Model(object):
@@ -180,10 +185,17 @@ class RealCalibreBase(unittest.TestCase):
             def model(self):
                 return Model()
 
+        class StatusBar(object):
+            messages = []
+
+            def show_message(self, text, ms=0):
+                StatusBar.messages.append(text)
+
         class Gui(object):
             library_path = self.lib.path
             library_view = View()
             current_db = self.lib.legacy
+            status_bar = StatusBar()
 
         class Kick(object):
             starts = 0
@@ -194,13 +206,40 @@ class RealCalibreBase(unittest.TestCase):
         class Action(object):
             gui = Gui()
             _kick = Kick()
-            _run_kobo = ui.CalibReaderSyncAction._run_kobo     # the real Kobo step (1.5.0)
+        for name, member in vars(ui.CalibReaderSyncAction).items():
+            if callable(member) and name.startswith('_') and not name.startswith('__'):
+                setattr(Action, name, member)               # the real Kobo step and its helpers
         self.kicks = Kick
+        self.status_messages = StatusBar.messages
+        self._action = Action()
+        return self._action
+
+    def run_ui(self, approve=None, manual=False):
+        '''The main sync path: ui.CalibReaderSyncAction._run, as the button and the
+        automatic sync call it, with the plugin's real JSONConfig.'''
+        import ui
         from sync_core import SETTINGS_KEY, normalise_settings
         settings = normalise_settings(self.lib.api.pref(SETTINGS_KEY, None))
-        if approve is None:
-            return ui.CalibReaderSyncAction._run(Action(), self.lib.api, settings)
-        return ui.CalibReaderSyncAction._run(Action(), self.lib.api, settings, approve=approve)
+        kwargs = {}
+        if approve is not None:
+            kwargs['approve'] = approve
+        if manual:
+            kwargs['manual'] = True
+        return ui.CalibReaderSyncAction._run(self.action(), self.lib.api, settings, **kwargs)
+
+    def wait_push(self, timeout=20):
+        '''1.5.0 round 1 (S4): the Kobo push runs on a worker thread and reports back on the
+        GUI thread. Process Qt events until it has (or there was none).'''
+        app = qt_app()
+        action = self.action()
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            app.processEvents()
+            if not getattr(action, '_push_pending', False):
+                break
+            time.sleep(0.02)
+        app.processEvents()
+        return getattr(action, '_last_push', None)
 
 
 @unittest.skipUnless(HAVE_CALIBRE, 'needs calibre (run tests/run_calibre.sh)')
@@ -247,6 +286,8 @@ class RealKoboRunTests(RealCalibreBase):
             pass
         RealCalibreBase.tearDown(self)
 
+    SINCE = '2026-10-01T00:00:00.000Z'                       # the box ticked before the app's place
+
     def set_kobo(self, **extra):
         import ui
         entry = {'app_db': self.app_db, 'user': 'admin', 'cw_url': self.cw.url}
@@ -256,37 +297,86 @@ class RealKoboRunTests(RealCalibreBase):
     def test_nothing_is_sent_until_the_box_is_ticked(self):
         self.set_kobo()                                     # Settings saved, box never ticked
         res = self.run_ui()
+        self.wait_push()
         self.assertEqual((self.cw.requests, res.kobo_pushed), ([], 0))
         self.set_kobo(push=False)
-        self.run_ui()
+        res = self.run_ui()                                  # N9: the second run's own result
+        self.wait_push()
         self.assertEqual(self.cw.requests, [])
         self.assertFalse([n for n in res.notes if 'Kobo' in n], res.notes)
+        self.assertIsNone(getattr(self.action(), '_last_push', None))
 
     def test_ticked_it_sends_the_span_once_and_the_import_skips_the_echo(self):
         import ui
-        self.set_kobo(push=True)
+        self.set_kobo(push=True, push_since=self.SINCE)
         res = self.run_ui()
-        self.assertEqual(res.kobo_pushed, 1, res.notes)
+        self.assertTrue(res.kobo_push_started, res.notes)
+        pres = self.wait_push()
+        self.assertEqual(len(pres.sent), 1, pres.notes)
         (_, path, body, user, _), = self.cw.requests
-        self.assertNotIn(self.tkp.TOKEN, ' '.join(res.notes + res.kobo_push_lines))
+        self.assertNotIn(self.tkp.TOKEN, ' '.join(pres.notes + pres.lines + self.status_messages))
         loc = body['ReadingStates'][0]['CurrentBookmark']['Location']
         self.assertEqual((loc['Type'], loc['Source']), ('KoboSpan', self.tkp.CH.format(2)))
-        self.assertTrue(any('sentence' in line for line in res.kobo_push_lines), res.kobo_push_lines)
-        self.assertIn('sent to the Kobo', res.status_line())
+        self.assertTrue(any('sentence' in line for line in pres.lines), pres.lines)
+        self.assertTrue(any('sent to the Kobo' in m for m in self.status_messages), self.status_messages)
         memory = ui.PREFS['kobo_pushed'][self.lib.path]
         self.assertEqual(memory[self.uuid.lower()]['value'], loc['Value'])
         before = open(os.path.join(self.lib.path, 'CalibReader_positions.json'), 'rb').read()
         res = self.run_ui()                                  # Calibre-Web stamped our push: newer than the app's
-        self.assertEqual((res.kobo_imported, res.kobo_pushed, len(self.cw.requests)), (0, 0, 1), res.notes)
+        pres = self.wait_push()
+        self.assertEqual((res.kobo_imported, pres.sent, len(self.cw.requests)), (0, [], 1), res.notes)
         self.assertEqual(open(os.path.join(self.lib.path, 'CalibReader_positions.json'), 'rb').read(), before)
 
     def test_calibre_web_down_is_one_note_and_no_follow_up_run(self):
-        self.set_kobo(push=True, cw_url=self.tkp.closed_port())
-        res = self.run_ui()
-        self.assertEqual(res.kobo_pushed, 0)
-        self.assertEqual(len([n for n in res.notes if 'did not answer' in n]), 1, res.notes)
+        self.set_kobo(push=True, push_since=self.SINCE, cw_url=self.tkp.closed_port())
+        self.run_ui()
+        pres = self.wait_push()
+        self.assertEqual(pres.sent, [])
+        self.assertEqual(len([n for n in pres.notes if 'did not answer' in n]), 1, pres.notes)
         self.assertEqual(self.kicks.starts, 0)
-        self.assertIn('needs attention', res.status_line())
+        self.assertTrue(any('did not answer' in m for m in self.status_messages), self.status_messages)
+
+    def test_S4_the_push_never_blocks_the_gui_thread(self):
+        import kobo_push
+        self.set_kobo(push=True, push_since=self.SINCE)
+        gate = threading.Event()
+        real = kobo_push._send
+
+        def held(*a, **kw):
+            gate.wait(10)
+            return real(*a, **kw)
+        with mock.patch('kobo_push._send', side_effect=held):
+            t = time.monotonic()
+            res = self.run_ui()
+            self.assertLess(time.monotonic() - t, 2.0)        # the run returned while the PUT is held
+            self.assertTrue(res.kobo_push_started)
+            self.assertEqual(self.cw.requests, [])
+            gate.set()
+            pres = self.wait_push()
+        self.assertEqual(len(pres.sent), 1, pres.notes)
+
+    def test_S4_after_a_network_failure_automatic_runs_wait_the_button_does_not(self):
+        import kobo_push
+        self.set_kobo(push=True, push_since=self.SINCE, cw_url=self.tkp.closed_port())
+        with mock.patch('kobo_push._send', wraps=kobo_push._send) as send:
+            self.run_ui()
+            self.wait_push()
+            self.assertEqual(send.call_count, 1)
+            self.run_ui()                                    # automatic: in the back-off, nothing tried
+            self.wait_push()
+            self.assertEqual(send.call_count, 1)
+            self.run_ui(manual=True)                          # the button always tries
+            self.wait_push()
+            self.assertEqual(send.call_count, 2)
+
+    def test_B3_the_first_run_after_ticking_sends_no_old_place(self):
+        import ui
+        self.set_kobo(push=True)                              # ticked, no start time stored yet
+        self.run_ui()
+        pres = self.wait_push()
+        self.assertEqual(self.cw.requests, [])
+        self.assertIn('push_since', ui.PREFS['kobo'][self.lib.path])
+        self.assertTrue(pres is None or not pres.sent)
 
 
 class RealSyncPathTests(RealCalibreBase):
@@ -628,12 +718,32 @@ class RealSettingsDialogTests(RealCalibreBase):
             entry = PREFS['kobo'][self.lib.path]
             self.assertIs(entry['push'], False)
             self.assertFalse(kobo_push.push_enabled(entry))
+            self.assertNotIn('push_since', entry)
             self.assertEqual(kobo_push.calibre_web_url(entry), 'http://127.0.0.1:8083')
             w = self.widget()
             w.kobo_push.setChecked(True)
             w.save_kobo()
-            self.assertTrue(kobo_push.push_enabled(PREFS['kobo'][self.lib.path]))
+            entry = PREFS['kobo'][self.lib.path]
+            self.assertTrue(kobo_push.push_enabled(entry))
+            ticked = entry['push_since']                            # B3: when sending was turned on
+            t = datetime.datetime.strptime(ticked[:19], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=UTC)
+            self.assertLess(abs((datetime.datetime.now(UTC) - t).total_seconds()), 120)
             self.assertTrue(self.widget().kobo_push.isChecked())     # reopened: still on
+            self.widget().save_kobo()                               # OK again: the start time stays
+            self.assertEqual(PREFS['kobo'][self.lib.path]['push_since'], ticked)
+            w = self.widget()
+            w.kobo_push.setChecked(False)
+            w.save_kobo()
+            self.assertNotIn('push_since', PREFS['kobo'][self.lib.path])   # unticking clears it
+            # N7: a pasted Kobo sync link is cut to the address (its token never stored)
+            w = self.widget()
+            w.kobo_url.setText('http://mini.local:8083/kobo/' + 'ab' * 16)
+            w.save_kobo()
+            self.assertEqual(PREFS['kobo'][self.lib.path]['cw_url'], 'http://mini.local:8083')
+            # N8: without a KEPUB the Kobo gets the percentages only
+            from qt.core import QLabel
+            text = ' '.join(label.text() for label in self.widget().findChildren(QLabel))
+            self.assertIn('percentages only', text)
         finally:
             PREFS['kobo'] = {}
 

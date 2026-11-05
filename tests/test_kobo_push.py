@@ -25,8 +25,10 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
@@ -83,6 +85,7 @@ class FakeCalibreWeb(object):
         self.books = dict(books)            # uuid -> calibre book id (the books Calibre-Web has)
         self.store = store
         self.status = status                # force an HTTP status (500, …)
+        self.delay = 0                      # seconds before answering (a slow server)
         self.requests = []                  # (method, path, json body, user id)
         fake = self
 
@@ -108,6 +111,8 @@ class FakeCalibreWeb(object):
                 except ValueError:
                     body = None
                 fake.requests.append(('PUT', self.path, body, user, self.headers.get('Content-Type')))
+                if fake.delay:
+                    time.sleep(fake.delay)
                 if fake.status:
                     return self._reply(fake.status, {'error': 'forced'})
                 if user is None:
@@ -202,7 +207,12 @@ class PushBase(unittest.TestCase):
         con.execute('INSERT INTO settings VALUES (1, ?)', (self.lib,))     # Calibre-Web serves THIS library
         con.commit()
         con.close()
-        self.books = {60: (UUID, EPUB, KEPUB), 61: (NOKEPUB, EPUB, None), 62: (THIRD, EPUB, KEPUB)}
+        # Book 61 has no KEPUB: its EPUB sits in a folder of its own (round 1, S2: a KEPUB
+        # beside the EPUB is found even when calibre does not list it).
+        plain = os.path.join(self.dir, 'plain', 'metamorphosis.epub')
+        os.makedirs(os.path.dirname(plain))
+        shutil.copy(EPUB, plain)
+        self.books = {60: (UUID, EPUB, KEPUB), 61: (NOKEPUB, plain, None), 62: (THIRD, EPUB, KEPUB)}
         self.cw = FakeCalibreWeb(self.app_db, {UUID: 60, NOKEPUB: 61, THIRD: 62})
         self.memory = {}
 
@@ -731,6 +741,354 @@ class EchoGuardTests(PushBase):
         con.commit(); con.close()
         kres, _ = self.sync(push=False)
         self.assertEqual(kres.written, [NOKEPUB])
+
+
+
+# -- review round 1 (REVIEW-STEP2.md) -------------------------------------------------------
+
+SINCE = '2026-10-01T00:00:00.000Z'      # sending turned on before every app stamp of these tests
+
+
+def pspan(sid):
+    return tuple(int(x) for x in sid.split('.')[1:])
+
+
+def edited_epub(folder):
+    '''The library's EPUB no longer matches the KEPUB Calibre-Web served (edited after kepubify
+    ran: curly quotes straightened in Part II), so many of the Kobo's spans resolve only as
+    span~ (REVIEW-STEP2 B2, probe_span_backward).'''
+    path = os.path.join(folder, 'edited', 'metamorphosis.epub')
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with zipfile.ZipFile(EPUB) as zin, zipfile.ZipFile(path, 'w') as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename == CH.format(2):
+                s = data.decode('utf-8')
+                s = s.replace('’', "'").replace('‘', "'").replace('“', '"').replace('”', '"')
+                data = s.encode('utf-8')
+            zout.writestr(item, data)
+    return path
+
+
+class ReviewB1Tests(PushBase):
+    '''B1: what is SENT must be ahead in the Kobo's own terms: a push the Kobo gets as % only
+    must carry a % strictly above the Kobo's own (plus a margin).'''
+
+    def test_B1_a_chapter_percent_push_below_the_kobos_own_percent_is_not_sent(self):
+        # probe_percent_backward A1: the Kobo (plain EPUB) at 47 % of the book, 50 % of Part II;
+        # the app at 60 % of Part II's text: ahead by the plugin's measure, but 45.66 % is sent.
+        self.kobo(61, '2026-10-30 21:03:48', CH.format(2), '', '', 47.0, 50.0)
+        self.app(NOKEPUB, 3, int(40209 * 0.60))
+        res = self.push(since=SINCE)
+        self.assertEqual((res.sent, self.puts()), ([], []))
+        self.assertIn('Kobo\'s own %', res.skipped[NOKEPUB])
+
+    def test_B1_a_percent_only_kobo_is_compared_with_the_percent_sent(self):
+        # A2: Kobo at 40 % only; the app's own progress says 41 %, the text fraction sent is 39.5 %.
+        self.kobo(60, '2026-10-30 21:03:48', None, None, None, 40.0, None)
+        self.app(UUID, 3, int(0.395 * 138516) - 39125, progress=0.41)
+        res = self.push(since=SINCE)
+        self.assertEqual((res.sent, self.puts()), ([], []))
+
+    def test_B1_a_percent_push_must_clear_the_margin(self):
+        self.kobo(60, '2026-10-30 21:03:48', None, None, None, 40.0, None)
+        self.app(UUID, 3, int(0.403 * 138516) - 39125, progress=0.5)            # 40.3 %: inside the margin
+        self.assertEqual(self.push(since=SINCE).sent, [])
+        self.app(UUID, 3, int(0.45 * 138516) - 39125, progress=0.5, stamp='2026-10-31T10:05:00.000Z')
+        res = self.push(since=SINCE)
+        self.assertEqual(res.sent, [UUID])
+        bm = self.puts()[0][2]['ReadingStates'][0]['CurrentBookmark']
+        self.assertGreater(bm['ProgressPercent'], 40.5)
+
+
+class ReviewB2Tests(PushBase):
+    '''B2 (and N1): a span push is ahead only when its kobo.P.S comes after the Kobo's own span
+    (same file) or its file comes later in the spine; never the Kobo's own span again.'''
+
+    def test_B2_never_a_span_before_the_kobos_own_span(self):
+        edited = edited_epub(self.dir)
+        self.books[60] = (UUID, edited, KEPUB)
+        e, k = kobo_position.Book(edited), kobo_position.Book(KEPUB)
+        try:
+            approx = []
+            for sid in [s for s in k.text(3).ids if kobo_position._SPAN_ID.match(s)]:
+                row = {'location_type': 'KoboSpan', 'location_value': sid, 'location_source': CH.format(2),
+                       'progress_percent': 30.0, 'content_source_progress_percent': 10.0}
+                place = kobo_position.map_bookmark(e, row, k)
+                if place is not None and place['precision'] == kobo_position.SPAN_APPROX:
+                    approx.append((sid, place['textAnchor']))
+        finally:
+            e.close()
+            k.close()
+        self.assertGreater(len(approx), 20)
+        self.cw.store = False                    # the Kobo row is set by the test each time
+        self.kobo(60, '2026-10-30 21:03:48', CH.format(2), 'KoboSpan', approx[0][0], 30.0, 10.0)
+        backwards = []
+        for i, (sid, anchor) in enumerate(approx):
+            con = sqlite3.connect(self.app_db)
+            con.execute("UPDATE kobo_bookmark SET location_value=?, last_modified='2026-10-30 21:03:48'", (sid,))
+            con.commit(); con.close()
+            kobo_push.forget_failures()
+            self.memory.clear()
+            self.app(UUID, 3, anchor + 1, stamp='2026-10-31T10:{:02d}:{:02d}.000Z'.format(i // 60, i % 60))
+            before = len(self.puts())
+            self.push(since=SINCE)
+            for put in self.puts()[before:]:
+                sent = put[2]['ReadingStates'][0]['CurrentBookmark']['Location']['Value']
+                if sent and pspan(sent) <= pspan(sid):
+                    backwards.append((sid, sent))
+        self.assertEqual(backwards, [])
+
+    def test_B2_the_worst_probe_case_sends_nothing(self):
+        # probe_span_backward: Kobo at kobo.19.2 (span~), the app 1 character past the plugin's
+        # estimate of it -> kobo.18.6 was sent, 591 characters back.
+        edited = edited_epub(self.dir)
+        self.books[60] = (UUID, edited, KEPUB)
+        e, k = kobo_position.Book(edited), kobo_position.Book(KEPUB)
+        try:
+            row = {'location_type': 'KoboSpan', 'location_value': 'kobo.19.2', 'location_source': CH.format(2),
+                   'progress_percent': 30.0, 'content_source_progress_percent': 10.0}
+            anchor = kobo_position.map_bookmark(e, row, k)['textAnchor']
+        finally:
+            e.close()
+            k.close()
+        self.kobo(60, '2026-10-30 21:03:48', CH.format(2), 'KoboSpan', 'kobo.19.2', 30.0, 10.0)
+        self.app(UUID, 3, anchor + 1)
+        res = self.push(since=SINCE)
+        self.assertEqual((res.sent, self.puts()), ([], []))
+
+    def test_N1_the_kobos_own_span_is_not_sent_again(self):
+        self.kobo(60, '2026-10-30 21:03:48', CH.format(2), 'KoboSpan', 'kobo.5.1', 30.0, 7.0)
+        self.app(UUID, 3, self.anchor_of(3, 'kobo.5.1', plus=7))     # a few characters into the Kobo's sentence
+        res = self.push(since=SINCE)
+        self.assertEqual((res.sent, self.puts()), ([], []))
+
+    def test_a_span_push_never_carries_a_lower_percent_than_the_kobos_own(self):
+        # Ruling (round 1): two signals must not disagree. kobo.5.1 -> kobo.30.1 is forward,
+        # but its text fraction (~48 %) is below the Kobo's own 60 %: the Kobo's % is kept.
+        self.kobo(60, '2026-10-30 21:03:48', CH.format(2), 'KoboSpan', 'kobo.5.1', 60.0, 7.0)
+        self.app(UUID, 3, self.anchor_of(3, 'kobo.30.1', plus=3))
+        res = self.push(since=SINCE)
+        self.assertEqual(res.sent, [UUID])
+        bm = self.puts()[0][2]['ReadingStates'][0]['CurrentBookmark']
+        self.assertEqual(bm['Location']['Value'], 'kobo.30.1')
+        self.assertGreaterEqual(bm['ProgressPercent'], 60.0)
+
+
+class ReviewB3Tests(PushBase):
+    '''B3: only places read after sending was turned on are sent; an empty Kobo bookmark is not
+    proof the Kobo has not read the book offline.'''
+
+    def test_B3_old_app_places_are_not_sent_after_ticking(self):
+        for bid, uuid in ((60, UUID), (61, NOKEPUB), (62, THIRD)):
+            self.kobo(bid, '2026-11-04 21:00:00')                          # synced yesterday, bookmark empty
+            self.app(uuid, 3, 500, stamp='2025-03-01T10:00:00.000Z')       # read in the app long ago
+        res = self.push(since='2026-11-05T08:00:00.000Z')
+        self.assertEqual((res.sent, self.puts()), ([], []))
+        self.assertTrue(all('before sending' in res.skipped[u] for u in (UUID, NOKEPUB, THIRD)), res.skipped)
+        # reading on after the box was ticked: that one is sent
+        self.app(UUID, 3, 900, stamp='2026-11-05T08:00:01.000Z')
+        self.assertEqual(self.push(since='2026-11-05T08:00:00.000Z').sent, [UUID])
+
+    def test_B3_no_start_time_sends_nothing(self):
+        self.kobo(60, '2026-10-30 21:03:48')
+        self.app(UUID, 3, 500)
+        res = self.push(since=None)
+        self.assertEqual((res.sent, self.puts()), ([], []))
+
+    def test_B3_the_cli_starts_sending_at_its_first_push_run(self):
+        self.metadata_db()
+        self.kobo(60, '2026-10-30 21:03:48')
+        self.app(UUID, 3, 500)                                             # read before the first --push
+        state = os.path.join(self.dir, 'state.json')
+        args = ['--library', self.lib, '--app-db', self.app_db, '--user', 'admin', '--push',
+                '--calibre-web', self.cw.url, '--state', state]
+        with contextlib.redirect_stdout(io.StringIO()):
+            kobo_import.main(args)
+        self.assertEqual(self.puts(), [])
+        with open(state, encoding='utf-8') as f:
+            since = json.load(f)[os.path.realpath(self.lib)]['push_since']
+        self.app(UUID, 3, 900, stamp=iso_in(1))                            # read after it
+        with contextlib.redirect_stdout(io.StringIO()):
+            kobo_import.main(args)
+        self.assertEqual(len(self.puts()), 1)
+        with open(state, encoding='utf-8') as f:
+            self.assertEqual(json.load(f)[os.path.realpath(self.lib)]['push_since'], since)
+
+
+class ReviewS1Tests(PushBase):
+    '''S1: our push reported back by the Kobo in its own terms is still our echo.'''
+
+    def pushed_span(self):
+        self.kobo(60, '2026-10-30 21:03:48', CH.format(1), 'KoboSpan', 'kobo.3.5', 12.0, 3.0)
+        self.app_anchor = self.anchor_of(3, 'kobo.5.1', plus=7)
+        self.app(UUID, 3, self.app_anchor)
+        kres, pres = self.sync(since=SINCE)
+        self.assertEqual(pres.sent, [UUID])
+
+    def assert_no_kobo_entry(self):
+        before = open(self.positions_path, 'rb').read()
+        kres, _ = self.sync(push=False)
+        self.assertEqual(kres.written, [])
+        self.assertEqual(open(self.positions_path, 'rb').read(), before)
+
+    def test_S1_the_kobo_reports_the_top_of_its_page(self):
+        self.pushed_span()
+        self.kobo_moves(60, 'KoboSpan', 'kobo.4.7', CH.format(2), 34.0, 7.0)     # the sentence before ours
+        self.assert_no_kobo_entry()
+
+    def test_S1_the_kobo_spells_source_its_own_way(self):
+        self.pushed_span()
+        self.kobo_moves(60, 'KoboSpan', 'kobo.5.1', '/' + CH.format(2), 34.0, 7.0)
+        self.assert_no_kobo_entry()
+
+    def test_S1_a_percent_push_landing_slightly_ahead_is_ours(self):
+        self.kobo(61, '2026-10-30 21:03:48')
+        self.app(NOKEPUB, 3, 20000)
+        _, pres = self.sync(since=SINCE)
+        self.assertEqual(pres.sent, [NOKEPUB])
+        sent = self.memory[NOKEPUB]['progressPercent']
+        # the Kobo lands by its own measure a little further on and reports its own place
+        self.kobo_moves(61, '', '', CH.format(2), sent + 1.0, 55.0)
+        self.assert_no_kobo_entry()
+
+    def test_S1_a_real_move_outside_the_window_is_imported(self):
+        self.pushed_span()
+        self.kobo_moves(60, 'KoboSpan', 'kobo.3.1', CH.format(1), 10.0, 2.0)     # back in Part I: a real move
+        kres, _ = self.sync(push=False)
+        self.assertEqual(kres.written, [UUID])
+
+
+class ReviewS2Tests(PushBase):
+    '''S2: a KEPUB Calibre-Web added while calibre was open (calibre's lookup does not list it).'''
+
+    def setUp(self):
+        PushBase.setUp(self)
+        folder = os.path.join(self.dir, 'book60')
+        os.makedirs(folder)
+        shutil.copy(EPUB, os.path.join(folder, 'Kafka - The Metamorphosis.epub'))
+        shutil.copy(KEPUB, os.path.join(folder, 'Kafka - The Metamorphosis.kepub'))
+        self.books[60] = (UUID, os.path.join(folder, 'Kafka - The Metamorphosis.epub'), None)   # not listed
+
+    def test_S2_the_kepub_beside_the_epub_gives_a_span_push(self):
+        self.kobo(60, '2026-10-30 21:03:48', CH.format(1), 'KoboSpan', 'kobo.3.5', 12.0, 3.0)
+        self.app(UUID, 3, self.anchor_of(3, 'kobo.5.1', plus=7))
+        _, pres = self.sync(since=SINCE)
+        self.assertEqual(pres.precisions.get(UUID), kobo_position.SPAN, pres.skipped)
+
+    def test_S2_the_import_uses_it_too(self):
+        self.kobo(60, '2026-10-30 21:03:48', CH.format(1), 'KoboSpan', 'kobo.3.5', 12.0, 3.0)
+        kres, _ = self.sync(push=False)
+        self.assertEqual(self.read_positions()['positions'][UUID]['kobo']['precision'], kobo_position.SPAN)
+
+    def test_S2_a_kobo_span_with_no_kepub_anywhere_is_not_answered_by_percent(self):
+        os.remove(os.path.join(self.dir, 'book60', 'Kafka - The Metamorphosis.kepub'))
+        self.kobo(60, '2026-10-30 21:03:48', CH.format(1), 'KoboSpan', 'kobo.3.5', 12.0, 3.0)
+        self.app(UUID, 4, 100)
+        res = self.push(since=SINCE)
+        self.assertEqual((res.sent, self.puts()), ([], []))
+        self.assertIn('KEPUB', res.skipped[UUID])
+
+
+class ReviewS3Tests(PushBase):
+
+    def test_S3_a_kobo_sync_during_the_run_is_not_overwritten(self):
+        # probe_race: the Kobo syncs Part III while the run maps; the run must not PUT Part II.
+        self.kobo(60, '2026-10-30 21:03:48', CH.format(1), 'KoboSpan', 'kobo.3.5', 12.0, 3.0)
+        self.app(UUID, 3, self.anchor_of(3, 'kobo.5.1', plus=7))
+        real = kobo_push.kobo_location
+
+        def kobo_syncs_meanwhile(*a, **kw):
+            self.kobo_moves(60, 'KoboSpan', 'kobo.7.4', CH.format(3), 70.0, 12.0)
+            return real(*a, **kw)
+        with mock.patch('kobo_push.kobo_location', side_effect=kobo_syncs_meanwhile):
+            res = self.push(since=SINCE)
+        self.assertEqual((res.sent, self.puts()), ([], []))
+        self.assertEqual(self.kobo_row(60)[1], 'kobo.7.4')
+        self.assertIn('synced', res.skipped[UUID])
+
+
+class ReviewS4Tests(PushBase):
+    '''S4: the run's sending has a wall-clock budget that covers name lookup too.'''
+
+    def test_S4_a_hanging_name_lookup_is_cut_by_the_budget(self):
+        self.kobo(60, '2026-10-30 21:03:48')
+        self.app(UUID, 3, 500)
+        real = socket.getaddrinfo
+
+        def slow(host, *a, **kw):
+            if host == 'slow-name.invalid':
+                time.sleep(4)
+            return real(host, *a, **kw)
+        t = time.monotonic()
+        with mock.patch('socket.getaddrinfo', side_effect=slow):
+            res = self.push(url='http://slow-name.invalid:8083', since=SINCE, budget=1.0, timeout=1.0)
+        self.assertLess(time.monotonic() - t, 2.5)
+        self.assertEqual((res.sent, res.more), ([], False))
+        self.assertEqual(len([n for n in res.notes if 'slow-name.invalid' in n]), 1, res.notes)
+
+    def test_S4_a_slow_server_leaves_the_rest_for_the_next_run(self):
+        self.cw.delay = 0.6
+        for bid, uuid in ((60, UUID), (61, NOKEPUB), (62, THIRD)):
+            self.kobo(bid, '2026-10-30 21:03:48')
+            self.app(uuid, 3, 500)
+        res = self.push(since=SINCE, budget=1.0)
+        self.assertEqual((len(res.sent), res.more, res.notes), (2, True, []))
+        res = self.push(since=SINCE, budget=1.0)
+        self.assertEqual((len(res.sent), res.more), (1, False))
+
+
+class ReviewS5Tests(PushBase):
+
+    def test_S5_no_token_maps_nothing_and_never_asks_for_more(self):
+        # probe_no_token_loop: 30 books to send, the token deleted in Calibre-Web.
+        con = sqlite3.connect(self.app_db)
+        con.execute('DELETE FROM remote_auth_token')
+        con.commit(); con.close()
+        for i in range(30):
+            bid = 500 + i
+            uuid = '55555555-0000-0000-0000-%012d' % bid
+            self.books[bid] = (uuid, EPUB, KEPUB)
+            self.kobo(bid, '2026-10-30 21:03:48')
+            self.app(uuid, 3, 500)
+        for run in (1, 2):
+            with mock.patch('kobo_push.Book', wraps=kobo_position.Book) as m:
+                res = self.push(since=SINCE)
+            self.assertEqual((m.call_count, res.more), (0, False), run)
+            self.assertEqual(len([n for n in res.notes if 'token' in n.lower()]), 1, res.notes)
+
+
+class ReviewNitTests(PushBase):
+
+    def test_N2_a_book_finished_on_the_kobo_with_an_empty_bookmark_is_not_sent(self):
+        con = sqlite3.connect(self.app_db)
+        con.execute('CREATE TABLE IF NOT EXISTS book_read_link (id INTEGER PRIMARY KEY, book_id INTEGER, '
+                    'user_id INTEGER, read_status INTEGER)')
+        con.execute('INSERT INTO book_read_link (book_id, user_id, read_status) VALUES (60, 1, 1)')
+        con.commit(); con.close()
+        self.kobo(60, '2026-10-30 21:03:48')
+        self.app(UUID, 3, 500)
+        res = self.push(since=SINCE)
+        self.assertEqual((res.sent, self.puts()), ([], []))
+        self.assertIn('Finished', res.skipped[UUID])
+
+    def test_N4_a_kepub_book_pushed_by_percent_does_not_say_no_kepub(self):
+        self.kobo(60, '2026-10-30 21:03:48')
+        self.app(UUID, 0, 3)                                               # the cover wrapper: no span there
+        res = self.push(since=SINCE)
+        self.assertEqual(res.precisions.get(UUID), kobo_position.CHAPTER_PERCENT)
+        self.assertFalse([line for line in res.lines if 'no KEPUB' in line], res.lines)
+
+    def test_N7_a_pasted_kobo_sync_link_is_cut_to_the_address(self):
+        self.assertEqual(kobo_push.calibre_web_url({'cw_url': 'http://mini.local:8083/kobo/' + 'ab' * 16}),
+                         'http://mini.local:8083')
+        self.kobo(60, '2026-10-30 21:03:48')
+        self.app(UUID, 3, 500)
+        res = self.push(url=self.cw.url + '/kobo/' + TOKEN2, since=SINCE)
+        self.assertEqual(res.sent, [UUID])
+        self.assertTrue(self.puts()[0][1].startswith('/kobo/{}/v1/'.format(TOKEN)))
+        self.assertTrue(any('/kobo/' in n for n in res.notes), res.notes)
+        self.assertNotIn(TOKEN2, ' '.join(res.notes))
 
 
 if __name__ == '__main__':
