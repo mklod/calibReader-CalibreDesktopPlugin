@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0413
+# Last modified: 2026-11-05--0425
 #
 # Step 2, CalibReader -> Kobo (kobo_push): the app's place in
 # CalibReader_positions.json is PUT to Calibre-Web's Kobo API, forward-only,
@@ -449,6 +449,7 @@ class ForwardOnlyTests(PushBase):
         for i in range(30):
             bid = 300 + i
             self.books[bid] = ('44444444-0000-0000-0000-%012d' % bid, EPUB, KEPUB)
+            self.cw.books['44444444-0000-0000-0000-%012d' % bid] = bid
             self.kobo(bid, '2026-10-30 21:03:48', CH.format(2), 'KoboSpan', 'kobo.5.1', 40.0, 3.0)
             self.app('44444444-0000-0000-0000-%012d' % bid, 2, 641)
         with mock.patch('kobo_push.map_bookmark', wraps=kobo_position.map_bookmark) as m:

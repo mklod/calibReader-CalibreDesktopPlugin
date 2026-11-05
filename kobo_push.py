@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0413
+# Last modified: 2026-11-05--0425
 #
 # kobo_push.py — CalibReader's reading place to the Kobo, through Calibre-Web
 # (step 2 of the Kobo sync, plugin 1.5.0, tester preview).
@@ -101,10 +101,17 @@ class KoboPushResult(object):
 # a malformed body), per calibre session: (library, app.db, uuid) -> the app
 # entry's stamp. Not tried again until the app's place changes (N1).
 _FAILED = {}
+# Books mapped and NOT sent (behind / same place / not clearly ahead / the Kobo's
+# place not in the book / unreadable), per calibre session: key -> (app stamp,
+# Kobo stamp). Not parsed again until either place changes, so a run never maps
+# the same books over and over (N1: with more than MAX_BOOKS such books, `more`
+# would otherwise re-run the same first chunk every few seconds).
+_SETTLED = {}
 
 
 def forget_failures():
     _FAILED.clear()
+    _SETTLED.clear()
 
 
 def _failure_key(library_path, app_db, uuid):
@@ -357,6 +364,10 @@ def push_positions(library_path, app_db, lookup, base_url=DEFAULT_CALIBRE_WEB, m
         if has_place and not _is_newer(entry['updated_at'], row['updated_at']):
             res.skipped[uuid] = 'the Kobo\'s place is as new or newer'
             continue
+        settled = (entry['updated_at'], row['updated_at'])
+        if _SETTLED.get(fkey, (None, None))[:2] == settled:
+            res.skipped[uuid] = _SETTLED[fkey][2]
+            continue
         if library_state != 'same' and not (row.get('location_source') or '').strip():
             # Book ids unproven: only the Kobo's own Source in this book (checked by
             # map_bookmark below, M4) shows Calibre-Web's book is this one.
@@ -379,22 +390,26 @@ def push_positions(library_path, app_db, lookup, base_url=DEFAULT_CALIBRE_WEB, m
                 except Exception:          # a damaged KEPUB only costs precision
                     kepub = None
             kobo_place = map_bookmark(epub, row, kepub) if has_place else None
+            why = None
             if has_place and kobo_place is None:
                 # Its Source is in neither the EPUB nor the KEPUB (M4): another book?
-                res.skipped[uuid] = 'the Kobo\'s place does not match this book'
-                continue
-            if not (0 <= entry['chapter'] < len(epub.chapters)):
-                res.skipped[uuid] = 'the app\'s chapter is not in this book'
-                continue
-            order = compare(entry, kobo_place, row)
-            if order != 'ahead':
-                res.skipped[uuid] = {'same': 'the same place as the Kobo', 'behind': 'behind the Kobo (forward only)',
-                                     'unknown': 'not clearly ahead of the Kobo'}[order]
+                why = 'the Kobo\'s place does not match this book'
+            elif not (0 <= entry['chapter'] < len(epub.chapters)):
+                why = 'the app\'s chapter is not in this book'
+            else:
+                order = compare(entry, kobo_place, row)
+                if order != 'ahead':
+                    why = {'same': 'the same place as the Kobo', 'behind': 'behind the Kobo (forward only)',
+                           'unknown': 'not clearly ahead of the Kobo'}[order]
+            if why is not None:
+                res.skipped[uuid] = why
+                _SETTLED[fkey] = settled + (why,)
                 continue
             loc = kobo_location(epub, entry['chapter'], entry['textAnchor'], kepub,
                                 kobo_source=row.get('location_source'))
         except Exception as exc:
             res.skipped[uuid] = 'could not read the book ({})'.format(exc)
+            _SETTLED[fkey] = settled + (res.skipped[uuid],)
             continue
         finally:
             for b in (epub, kepub):
