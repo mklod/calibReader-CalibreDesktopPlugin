@@ -434,7 +434,7 @@ class ImportTests(ImportBase):
         self.assertEqual(res.written, [])
         self.assertEqual(self.positions()[self.uuids[1]]['deviceId'], 'phone-1')
         res = self.run_import({1: (SPAN_VALUE, 4, '2026-11-01T10:00:00Z')})
-        self.assertEqual((res.written, len(self.kepub_calls)), ([], 1))
+        self.assertEqual((res.written, len(self.kepub_calls)), ([], 0))     # decided without mapping it
 
     def test_an_older_app_place_is_replaced_and_a_tie_goes_to_the_app(self):
         app = {'chapter': 1, 'textAnchor': 10, 'progress': 0.01, 'page': 0, 'scrollY': 0,
