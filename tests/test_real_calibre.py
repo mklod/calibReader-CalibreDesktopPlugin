@@ -1278,6 +1278,23 @@ class RealKoboUtilitiesTests(RealCalibreBase):
         self.assertTrue(ui.PREFS['kobo_ku_device_seen'])
         self.assertEqual(Timer.started, [ui.KU_DEVICE_DELAY_MS])
 
+    def test_calibreaders_own_columns_never_suggest_kobo_utilities_columns(self):
+        # e2e finding: on a library whose CalibReader settings were never saved, Settings pre-selected
+        # #kobo_percent_read / #kobo_last_read as CalibReader's own % / last-read columns, so OK would
+        # have had the plugin write the app's progress into Kobo Utilities' columns.
+        qt_app()
+        import config
+
+        class Gui(object):
+            current_db = self.lib.legacy
+            library_path = self.lib.path
+            iactions = {}
+        w = config.ConfigWidget(Gui())
+        self.assertNotEqual(w.combos['percent'].currentData(), '#kobo_percent_read')
+        self.assertNotEqual(w.combos['last_read'].currentData(), '#kobo_last_read')
+        # picked by hand they are still there to pick (only never suggested)
+        self.assertGreaterEqual(w.combos['percent'].findData('#kobo_percent_read'), 0)
+
     def test_a_newer_calibre_web_place_wins(self):
         (b1, u1), = self.books[:1]
         with open(os.path.join(self.lib.path, 'CalibReader_positions.json'), 'w', encoding='utf-8') as f:

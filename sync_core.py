@@ -2104,4 +2104,12 @@ if __name__ == '__main__':  # pragma: no cover
             ko = {'#ko_progint': {'datatype': 'int', 'name': 'KOReader Progress'}}
             self.assertEqual(suggest_column(ko, 'percent'), '#ko_progint')
 
+        def test_never_suggests_an_excluded_column(self):
+            # 1.7.0: Kobo Utilities' columns are never suggested as CalibReader's own
+            ku = {'#kobo_percent_read': {'datatype': 'int', 'name': 'Kobo % read'},
+                  '#kobo_last_read': {'datatype': 'datetime', 'name': 'Kobo last read'}}
+            self.assertEqual(suggest_column(ku, 'percent', exclude=('#kobo_percent_read',)), '')
+            self.assertEqual(suggest_column(ku, 'last_read', exclude=('#kobo_last_read',)), '')
+            self.assertEqual(suggest_column(ku, 'last_read'), '#kobo_last_read')
+
     unittest.main(verbosity=2)
