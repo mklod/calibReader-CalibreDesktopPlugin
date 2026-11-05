@@ -451,7 +451,8 @@ the Kobo. One way only (Kobo → CalibReader).
   and the earlier place is kept (marked approximate when they disagree), never
   one after the Kobo's. With the Kobo Touch Extended driver plugin installed,
   every sentence is passed on as approximate. Without a sentence: the
-  chapter's start (`precision: chapter`), or the Kobo's % (`percent`). Device
+  chapter's start (`precision: chapter`), or, with only the Kobo's %, the start
+  of the chapter 2 points before that % (`percent`: never past the Kobo). Device
   paths (`file:///mnt/onboard/…!…`), URL-encoded names and EPUB CFIs are read
   too; an unknown fragment is read as its chapter.
 - **When.** At every run of the button and the automatic sync (only books whose

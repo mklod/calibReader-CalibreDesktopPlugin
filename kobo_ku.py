@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--1118
+# Last modified: 2026-11-05--1121
 #
 # kobo_ku.py — Kobo reading places stored by the Kobo Utilities calibre plugin (USB sync)
 # into CalibReader_positions.json (plugin 1.7.0, tester preview). Kobo -> CalibReader only.
@@ -77,6 +77,7 @@ CHAPTER = 'chapter'         # the chapter's start: no usable place inside it
 PERCENT = 'percent'         # the Kobo's book-wide % only
 
 DISTRUST_POINTS = 25.0      # M5: the mapped place vs the Kobo's own %, in % points
+PERCENT_BACK = 2.0          # NIT 3: a %-only place starts this many points before the Kobo's %
 MAX_BOOKS = 25              # L1: books mapped per run inside calibre (the rest next run)
 REGEN_BUDGET = 3.0          # seconds of KEPUB regeneration started per run inside calibre
 CACHE_CAP = 200 * 1024 * 1024   # ruling 6: the kepub cache, in bytes
@@ -225,9 +226,15 @@ def map_ku(epub, parsed, percent=None, kepub=None):
         if pct is None or pct <= 0 or pct >= 100:
             return None, 'no location, and the Kobo\'s {} is a status, not a reading place'.format(
                 'missing %' if pct is None else '{:.0f} %'.format(pct))
-        place = map_bookmark(epub, {'progress_percent': pct})
+        # NIT 3 ruling (review step 4): the Kobo's % is its own measure, not the text's, so the
+        # text fraction can land past the Kobo's place. Never skip unread text: take the position
+        # at the Kobo's % minus 2 points (floor 0) and snap it to the START of its chapter.
+        place = map_bookmark(epub, {'progress_percent': max(0.0, pct - PERCENT_BACK)})
         if place is None:
             return None, 'the book has no text'
+        lengths = epub.lengths()
+        place['textAnchor'] = 0
+        place['progress'] = round(sum(lengths[:place['chapter']]) / (float(sum(lengths)) or 1.0), 6)
         place['precision'] = PERCENT
         return place, None
     chapter = None
