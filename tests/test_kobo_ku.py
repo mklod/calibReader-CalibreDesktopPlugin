@@ -778,7 +778,7 @@ class StalenessTests(unittest.TestCase):
 
     def test_the_hint(self):
         last = '2026-10-01T10:00:00.000Z'
-        self.assertIn('Kobo Utilities has not stored positions since',
+        self.assertIn('The newest Kobo reading Kobo Utilities stored is from 2026-10-01',  # NIT 6
                       kobo_ku.staleness_hint(last, '2026-11-04T10:00:00.000Z', NOW))
         self.assertEqual(kobo_ku.staleness_hint(last, None, NOW), '')                       # no Kobo seen
         self.assertEqual(kobo_ku.staleness_hint(last, '2026-09-30T10:00:00.000Z', NOW), '')  # not since
@@ -817,6 +817,186 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(stored['sources'][0]['id'], 'ku')
         self.assertIsNone(stored['sources'][0]['boundReader'])
         self.assertIsNone(kobo_ku.prefs_entry('', '#kobo_percent_read', ''))
+
+
+# --------------------------------------------------------------------------- review step 4, round 1
+
+class TwoNumberingsTests(unittest.TestCase):
+    '''S1: a stored KEPUB may not be the Kobo's copy (a KEPUB format added after the book was sent
+    by USB). Map the span through both numberings (the stored KEPUB and calibre's own) and never
+    land after the Kobo's real place: when they disagree, the EARLIER landing, marked span~.'''
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix='cr-ku-two-')
+        body = '<p>\nFirst sentence here. Second sentence there.</p>\n<p>\nThird one. Fourth one.</p>'
+        calibre_like = ('<div id="book-columns"><div id="book-inner"><p>' + span('kobo.1.1', '\n')
+                        + span('kobo.1.2', 'First sentence here. ') + span('kobo.1.3', 'Second sentence there.')
+                        + '</p>\n<p>' + span('kobo.2.1', '\n') + span('kobo.2.2', 'Third one. ')
+                        + span('kobo.2.3', 'Fourth one.') + '</p></div></div>')
+        kepubify_like = ('<p>' + span('kobo.1.1', 'First sentence here. ') + span('kobo.1.2', 'Second sentence there.')
+                         + '</p>\n<p>' + span('kobo.2.1', 'Third one. ') + span('kobo.2.2', 'Fourth one.') + '</p>')
+        self.epub = Book(make_book(os.path.join(self.dir, 'b.epub'), [('ch1.xhtml', body)]))
+        self.calibre = Book(make_book(os.path.join(self.dir, 'c.kepub'), [('ch1.xhtml', calibre_like)]))
+        self.stored = Book(make_book(os.path.join(self.dir, 's.kepub'), [('ch1.xhtml', kepubify_like)]))
+        self.text = self.epub.text(0).text
+
+    def tearDown(self):
+        for b in (self.epub, self.calibre, self.stored):
+            b.close()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def at(self, place):
+        return self.text[place['textAnchor']:]
+
+    def test_disagreeing_numberings_take_the_earlier_place_marked_approximate(self):
+        # kobo.1.2 = "First…" in calibre's numbering, "Second…" in the stored one
+        place, why = kobo_ku.map_ku(self.epub, kobo_ku.parse_location('text/ch1.xhtml#kobo.1.2'),
+                                    kepub=lambda: ([self.stored, self.calibre], None))
+        self.assertTrue(self.at(place).startswith('First sentence'), self.at(place)[:20])
+        self.assertEqual(place['precision'], kobo_ku.SPAN_APPROX)
+        self.assertIn('disagree', place['note'])
+
+    def test_agreeing_numberings_stay_exact(self):
+        place, why = kobo_ku.map_ku(self.epub, kobo_ku.parse_location('text/ch1.xhtml#kobo.1.1'),
+                                    kepub=lambda: ([self.stored, self.calibre], None))
+        self.assertTrue(self.at(place).startswith('First sentence'))
+        self.assertEqual(place['precision'], kobo_ku.SPAN)
+
+    def test_a_span_only_one_numbering_has_decides_the_numbering(self):
+        place, why = kobo_ku.map_ku(self.epub, kobo_ku.parse_location('text/ch1.xhtml#kobo.2.3'),
+                                    kepub=lambda: ([self.stored, self.calibre], None))
+        self.assertTrue(self.at(place).startswith('Fourth one'))
+        self.assertEqual(place['precision'], kobo_ku.SPAN)
+
+    def test_the_driver_plan_for_a_stored_kepub_with_an_epub_gives_both(self):
+        made = []
+
+        def regenerate(src, out):
+            made.append(src)
+            shutil.copy2(KEPUB, out)
+        cache = kobo_ku.KepubCache(os.path.join(self.dir, 'cache'), regenerate=regenerate, version='9.6.0',
+                                   options={'prefer_justification': False})
+        kepub_for = kobo_ku.make_kepub_for(lambda b: {'EPUB', 'KEPUB'}, cache, ['kepub', 'epub'], True, kte=False)
+        paths, why, info = kepub_for(1, EPUB, KEPUB)
+        self.assertEqual(len(paths), 2)
+        self.assertEqual(paths[0], KEPUB)
+        self.assertTrue(paths[1].startswith(cache.folder))
+        self.assertNotIn('uncertain', info)
+        kepub_for = kobo_ku.make_kepub_for(lambda b: {'EPUB'}, cache, ['kepub', 'epub'], True, kte=True)
+        paths, why, info = kepub_for(1, EPUB, None)
+        self.assertIn('Kobo Touch Extended', info['uncertain'])
+
+
+class KoboTouchExtendedImportTests(ImportBase):
+    '''S1: with the Kobo Touch Extended driver plugin installed, a span is approximate.'''
+
+    def kepub_for(self, book_id, epub_path, kepub_path):
+        return KEPUB, None, {'kepub': 'stored KEPUB', 'uncertain': 'the Kobo Touch Extended driver plugin is installed'}
+
+    def test_a_span_is_marked_approximate_and_said_once(self):
+        res = self.run_import({1: (SPAN_VALUE, 4, '2026-11-01T10:00:00Z')})
+        e = self.positions()[self.uuids[1]]
+        self.assertEqual(e['kobo']['precision'], kobo_ku.SPAN_APPROX)
+        self.assertIn('Kobo Touch Extended', e['kobo']['note'])
+        self.assertIn('Kobo Touch Extended', res.uncertain)
+
+
+@unittest.skipUnless(kobo_ku.calibre_kepubify() is not None, 'needs calibre\'s kepubify (calibre-debug)')
+class CalibreNumberingTests(unittest.TestCase):
+    '''S1, the reviewer's Metamorphosis probe: the Kobo has calibre's numbering (sent while the
+    book had only an EPUB), the library now also holds a kepubify-4.0.4 KEPUB. Through the plugin
+    no place may land after the Kobo's real one (874 did in 1.7.0 / 5d99d2e).'''
+
+    def test_never_after_the_kobos_place(self):
+        work = tempfile.mkdtemp(prefix='cr-ku-s1-')
+        try:
+            cache = kobo_ku.KepubCache(os.path.join(work, 'cache'))
+            kepub_for = kobo_ku.make_kepub_for(lambda b: {'EPUB', 'KEPUB'}, cache, ['kepub', 'epub'], True, kte=False)
+            paths, why, info = kepub_for(1, EPUB, KEPUB)
+            self.assertEqual(len(paths), 2, why)
+            epub, stored, calibre = Book(EPUB), Book(paths[0]), Book(paths[1])
+            after = exact = early = 0
+            try:
+                for ch in range(len(epub.chapters)):
+                    kch = [p.lower() for p in calibre.chapters].index(epub.chapters[ch].lower())
+                    for sid in calibre.text(kch).ids:
+                        if not re.match(r'^kobo\.\d+\.\d+$', sid):
+                            continue
+                        true = kobo_ku.resolve_span(epub, calibre, ch, sid)
+                        place, why = kobo_ku.map_ku(epub, kobo_ku.parse_location(epub.chapters[ch] + '#' + sid),
+                                                    kepub=lambda: ([stored, calibre], None))
+                        if true is None or place is None:
+                            continue
+                        if place['textAnchor'] > true[0]:
+                            after += 1
+                        elif place['textAnchor'] == true[0]:
+                            exact += 1
+                        else:
+                            early += 1
+            finally:
+                for b in (epub, stored, calibre):
+                    b.close()
+            self.assertEqual(after, 0, (after, exact, early))
+            self.assertGreater(exact, 0)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+    def test_S2_a_conversion_leaves_no_temp_folder_behind(self):
+        from calibre.ptempfile import base_dir
+        work = tempfile.mkdtemp(prefix='cr-ku-s2-')
+        try:
+            before = set(os.listdir(base_dir()))
+            cache = kobo_ku.KepubCache(os.path.join(work, 'cache'))
+            path, why = cache.path_for(1, EPUB)
+            self.assertTrue(path, why)
+            self.assertEqual(set(os.listdir(base_dir())) - before, set())
+            self.assertEqual(sorted(os.listdir(cache.folder)), [os.path.basename(path)])
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+class CacheReviewTests(unittest.TestCase):
+    '''S2: everything the plugin keeps counts against the cap; stale temp files and work folders
+    (a calibre killed mid-conversion) are removed. NIT 8: a damaged cache file is made again.'''
+    setUp, tearDown, regenerate, make = CacheTests.setUp, CacheTests.tearDown, CacheTests.regenerate, CacheTests.make
+
+    def test_stale_temp_files_and_work_folders_count_and_go(self):
+        c = self.make()
+        p, _ = c.path_for(7, self.src)
+        old = time.time() - 3600
+        stale_file = os.path.join(self.cache, 'abc.123.456.tmp')
+        stale_dir = os.path.join(self.cache, 'work-123-456')
+        os.makedirs(os.path.join(stale_dir, 'OEBPS'))
+        for f in (stale_file, os.path.join(stale_dir, 'OEBPS', 'x.html')):
+            with open(f, 'wb') as fh:
+                fh.write(b'x' * 1000)
+            os.utime(f, (old, old))
+        os.utime(stale_dir, (old, old))
+        self.assertGreaterEqual(c.used(), os.path.getsize(p) + 2000)
+        c.evict()
+        self.assertFalse(os.path.exists(stale_file))
+        self.assertFalse(os.path.exists(stale_dir))
+        self.assertTrue(os.path.exists(p))
+
+    def test_a_damaged_cache_file_is_made_again(self):
+        c = self.make()
+        p, _ = c.path_for(7, self.src)
+        with open(p, 'wb') as f:
+            f.write(b'not a zip')
+        p2, why = c.path_for(7, self.src)
+        self.assertEqual(p2, p)
+        self.assertEqual(len(self.made), 2)
+        self.assertTrue(zipfile.is_zipfile(p2))
+
+
+class SummaryNoiseTests(ImportBase):
+    '''NIT 7: a 0 % / 100 % status with no location is a status, not a problem to report.'''
+
+    def test_status_rows_are_not_problems(self):
+        res = self.run_import({1: (None, 100, '2026-11-01T10:00:00Z'), 2: ('Fantasy', 40, '2026-11-01T10:00:00Z')})
+        self.assertIn(self.uuids[1], res.skipped)
+        self.assertNotIn(self.uuids[1], res.problems)
+        self.assertIn(self.uuids[2], res.problems)
 
 
 if __name__ == '__main__':

@@ -1421,3 +1421,231 @@ class RealKoboUtilitiesSettingsTests(RealCalibreBase):
         w.save_ku()
         self.assertTrue(shown)
         self.assertNotIn(self.lib.path, ui.PREFS.get('kobo_ku', {}) or {})
+
+
+@unittest.skipUnless(HAVE_CALIBRE, 'needs calibre (run tests/run_calibre.sh)')
+class RealKuReviewRound1Tests(RealCalibreBase):
+    '''Review step 4 (REVIEW-STEP4.md), round 1: B1 (Settings never pre-selects CalibReader's own
+    columns; a clash blocks the whole save), S3 (a saved CalibReader column that is a Kobo
+    Utilities column is flagged and not written), S1 (Kobo Touch Extended: approximate), NITs 1,
+    2, 10.'''
+
+    def setUp(self):
+        RealCalibreBase.setUp(self)
+        import ui
+        self.cache = tempfile.mkdtemp(prefix='cr-ku-cache-')
+        self.cache_patch = mock.patch('kobo_ku.cache_folder', return_value=self.cache)
+        self.cache_patch.start()
+        if os.path.exists(ui.KU_MEMORY):
+            os.remove(ui.KU_MEMORY)
+
+    def tearDown(self):
+        import ui
+        self.cache_patch.stop()
+        shutil.rmtree(self.cache, ignore_errors=True)
+        ui.PREFS['kobo_ku'] = {}
+        if os.path.exists(ui.KU_MEMORY):
+            os.remove(ui.KU_MEMORY)
+        RealCalibreBase.tearDown(self)
+
+    def columns(self, *specs):
+        for label, name, kind in specs:
+            self.lib.legacy.create_custom_column(label, name, kind, False)
+        self.lib.reopen()
+
+    def widget(self):
+        qt_app()
+        import config
+
+        class Gui(object):
+            current_db = self.lib.legacy
+            library_path = self.lib.path
+            iactions = {}
+        return config.ConfigWidget(Gui())
+
+    def pick(self, combo, lookup):
+        index = combo.findData(lookup)
+        self.assertGreaterEqual(index, 0, lookup)
+        combo.setCurrentIndex(index)
+
+    def app_places(self, *uuids):
+        with open(os.path.join(self.lib.path, 'CalibReader_positions.json'), 'w', encoding='utf-8') as f:
+            json.dump({'schema': 1, 'updated_at': '2026-11-04T20:00:00.000Z', 'positions': {
+                u: {'chapter': 3, 'page': 0, 'scrollY': 0, 'progress': 0.63, 'textAnchor': 100,
+                    'updated_at': '2026-11-04T20:00:00.000Z', 'deviceId': 'iphone-x'} for u in uuids}}, f)
+
+    def stored(self):
+        from sync_core import SETTINGS_KEY
+        return self.lib.api.pref(SETTINGS_KEY, None)
+
+    # -- B1 ---------------------------------------------------------------------------------
+
+    def test_B1_two_readers_nothing_preselected_nothing_written_into_either_readers_columns(self):
+        # the reviewer's DAL/CES setup (KOBO-UTILITIES.md section 7: one KU column set per person)
+        import kobo_ku
+        import ui
+        self.columns(('dal_location', 'DAL Reading Location', 'comments'), ('dal_percent', 'DAL % Read', 'int'),
+                     ('dal_last_read', 'DAL Last Read', 'datetime'),
+                     ('ces_location', 'CES Reading Location', 'comments'), ('ces_percent', 'CES % Read', 'int'),
+                     ('ces_last_read', 'CES Last Read', 'datetime'))
+        (b1, u1), (b2, u2) = self.lib.books(2)
+        api = self.lib.api
+        api.set_field('#dal_location', {b1: 'OEBPS/ch08.xhtml'})
+        api.set_field('#ces_location', {b1: 'OEBPS/ch02.xhtml'})
+        api.set_field('#ces_percent', {b1: 12})
+        api.set_field('#ces_last_read', {b1: datetime.datetime(2026, 10, 1, 9, 0, tzinfo=UTC)})
+        self.app_places(u1, u2)
+        cols = ('#dal_location', '#dal_percent', '#dal_last_read', '#ces_location', '#ces_percent', '#ces_last_read')
+        before = [[self.v(c, b) for c in cols] for b in (b1, b2)]
+        w = self.widget()
+        self.assertEqual((w.combos['percent'].currentData(), w.combos['last_read'].currentData()), ('', ''))
+        self.pick(w.ku_location, '#dal_location')
+        self.pick(w.ku_percent, '#dal_percent')
+        self.pick(w.ku_last_read, '#dal_last_read')
+        errors = []
+        w._show_ku_error = errors.append
+        self.assertTrue(w.validate())
+        w.save_settings()
+        self.assertEqual(errors, [])
+        stored = self.stored()
+        self.assertEqual((stored['percent_column'], stored['last_read_column']), ('', ''))
+        self.assertEqual(ui.PREFS['kobo_ku'][self.lib.path],
+                         kobo_ku.prefs_entry('#dal_location', '#dal_percent', '#dal_last_read'))
+        self.run_ui()
+        self.assertEqual([[self.v(c, b) for c in cols] for b in (b1, b2)], before)
+
+    def test_B1_a_clash_blocks_the_whole_save_and_nothing_is_written(self):
+        import ui
+        self.columns(('reading_location', 'Reading location', 'text'), ('percent_read', 'Percent read', 'int'),
+                     ('last_read', 'Last read', 'datetime'))
+        (b1, u1), = self.lib.books(1)
+        self.app_places(u1)
+        w = self.widget()
+        self.assertEqual((w.combos['percent'].currentData(), w.combos['last_read'].currentData()), ('', ''))
+        self.pick(w.combos['percent'], '#percent_read')            # picked by hand for CalibReader...
+        self.pick(w.combos['last_read'], '#last_read')
+        self.pick(w.ku_location, '#reading_location')
+        self.pick(w.ku_percent, '#percent_read')                   # ...and the same for Kobo Utilities
+        self.pick(w.ku_last_read, '#last_read')
+        errors = []
+        w._show_ku_error = errors.append
+        self.assertIs(getattr(w, 'validate_before_accept', False), True)
+        self.assertFalse(w.validate())                              # the dialog stays open
+        self.assertTrue(errors and '#percent_read' in errors[0], errors)
+        w.save_settings()                                           # even if called: nothing saved
+        self.assertIsNone(self.stored())
+        self.assertNotIn(self.lib.path, ui.PREFS.get('kobo_ku', {}) or {})
+        self.run_ui()
+        self.assertEqual((self.v('#percent_read', b1), self.v('#last_read', b1)), (None, None))
+
+    # -- S3 ---------------------------------------------------------------------------------
+
+    def test_S3_a_saved_calibreader_column_that_ku_uses_is_flagged_and_not_written(self):
+        import kobo_ku
+        import ui
+        self.columns(('kobo_reading_location', 'Kobo location', 'text'), ('kobo_percent_read', 'Kobo % read', 'int'),
+                     ('kobo_last_read', 'Kobo last read', 'datetime'))
+        (b1, u1), = self.lib.books(1)
+        # saved by 1.2.0-1.6.0's suggestion, and Kobo Utilities' route uses the same % column
+        self.lib.set_settings({'version': 1, 'percent_column': '#kobo_percent_read', 'last_read_column': '',
+                               'progress_threshold': 1, 'auto_sync': True})
+        ui.PREFS['kobo_ku'] = {self.lib.path: kobo_ku.prefs_entry('#kobo_reading_location', '#kobo_percent_read', '')}
+        self.app_places(u1)
+        w = self.widget()
+        warning = w.ku_clash_note.text()
+        self.assertIn('#kobo_percent_read', warning)
+        self.assertIn('pick another', warning)
+        res = self.run_ui()
+        self.assertIsNone(self.v('#kobo_percent_read', b1))        # CalibReader stopped writing it
+        self.assertTrue(any('#kobo_percent_read' in n and 'not written' in n for n in res.notes), res.notes)
+
+    def test_S3_without_saved_ku_settings_the_ku_selection_is_checked(self):
+        self.columns(('reading_location', 'Reading location', 'text'), ('percent_read', 'Percent read', 'int'))
+        self.lib.set_settings({'version': 1, 'percent_column': '#percent_read', 'last_read_column': '',
+                               'progress_threshold': 1, 'auto_sync': True})
+        w = self.widget()
+        self.assertNotIn('#percent_read', w.ku_clash_note.text())
+        self.pick(w.ku_percent, '#percent_read')                   # offered, so the clash is visible
+        self.assertIn('#percent_read', w.ku_clash_note.text())
+
+    # -- S1 (Kobo Touch Extended) -----------------------------------------------------------
+
+    def test_S1_with_kobo_touch_extended_installed_spans_are_approximate(self):
+        import kobo_ku
+        import ui
+        self.columns(('kobo_reading_location', 'Kobo location', 'text'), ('kobo_last_read', 'Kobo last read', 'datetime'))
+        (b1, u1), = self.lib.books(1)
+        self.lib.api.add_format(b1, 'EPUB', os.path.join(TESTS, 'fixtures', 'metamorphosis.epub'))
+        self.lib.api.set_field('#kobo_reading_location', {b1: KU_CH.format(1) + '#kobo.3.2'})
+        self.lib.api.set_field('#kobo_last_read', {b1: datetime.datetime(2026, 11, 1, 10, 0, tzinfo=UTC)})
+        ui.PREFS['kobo_ku'] = {self.lib.path: kobo_ku.prefs_entry('#kobo_reading_location', '', '#kobo_last_read')}
+        with mock.patch('kobo_ku.kte_installed', return_value=True):
+            res = self.run_ui()
+        with open(os.path.join(self.lib.path, 'CalibReader_positions.json'), encoding='utf-8') as f:
+            entry = json.load(f)['positions'][u1]
+        self.assertEqual(entry['kobo']['precision'], 'span~')
+        self.assertTrue(any('Kobo Touch Extended' in line for line in res.kobo_ku_lines), res.kobo_ku_lines)
+
+    # -- NITs 1, 2, 10 ----------------------------------------------------------------------
+
+    def test_NIT1_a_ku_catch_up_follows_after_a_longer_pause(self):
+        import kobo_ku
+        import ui
+        self.columns(('kobo_reading_location', 'Kobo location', 'text'))
+        ui.PREFS['kobo_ku'] = {self.lib.path: kobo_ku.prefs_entry('#kobo_reading_location', '', '')}
+        action = self.action()
+        asked = []
+
+        class Kick(object):
+            def start(self, ms):
+                asked.append(ms)
+        action._kick = Kick()
+        more = kobo_ku.KuImportResult()
+        more.more = True
+        with mock.patch('kobo_ku.import_ku', return_value=more):
+            self.run_ui()
+        self.assertIn(ui.KU_MORE_DELAY_MS, asked)
+        self.assertGreaterEqual(ui.KU_MORE_DELAY_MS, 20000)
+
+    def test_NIT2_our_own_send_holding_the_lock_is_said_plainly(self):
+        import kobo_ku
+        import kobo_service
+        import ui
+        self.columns(('kobo_reading_location', 'Kobo location', 'text'))
+        ui.PREFS['kobo_ku'] = {self.lib.path: kobo_ku.prefs_entry('#kobo_reading_location', '', '')}
+        home = tempfile.mkdtemp(prefix='cr-ku-home-')
+        try:
+            with mock.patch.dict(os.environ, {'CALIBREADER_SYNC_HOME': home}):
+                held = kobo_service.LibraryLock(self.lib.path, 'calibre')
+                self.assertTrue(held.acquire())
+                try:
+                    class Alive(object):
+                        def is_alive(self):
+                            return True
+                    self.action()._kobo_worker = Alive()
+                    res = self.run_ui()
+                finally:
+                    held.release()
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+        notes = ' '.join(res.notes)
+        self.assertIn('calibre\'s own send', notes)
+        self.assertNotIn('running elsewhere', notes)
+
+    def test_NIT10_the_button_shows_the_ku_lines_in_a_library_without_calibreader_files(self):
+        import kobo_ku
+        import ui
+        self.columns(('kobo_reading_location', 'Kobo location', 'text'))
+        (b1, u1), = self.lib.books(1)
+        self.lib.api.set_field('#kobo_reading_location', {b1: 'text/nowhere.xhtml#kobo.1.1'})
+        ui.PREFS['kobo_ku'] = {self.lib.path: kobo_ku.prefs_entry('#kobo_reading_location', '', '')}
+        action = self.action()
+        action.sync_read_status = ui.CalibReaderSyncAction.sync_read_status.__get__(action)
+        shown = []
+        saved = ui.info_dialog, ui.error_dialog
+        ui.info_dialog = ui.error_dialog = lambda parent, title, msg, **kw: shown.append(msg)
+        try:
+            action.sync_read_status()
+        finally:
+            ui.info_dialog, ui.error_dialog = saved
+        self.assertTrue(shown and 'Kobo Utilities' in shown[0] and 'No CalibReader files' not in shown[0], shown)
