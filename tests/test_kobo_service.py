@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0721
+# Last modified: 2026-11-05--0734
 #
 # Step 3 (plugin 1.6.0, tester preview): the Kobo sync without calibre running.
 # kobo_service.run_once is what the launchd job runs (calibre-debug -e <copy>/kobo_service.py
@@ -290,6 +290,31 @@ class RunTests(ServiceBase):
         self.assertIn('calibre (pid', self.log_text())
         out = self.run_job()                                     # the next run does the work
         self.assertEqual((out.status, out.kres.written), ('done', [tkp.UUID]))
+
+    def test_a_busy_run_never_overwrites_what_the_lock_holder_saved(self):
+        # The holder (another job run) saves its state while this run, which found the lock
+        # taken, is between reading the state file and writing its own line: the holder's N1
+        # memories and back-off must survive.
+        kobo_service.save_state(self.lib, {'status': 'done', 'clean': True})
+        holder_saved = {'status': 'done', 'clean': True, 'n1': {'import_failed': [['a', 'b', 'c']]},
+                        'backoff_until': '2026-11-05T12:00:00.000Z'}
+        real = kobo_service.read_prefs
+
+        def holder_saves_meanwhile(config_dir):
+            kobo_service.save_state(self.lib, holder_saved)
+            return real(config_dir)
+        lock = kobo_service.LibraryLock(self.lib, 'the background job')
+        self.assertTrue(lock.acquire())
+        try:
+            with mock.patch.object(kobo_service, 'read_prefs', side_effect=holder_saves_meanwhile):
+                out = self.run_job()
+        finally:
+            lock.release()
+        self.assertEqual(out.status, 'busy')
+        state = kobo_service.load_state(self.lib)
+        self.assertEqual(state.get('n1'), holder_saved['n1'])
+        self.assertEqual(state.get('backoff_until'), holder_saved['backoff_until'])
+        self.assertEqual((state['status'], state['clean']), ('busy', False))
 
     def test_nothing_new_is_cut_short(self):
         self.kobo(60, '2026-10-30 21:03:48', tkp.CH.format(2), 'KoboSpan', 'kobo.5.1', 40.0, 3.0)
