@@ -1,4 +1,4 @@
-# Last modified: 2026-11-02--1446
+# Last modified: 2026-11-05--0413
 #
 # sync_core.py — one sync run, without the GUI.
 #
@@ -406,6 +406,8 @@ class SyncResult(object):
         self.columns_written = []      # e.g. ['#read_status', '#read_percent']
         self.notes = []                # plain-English problems worth showing
         self.kobo_imported = 0         # 1.4.0: Kobo places put into the positions file (ui.py)
+        self.kobo_pushed = 0           # 1.5.0: app places sent to the Kobo via Calibre-Web (ui.py)
+        self.kobo_push_lines = []      # 1.5.0: what was sent, with the precision (summary only)
         self.changes = []              # 1.3.1: every value written, old -> new (append_change_log)
         self.confirm = None            # 1.3.1: {column, heading, fill, change} of a first sync
                                        # into a chosen column waiting for the user's OK
@@ -428,6 +430,8 @@ class SyncResult(object):
             parts.append('{} passed back to the app'.format(self.flags_sent_back))
         if self.kobo_imported:
             parts.append('{} Kobo reading place(s) for the app'.format(self.kobo_imported))
+        if self.kobo_pushed:
+            parts.append('{} reading place(s) sent to the Kobo'.format(self.kobo_pushed))
         line = ('updated ' + ', '.join(parts) + '.') if parts else ''
         if self.notes:
             line = (line + ' ' if line else '') + 'Something needs attention: click Sync Read Status for details.'
@@ -451,6 +455,7 @@ class SyncResult(object):
             lines.append('{} book(s) in the files are not in this library.'.format(len(self.unmatched)))
         if self.kobo_imported:
             lines.append('Kobo: {} reading place(s) from Calibre-Web passed to the app.'.format(self.kobo_imported))
+        lines.extend(self.kobo_push_lines)
         lines.extend(self.notes)
         return '\n\n'.join(lines) if lines else 'Nothing to sync.'
 

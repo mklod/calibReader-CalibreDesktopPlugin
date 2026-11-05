@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0358
+# Last modified: 2026-11-05--0413
 #
 # Step 2, CalibReader -> Kobo (kobo_push): the app's place in
 # CalibReader_positions.json is PUT to Calibre-Web's Kobo API, forward-only,
@@ -281,6 +281,24 @@ class PushBase(unittest.TestCase):
     def puts(self):
         return [r for r in self.cw.requests if r[0] == 'PUT']
 
+    def metadata_db(self):
+        '''A calibre metadata.db for the CLI (it looks the books up there, read-only).'''
+        con = sqlite3.connect(os.path.join(self.lib, 'metadata.db'))
+        con.executescript('CREATE TABLE books (id INTEGER PRIMARY KEY, uuid TEXT, path TEXT);'
+                          'CREATE TABLE data (id INTEGER PRIMARY KEY, book INTEGER, format TEXT, name TEXT);'
+                          'CREATE TABLE library_id (id INTEGER PRIMARY KEY, uuid TEXT NOT NULL);')
+        con.execute("INSERT INTO library_id VALUES (1, 'dddddddd-0000-0000-0000-000000000004')")
+        for bid, (uuid, epub, kepub) in self.books.items():
+            rel = 'Author/Book ({})'.format(bid)
+            os.makedirs(os.path.join(self.lib, rel), exist_ok=True)
+            con.execute('INSERT INTO books VALUES (?,?,?)', (bid, uuid, rel))
+            for fmt, src in (('EPUB', epub), ('KEPUB', kepub)):
+                if src:
+                    shutil.copy(src, os.path.join(self.lib, rel, 'book.' + fmt.lower()))
+                    con.execute('INSERT INTO data (book, format, name) VALUES (?,?,?)', (bid, fmt, 'book'))
+        con.commit()
+        con.close()
+
 
 class ForwardOnlyTests(PushBase):
 
@@ -299,8 +317,9 @@ class ForwardOnlyTests(PushBase):
         self.assertIsNone(state['Statistics'])
         bm = state['CurrentBookmark']
         self.assertEqual(bm['Location'], {'Type': 'KoboSpan', 'Value': 'kobo.5.1', 'Source': CH.format(2)})
-        self.assertTrue(28 < bm['ProgressPercent'] < 29, bm)        # (39125 + a few) / 138516 of the text
-        self.assertLess(bm['ContentSourceProgressPercent'], 5)
+        start = self.anchor_of(3, 'kobo.5.1')                   # the span's own place: what lands back
+        self.assertAlmostEqual(bm['ProgressPercent'], 100.0 * (39125 + start) / 138516, places=3)
+        self.assertAlmostEqual(bm['ContentSourceProgressPercent'], 100.0 * start / 40209, places=3)
         self.assertEqual(self.kobo_row(60)[:3], ('KoboSpan', 'kobo.5.1', CH.format(2)))   # Calibre-Web stored it
         self.assertEqual(res.precisions[UUID], kobo_position.SPAN)
         self.assertTrue(any('sentence' in line for line in res.lines), res.lines)
@@ -552,6 +571,7 @@ class ConsentTests(PushBase):
         self.assertEqual(self.puts(), [])
 
     def test_the_cli_pushes_only_with_push(self):
+        self.metadata_db()
         self.kobo(60, '2026-10-30 21:03:48')
         self.app(UUID, 3, 500)
         state = os.path.join(self.dir, 'state.json')
@@ -577,6 +597,7 @@ class TokenTests(PushBase):
         return ' '.join(res.notes + res.lines + list(res.skipped.values()) + [json.dumps(self.memory)])
 
     def test_the_token_is_never_in_notes_logs_state_or_cli_output(self):
+        self.metadata_db()
         self.kobo(60, '2026-10-30 21:03:48')
         self.app(UUID, 3, 500)
         logged = []

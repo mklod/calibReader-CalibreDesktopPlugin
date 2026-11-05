@@ -1,4 +1,4 @@
-# Last modified: 2026-11-02--1441
+# Last modified: 2026-11-05--0413
 #
 # test_real_calibre.py — CalibReader Sync against REAL calibre (LibraryDatabase, set_field,
 # metadata.db, JSONConfig, the Settings widget), not the in-memory FakeDB of sync_core.py.
@@ -517,6 +517,30 @@ class RealSettingsDialogTests(RealCalibreBase):
         self.assertIn('iPhone and iPad', text)
         self.assertIn('Android app uses #read_status only', text)
         self.assertNotIn('The CalibReader app reads the same column', text)
+
+    def test_kobo_push_is_off_until_the_user_ticks_it(self):
+        # 1.5.0: nothing is ever sent to the Kobo unless "Also send CalibReader's place to
+        # the Kobo" is ticked; the address defaults to Calibre-Web on this computer.
+        import kobo_push
+        from ui import PREFS
+        try:
+            w = self.widget()
+            self.assertFalse(w.kobo_push.isChecked())
+            self.assertIn('Also send CalibReader', w.kobo_push.text())
+            self.assertEqual(w.kobo_url.placeholderText(), 'http://127.0.0.1:8083')
+            w.kobo_db.setText(os.path.join(self.lib.path, 'app.db'))
+            w.save_kobo()                                           # OK without touching the box
+            entry = PREFS['kobo'][self.lib.path]
+            self.assertIs(entry['push'], False)
+            self.assertFalse(kobo_push.push_enabled(entry))
+            self.assertEqual(kobo_push.calibre_web_url(entry), 'http://127.0.0.1:8083')
+            w = self.widget()
+            w.kobo_push.setChecked(True)
+            w.save_kobo()
+            self.assertTrue(kobo_push.push_enabled(PREFS['kobo'][self.lib.path]))
+            self.assertTrue(self.widget().kobo_push.isChecked())     # reopened: still on
+        finally:
+            PREFS['kobo'] = {}
 
     def test_picking_a_read_column_saves_it(self):
         self.lib.add_column('read', 'Read')

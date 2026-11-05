@@ -1,4 +1,4 @@
-# Last modified: 2026-11-02--1447
+# Last modified: 2026-11-05--0413
 #
 # kobo_position.py — a Kobo reading position -> a CalibReader position.
 #
@@ -24,6 +24,11 @@
 #      text, snapped back to a word start. ~a page or two (Kobo's % is its own
 #      measure).
 #   4. ProgressPercent only -> the book-wide fraction over all chapters' text.
+#
+# Step 2 (1.5.0, CalibReader -> Kobo): kobo_location turns the app's place back
+# into a Kobo bookmark: the KoboSpan the app's character is in (via the KEPUB,
+# with resolve_span itself, so the round trip lands at or just before the
+# app's place), or Source + the two percentages without a KEPUB.
 #
 # Pure stdlib (zipfile, html.parser, re, posixpath); nothing from calibre, so it
 # is unit-tested outside calibre (tests/test_kobo_position.py).
@@ -591,7 +596,10 @@ def _norm_index(s):
 def locate_text(ct, needle, near):
     '''Offset in `ct` of the occurrence of `needle` (whitespace-insensitive) whose
     start is nearest `near`; None if absent.'''
-    hay, idx = _norm_index(ct.text)
+    cached = getattr(ct, '_norm_cache', None)
+    if cached is None:                   # once per chapter (step 2 resolves every span)
+        cached = ct._norm_cache = _norm_index(ct.text)
+    hay, idx = cached
     n = ' '.join(needle.split())
     if not n:
         return None
@@ -736,4 +744,156 @@ def map_bookmark(epub, bookmark, kepub=None):
         'textAnchor': int(anchor),
         'progress': round(max(0.0, min(1.0, progress)), 6),
         'precision': precision,
+    }
+
+
+# -- the other way: a CalibReader place -> the Kobo bookmark to PUT (step 2) ------------
+
+_SPAN_ID = re.compile(r'^kobo\.\d+\.\d+$')
+SPAN_DRIFT = 200          # characters, or 5 % of the chapter: a span "found" further from
+SPAN_DRIFT_SHARE = 0.05   # its own KEPUB offset than this matched a repeated phrase elsewhere
+
+
+def kepub_spans(epub, kepub, chapter):
+    '''(KEPUB chapter index, [(anchor, span id)]) for the EPUB chapter `chapter`:
+    every kobo.P.S span of the matching KEPUB chapter, resolved with
+    resolve_span (step 1's own span -> anchor), kept when exactly found and near
+    its scaled KEPUB offset, sorted by anchor (document order for ties).
+    (None, []) when the KEPUB has no such chapter.'''
+    cache = kepub.__dict__.setdefault('_spans', {})
+    key = (epub.path, chapter)
+    if key in cache:
+        return cache[key]
+    src = epub.chapters[chapter]
+    try:
+        kch = [p.lower() for p in kepub.chapters].index(src.lower())
+    except ValueError:
+        kch = kepub.chapter_for_source(src)
+    out = []
+    if kch is not None:
+        kct = kepub.text(kch)
+        ect = epub.text(chapter)
+        scale = (ect.length / kct.length) if kct.length else 1.0
+        slack = max(SPAN_DRIFT, int(ect.length * SPAN_DRIFT_SHARE))
+        order = 0
+        for sid, koff in kct.ids.items():
+            if not _SPAN_ID.match(sid):
+                continue
+            hit = resolve_span(epub, kepub, chapter, sid)
+            if hit is None or hit[1] != SPAN:
+                continue
+            if abs(hit[0] - int(round(koff * scale))) > slack:
+                continue
+            out.append((hit[0], order, sid))
+            order += 1
+        out.sort()
+    cache[key] = (kch, [(a, sid) for a, _, sid in out])
+    return cache[key]
+
+
+def _word_back(ct, offset):
+    '''Start of the word `offset` is in; in whitespace, the word before it. At the
+    chapter's leading whitespace: `offset` itself (step 1's word_start then moves
+    forward to the first word: nothing but whitespace between).'''
+    units = ct.text.encode('utf-16-le')
+
+    def ch(i):
+        return units[2 * i:2 * i + 2].decode('utf-16-le', 'replace')
+    i = max(0, min(offset, ct.length))
+    if i >= ct.length:
+        return ct.length
+    if ch(i).isspace():
+        j = i
+        while j > 0 and ch(j - 1).isspace():
+            j -= 1
+        if j == 0:
+            return offset
+        i = j - 1
+    while i > 0 and not ch(i - 1).isspace():
+        i -= 1
+    return i
+
+
+def mirror_source(book, kobo_source, target):
+    '''The Source to send for chapter `target` of `book`, spelled like the Kobo's
+    own Source for this book (`kobo_source`, any chapter) when it has one: the
+    part before their common tail is swapped ("Text/a.xhtml" for
+    "OEBPS/Text/a.xhtml" gives "Text/b.xhtml"). Otherwise the chapter's zip path.'''
+    member = book.chapters[target]
+    if not kobo_source:
+        return member
+    said = kobo_source.split('#')[0]
+    kc = book.chapter_for_source(said)
+    if kc is None:
+        return member
+    theirs = book.chapters[kc]
+    if said == theirs:
+        return member
+    n = 0
+    while n < min(len(said), len(theirs)) and said[-1 - n] == theirs[-1 - n]:
+        n += 1
+    said_head, theirs_head = said[:len(said) - n], theirs[:len(theirs) - n]
+    if not member.startswith(theirs_head):
+        return member
+    candidate = said_head + member[len(theirs_head):]
+    return candidate if book.chapter_for_source(candidate) == target else member
+
+
+def kobo_location(epub, chapter, anchor, kepub=None, kobo_source=None):
+    '''CalibReader's place (`chapter` in the app's numbering, `anchor` its
+    textAnchor) -> the bookmark to PUT to Calibre-Web, or None:
+    {'type', 'value', 'source', 'progressPercent', 'contentSourceProgressPercent',
+     'precision', 'chapter', 'anchor'}.
+
+    With a KEPUB (`kepub`, the file Calibre-Web served the Kobo): the KoboSpan the
+    app's character is in: of the chapter's spans (kepub_spans), the one with the
+    largest anchor <= `anchor`; before the first span, the first span when only
+    whitespace lies between. Without a KEPUB (or a chapter with no span): Source +
+    the two percentages only, Location Type and Value empty.
+
+    'anchor' is where step 1's import (map_bookmark) puts this bookmark back:
+    the span's own anchor, or the word start the chapter % lands on; at or just
+    before `anchor`. Both percentages are text fractions of that place, the
+    import's own measure (rounded to 4 decimals).'''
+    if not isinstance(chapter, int) or not (0 <= chapter < len(epub.chapters)):
+        return None
+    ct = epub.text(chapter)
+    L = ct.length
+    anchor = max(0, min(int(anchor), L))
+    lengths = epub.lengths()
+    total = float(sum(lengths)) or 1.0
+    before = sum(lengths[:chapter])
+    chosen = None
+    if kepub is not None:
+        kch, spans = kepub_spans(epub, kepub, chapter)
+        for a, sid in spans:
+            if a > anchor:
+                break
+            chosen = (a, sid)
+        if chosen is None and spans:
+            a, sid = spans[0]
+            gap = ct.text.encode('utf-16-le')[2 * anchor:2 * a].decode('utf-16-le', 'replace')
+            if not gap.strip():
+                chosen = (a, sid)
+    if chosen is not None:
+        back, sid = chosen
+        return {
+            'type': 'KoboSpan', 'value': sid, 'source': mirror_source(kepub, kobo_source, kch),
+            'progressPercent': round(100.0 * (before + back) / total, 4),
+            'contentSourceProgressPercent': round(100.0 * back / L, 4) if L else 0.0,
+            'precision': SPAN, 'chapter': chapter, 'anchor': back,
+        }
+    if anchor >= L:
+        cpct = 100.0
+        back = L
+    else:
+        w = _word_back(ct, anchor)
+        # +½ character: step 1's int(L * % / 100) must give w itself, not w - 1
+        cpct = round(100.0 * (w + 0.5) / L, 4)
+        back = ct.word_start(int(L * cpct / 100.0)) if cpct < 100 else L
+    return {
+        'type': '', 'value': '', 'source': mirror_source(epub, kobo_source, chapter),
+        'progressPercent': round(100.0 * (before + back) / total, 4),
+        'contentSourceProgressPercent': cpct,
+        'precision': CHAPTER_PERCENT, 'chapter': chapter, 'anchor': back,
     }

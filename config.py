@@ -1,4 +1,4 @@
-# Last modified: 2026-11-02--1446
+# Last modified: 2026-11-05--0413
 #
 # config.py — the plugin's settings dialog (Preferences > Plugins > CalibReader
 # Sync > Customize, or the "Settings…" item in the toolbar button's menu).
@@ -15,6 +15,10 @@
 # 1.4.0 (tester preview): the Kobo section keeps Calibre-Web's app.db path in the
 # plugin's own prefs (ui.PREFS['kobo'], per library folder): it is this computer's.
 # Off unless a path is set.
+#
+# 1.5.0 (tester preview): "Also send CalibReader's place to the Kobo", unchecked
+# by default (nothing is ever sent while it is off), and Calibre-Web's address
+# (default http://127.0.0.1:8083). Both in the same per-library Kobo prefs.
 #
 # 1.3.1: no read column is pre-selected or saved unless the user picks one (H1);
 # a chosen column that can't be used means read status is not synced (M1); OK
@@ -45,6 +49,10 @@ except ImportError:  # pragma: no cover - standalone / test import
         MAX_THRESHOLD, POSITIONS_FILE, READ_COLUMN, READ_TYPES, SETTINGS_KEY, eligible_columns,
         normalise_settings, read_column_hint, settings_to_store, suggest_column,
     )
+try:
+    from calibre_plugins.calibreader_sync.kobo_push import DEFAULT_CALIBRE_WEB
+except ImportError:  # pragma: no cover - standalone / test import
+    from kobo_push import DEFAULT_CALIBRE_WEB
 
 # What "Create column…" proposes. The user can rename them in calibre's dialog.
 NEW_COLUMNS = {
@@ -165,6 +173,23 @@ class ConfigWidget(QWidget):
         self.kobo_user.setPlaceholderText('Whose Kobo CalibReader follows (needed when Calibre-Web has several users)')
         grid.addWidget(QLabel('Calibre-Web user:', self), 1, 0)
         grid.addWidget(self.kobo_user, 1, 1)
+        grid.setColumnStretch(1, 1)
+        v.addLayout(grid)
+        # 1.5.0: the other way, off unless the user ticks it.
+        self.kobo_push = QCheckBox('Also send CalibReader\'s place to the Kobo (tester preview)', self)
+        self.kobo_push.setChecked(kobo.get('push') is True)
+        v.addWidget(self.kobo_push)
+        v.addWidget(self._text(
+            'When you have read further in CalibReader than on the Kobo, calibre sends that place to '
+            'Calibre-Web, which hands it to the Kobo at its next sync. Only forward: never a place behind '
+            'the Kobo\'s. It goes through Calibre-Web\'s own Kobo connection at the address below '
+            '(app.db is still only read). To the sentence when the book has a KEPUB in this library, '
+            'otherwise to the chapter and percentage.'))
+        grid = QGridLayout()
+        self.kobo_url = QLineEdit(kobo.get('cw_url', ''), self)
+        self.kobo_url.setPlaceholderText(DEFAULT_CALIBRE_WEB)
+        grid.addWidget(QLabel('Calibre-Web address:', self), 0, 0)
+        grid.addWidget(self.kobo_url, 0, 1)
         grid.setColumnStretch(1, 1)
         v.addLayout(grid)
         v.addWidget(self._text('Saved on this computer only, for this library.'))
@@ -289,12 +314,19 @@ class ConfigWidget(QWidget):
 
     # -- Kobo (1.4.0, tester preview) -------------------------------------------
 
-    def _kobo_prefs(self):
+    def _prefs(self):
         try:
             from calibre_plugins.calibreader_sync.ui import PREFS
-        except ImportError:  # pragma: no cover
-            return {}
-        return dict(PREFS.get('kobo', {}) or {})
+        except ImportError:  # pragma: no cover - tests under calibre-debug load ui directly
+            try:
+                from ui import PREFS
+            except ImportError:
+                return None
+        return PREFS
+
+    def _kobo_prefs(self):
+        prefs = self._prefs()
+        return dict(prefs.get('kobo', {}) or {}) if prefs is not None else {}
 
     def choose_app_db(self):
         from calibre.gui2 import choose_files
@@ -304,14 +336,15 @@ class ConfigWidget(QWidget):
             self.kobo_db.setText(picked[0])
 
     def save_kobo(self):
-        try:
-            from calibre_plugins.calibreader_sync.ui import PREFS
-        except ImportError:  # pragma: no cover
+        PREFS = self._prefs()
+        if PREFS is None:  # pragma: no cover
             return
         table = dict(PREFS.get('kobo', {}) or {})
         path = self.kobo_db.text().strip()
         if path:
-            table[self.gui.library_path] = {'app_db': path, 'user': self.kobo_user.text().strip()}
+            table[self.gui.library_path] = {'app_db': path, 'user': self.kobo_user.text().strip(),
+                                            'push': bool(self.kobo_push.isChecked()),
+                                            'cw_url': self.kobo_url.text().strip()}
         else:
             table.pop(self.gui.library_path, None)
         PREFS['kobo'] = table                   # assignment commits a JSONConfig

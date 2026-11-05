@@ -1,4 +1,4 @@
-# Last modified: 2026-11-02--1446
+# Last modified: 2026-11-05--0413
 #
 # CalibReader Sync — the toolbar action (GUI only).
 # calibre imports this module only in its main window, through
@@ -16,6 +16,12 @@
 # v1.3.0: read status goes into the column picked in Settings; the plugin keeps
 # its read-flag memory per column ('applied' for #read_status as before,
 # 'applied_cols' for the others; sync_core.flag_blobs_from_prefs).
+#
+# v1.5.0 (tester preview): with Settings -> Kobo "Also send CalibReader's place to
+# the Kobo" on (off by default), a run also sends the app's places to the Kobo
+# through Calibre-Web (kobo_push.sync_kobo). What was sent is remembered per
+# library folder in this plugin's prefs ('kobo_pushed'), so the import does not
+# read our own push back as a Kobo move.
 #
 # v1.3.1: one run is sync_core.sync_library (tested under real calibre in
 # tests/test_real_calibre.py). The first sync into a chosen read column waits for
@@ -53,9 +59,9 @@ except ImportError:  # pragma: no cover - standalone / test import
         normalise_settings, sync_library,
     )
 try:
-    from calibre_plugins.calibreader_sync.kobo_import import import_positions as import_kobo_positions
+    from calibre_plugins.calibreader_sync.kobo_push import calibre_web_url, push_enabled, sync_kobo
 except ImportError:  # pragma: no cover - standalone / test import
-    from kobo_import import import_positions as import_kobo_positions
+    from kobo_push import calibre_web_url, push_enabled, sync_kobo
 
 # Per-book bookkeeping lives in the plugin's OWN prefs, never in the user's
 # library: adding a column to someone's library to track sync state is not
@@ -73,7 +79,12 @@ CHANGE_LOGS = os.path.join(config_dir, 'plugins', CHANGE_LOG_DIR)
 # 1.4.0 (tester preview): Kobo reading places from Calibre-Web, per library
 # folder: PREFS['kobo'] = {library path: {'app_db': path, 'user': name or ''}}.
 # This computer's path, so not in the library. Off unless a path is set.
+# 1.5.0: the entry also holds 'push' (True only when the user ticked "Also send
+# CalibReader's place to the Kobo"; off by default) and 'cw_url' (Calibre-Web's
+# address, '' = http://127.0.0.1:8083). PREFS['kobo_pushed'] = {library path:
+# {uuid: what was sent}}: the echo guard's memory (never the shared sidecar).
 PREFS.defaults['kobo'] = {}
+PREFS.defaults['kobo_pushed'] = {}
 
 
 def kobo_settings(library_path):
@@ -169,8 +180,11 @@ class CalibReaderSyncAction(InterfaceAction):
 
     def _run_kobo(self, api):
         '''Kobo places from Calibre-Web's app.db into CalibReader_positions.json
-        (1.4.0 tester preview), before the sync reads that file. None when not set up.'''
-        kobo = kobo_settings(self.gui.library_path)
+        (1.4.0 tester preview), before the sync reads that file; then (1.5.0, only
+        when the user turned it on) the app's places to the Kobo through
+        Calibre-Web. -> (import result, push result or None), or None when not set up.'''
+        library = self.gui.library_path
+        kobo = kobo_settings(library)
         if not kobo:
             return None
         ids = api.all_book_ids()
@@ -180,18 +194,28 @@ class CalibReaderSyncAction(InterfaceAction):
                 return None
             return (api.field_for('uuid', book_id), api.format_abspath(book_id, 'EPUB'),
                     api.format_abspath(book_id, 'KEPUB'))
-        return import_kobo_positions(self.gui.library_path, kobo['app_db'], lookup, user=kobo.get('user') or None)
+        pushed = dict(PREFS.get('kobo_pushed', {}) or {})
+        memory = dict(pushed.get(library) or {})
+        before = dict(memory)
+        kres, pres = sync_kobo(library, kobo['app_db'], lookup, user=kobo.get('user') or None,
+                               push=push_enabled(kobo), base_url=calibre_web_url(kobo), memory=memory)
+        if memory != before:
+            pushed[library] = memory
+            PREFS['kobo_pushed'] = pushed       # assignment commits a JSONConfig
+        return kres, pres
 
     def _run(self, api, settings=None, approve=None):
         # settings: unused since 1.3.1 (sync_library reads the library's own); kept so
         # callers written for 1.3.0 still work.
-        # 1.4.0 L2: the Kobo import never stops the read-status sync.
+        # 1.4.0 L2: the Kobo import (and 1.5.0's push) never stops the read-status sync.
         try:
-            kres, kobo_error = self._run_kobo(api), None
+            kobo, kobo_error = self._run_kobo(api), None
         except Exception as exc:
-            kres, kobo_error = None, 'Kobo import failed ({}); read status and progress still synced.'.format(exc)
+            kobo, kobo_error = None, 'Kobo sync failed ({}); read status and progress still synced.'.format(exc)
+        kres, pres = kobo if kobo is not None else (None, None)
         # L1: a run maps at most kobo_import.MAX_BOOKS books; the rest follow soon.
-        if kres is not None and kres.more:
+        # A refused or failing run never sets `more` (N1), so this never loops.
+        if (kres is not None and kres.more) or (pres is not None and pres.more):
             self._kick.start(AUTO_DELAY_MS)
         res = sync_library(api, self.gui.library_path, PREFS, log_dir=CHANGE_LOGS, approve=approve)
         if res.columns_written:
@@ -199,6 +223,10 @@ class CalibReaderSyncAction(InterfaceAction):
         if kres is not None:
             res.notes.extend(kres.notes)
             res.kobo_imported = len(kres.written)
+        if pres is not None:
+            res.notes.extend(pres.notes)
+            res.kobo_pushed = len(pres.sent)
+            res.kobo_push_lines = list(pres.lines)
         if kobo_error:
             res.notes.append(kobo_error)
         return res

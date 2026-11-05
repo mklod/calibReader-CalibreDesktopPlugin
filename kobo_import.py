@@ -1,4 +1,4 @@
-# Last modified: 2026-11-02--1916
+# Last modified: 2026-11-05--0413
 #
 # kobo_import.py — Kobo reading positions (Calibre-Web's app.db) into
 # CalibReader_positions.json, the sidecar the CalibReader apps already read.
@@ -24,6 +24,11 @@
 # `python3 kobo_import.py --library <folder> --app-db <app.db> [--user <name>]`
 # runs one import outside calibre (metadata.db opened read-only to find the
 # books); inside calibre ui.py calls import_positions with the db API.
+#
+# 1.5.0 (step 2, CalibReader -> Kobo, kobo_push.py): `--push` also sends the
+# app's places to the Kobo through Calibre-Web's own Kobo API. The import skips
+# a Kobo bookmark that is our own push coming back (is_echo: Calibre-Web stamps
+# it with server time, so it looks newer than the app's place).
 #
 # Copyright (C) 2026 CalibReader
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU General
@@ -158,22 +163,9 @@ def read_kobo_bookmarks(app_db, user=None):
     finally:
         con.close()
     names = {uid: name for uid, name, _ in users}
-    # Calibre-Web's anonymous account ("Guest", ROLE_ANONYMOUS = 32) is nobody's Kobo.
-    people = sorted(uid for uid, name, role in users
-                    if not ((role or 0) & 32) and (name or '').lower() != 'guest')
-    with_places = sorted({r[0] for r in raw})
-    if user:
-        uid = next((i for i, n in names.items() if (n or '').lower() == user.lower()), None)
-        if uid is None:
-            return [], None, ['No Calibre-Web user named "{}" in app.db.'.format(user)]
-    elif not with_places:
+    uid, notes = pick_user(users, sorted({r[0] for r in raw}), user)
+    if uid is None:
         return [], None, notes
-    elif len(people) == 1 and with_places == people:
-        uid = with_places[0]
-    else:
-        # L4: never pick one silently (two people, one Kobo, one library).
-        return [], None, ['Several Calibre-Web users ({}): choose in Settings whose Kobo places CalibReader '
-                          'should follow.'.format(', '.join(sorted(names.get(u, str(u)) for u in people)))]
     rows = {}
     for (u, book_id, lm, src, ltype, val, pct, cpct) in raw:
         if u != uid:
@@ -185,6 +177,30 @@ def read_kobo_bookmarks(app_db, user=None):
         if prev is None or _is_newer(stamp, prev['updated_at']):
             rows[book_id] = row
     return sorted(rows.values(), key=lambda r: r['book_id']), names.get(uid), notes
+
+
+def pick_user(users, with_rows, user=None):
+    """-> (user id or None, notes). `users`: (id, name, role) rows of app.db's
+    user table; `with_rows`: ids of the users that have Kobo rows. An explicit
+    `user` (Settings) is looked up by name; otherwise the single real person,
+    when the rows are theirs. Several people: never picked silently (L4)."""
+    names = {uid: name for uid, name, _ in users}
+    # Calibre-Web's anonymous account ("Guest", ROLE_ANONYMOUS = 32) is nobody's Kobo.
+    people = sorted(uid for uid, name, role in users
+                    if not ((role or 0) & 32) and (name or '').lower() != 'guest')
+    with_rows = sorted(set(with_rows))
+    if user:
+        uid = next((i for i, n in names.items() if (n or '').lower() == user.lower()), None)
+        if uid is None:
+            return None, ['No Calibre-Web user named "{}" in app.db.'.format(user)]
+        return uid, []
+    if not with_rows:
+        return None, []
+    if len(people) == 1 and with_rows == people:
+        return with_rows[0], []
+    # L4: never pick one silently (two people, one Kobo, one library).
+    return None, ['Several Calibre-Web users ({}): choose in Settings whose Kobo places CalibReader '
+                  'should follow.'.format(', '.join(sorted(names.get(u, str(u)) for u in people)))]
 
 
 def _load_positions(path):
@@ -257,12 +273,14 @@ def _library_uuid(folder):
         return None
 
 
-def other_library(app_db, library_path):
-    """Calibre-Web's app.db book ids are calibre ids of the library IT serves
-    (settings.config_calibre_dir). When that folder is visible here and holds a
-    metadata.db with a different library_id, the ids belong to another library:
-    return a note (and import nothing). A path not visible here (Docker's
-    /books) or the same library under another mount is accepted."""
+def served_library(app_db, library_path):
+    """-> (state, folder, note). Calibre-Web's app.db book ids are calibre ids of
+    the library IT serves (settings.config_calibre_dir). state:
+      'same'    that folder is this library (same path, or a visible folder
+                whose metadata.db has the same library_id);
+      'other'   a visible folder with a different library_id (note says so);
+      'unknown' not visible here (Docker's /books, another computer) or no
+                library_id to compare."""
     try:
         con = _connect_ro(app_db)
         try:
@@ -270,17 +288,28 @@ def other_library(app_db, library_path):
         finally:
             con.close()
     except sqlite3.Error:
-        return None
+        return 'unknown', None, None
     served = row[0] if row else None
+    if served and os.path.realpath(served) == os.path.realpath(library_path):
+        return 'same', served, None
     if not served or not os.path.isfile(os.path.join(served, 'metadata.db')):
-        return None
-    if os.path.realpath(served) == os.path.realpath(library_path):
-        return None
+        return 'unknown', served, None
     theirs, ours = _library_uuid(served), _library_uuid(library_path)
     if theirs and ours and theirs != ours:
-        return ('This Calibre-Web serves another calibre library ({}); Kobo places not imported. '
-                'Open that library in calibre, or point Settings at the right app.db.'.format(served))
-    return None
+        return 'other', served, ('This Calibre-Web serves another calibre library ({}); Kobo places not imported. '
+                                 'Open that library in calibre, or point Settings at the right app.db.'.format(served))
+    if theirs and ours:
+        return 'same', served, None
+    return 'unknown', served, None
+
+
+def other_library(app_db, library_path):
+    """When Calibre-Web's library folder is visible here and holds a metadata.db
+    with a different library_id, the ids belong to another library: a note (and
+    nothing is imported). A path not visible here (Docker's /books) or the same
+    library under another mount is accepted."""
+    state, _, note = served_library(app_db, library_path)
+    return note if state == 'other' else None
 
 
 # N1: books whose Kobo place failed to map (or was refused) in this calibre
@@ -303,6 +332,33 @@ MAX_BOOKS = 25                             # L1: books mapped per run (the rest 
 DISTRUST_POINTS = 25.0                     # M5: location vs ProgressPercent, in % points
 
 
+ECHO_POINTS = 1.0                          # step 2: % tolerance of a no-KEPUB echo
+
+
+def is_echo(row, record):
+    """Step 2's echo guard: is this Kobo bookmark (app.db row) our own push
+    (`record`, kept per book by kobo_push) coming back? A KoboSpan push: the
+    same Type, Value and Source (the span is the place; a Kobo may send its own
+    % with it). A push without a KEPUB (Value empty): the same Location AND both
+    % within ECHO_POINTS, because Calibre-Web keeps our Location when a later
+    Kobo PUT has none, and a Kobo that moved by % only must still be imported."""
+    if not isinstance(record, dict):
+        return False
+    if ((row.get('location_type') or ''), (row.get('location_value') or ''), (row.get('location_source') or '')) != (
+            (record.get('type') or ''), (record.get('value') or ''), (record.get('source') or '')):
+        return False
+    if record.get('value'):
+        return True
+    for got, sent in ((row.get('progress_percent'), record.get('progressPercent')),
+                      (row.get('content_source_progress_percent'), record.get('contentSourceProgressPercent'))):
+        try:
+            if abs(float(got) - float(sent)) > ECHO_POINTS:
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
 def _row_has_location(row):
     return bool((row.get('location_source') or '').strip() or (row.get('location_value') or '').strip())
 
@@ -315,11 +371,14 @@ def _same_location(row, entry):
         row['location_type'], row['location_value'], row['location_source'])
 
 
-def import_positions(library_path, app_db, lookup, user=None, log=None, max_books=MAX_BOOKS, now=None):
+def import_positions(library_path, app_db, lookup, user=None, log=None, max_books=MAX_BOOKS, now=None,
+                     pushed=None):
     '''One import. `lookup(book_id)` -> (uuid, epub path or None, kepub path or
     None), or None for a book not in this library. Maps first (slow: EPUB
     parsing), then re-reads the positions file and merges against THAT copy
-    just before writing (M1), so an app upload landing meanwhile is kept.'''
+    just before writing (M1), so an app upload landing meanwhile is kept.
+    `pushed`: kobo_push's memory {uuid (lower case): what we last PUT}; a Kobo
+    bookmark equal to it is our own push, not a Kobo move (step 2 echo guard).'''
     res = KoboImportResult()
     mismatch = other_library(app_db, library_path) if app_db and os.path.isfile(app_db) else None
     if mismatch:
@@ -358,6 +417,9 @@ def import_positions(library_path, app_db, lookup, user=None, log=None, max_book
         current = data['positions'].get(keys.get(uuid.lower(), uuid))
         if isinstance(current, dict) and not _is_newer(row['updated_at'], current.get('updated_at')):
             continue                      # the sidecar's place is as new or newer
+        if pushed and is_echo(row, pushed.get(uuid.lower())):
+            res.skipped[uuid] = 'our own push to the Kobo coming back (echo), not a Kobo move'
+            continue
         has_loc = _row_has_location(row)
         pct = row['progress_percent']
         if not has_loc and (pct is None or pct <= 0 or pct >= 100):
@@ -500,12 +562,25 @@ def metadata_lookup(library_path):
 
 def main(argv=None):  # pragma: no cover - CLI
     import argparse
-    ap = argparse.ArgumentParser(description='Import Kobo reading places from Calibre-Web into CalibReader_positions.json')
+    try:
+        from calibre_plugins.calibreader_sync import kobo_push
+    except ImportError:  # standalone
+        import kobo_push
+    ap = argparse.ArgumentParser(description='Import Kobo reading places from Calibre-Web into CalibReader_positions.json'
+                                             ' (and, with --push, send CalibReader\'s places to the Kobo)')
     ap.add_argument('--library', required=True)
     ap.add_argument('--app-db', required=True)
     ap.add_argument('--user')
+    ap.add_argument('--push', action='store_true',
+                    help='also send CalibReader\'s place to the Kobo through Calibre-Web (tester preview; off without it)')
+    ap.add_argument('--calibre-web', default=kobo_push.DEFAULT_CALIBRE_WEB,
+                    help='Calibre-Web address (default %(default)s)')
+    ap.add_argument('--state', default=kobo_push.DEFAULT_STATE_FILE,
+                    help='where the places sent to the Kobo are remembered (default %(default)s)')
     a = ap.parse_args(argv)
-    res = import_positions(a.library, a.app_db, metadata_lookup(a.library), user=a.user, log=print)
+    state = kobo_push.load_state(a.state, a.library)
+    res, pres = kobo_push.sync_kobo(a.library, a.app_db, metadata_lookup(a.library), user=a.user, push=a.push,
+                                    base_url=a.calibre_web, memory=state.memory, log=print)
     for n in res.notes:
         print('note:', n)
     for k, why in res.skipped.items():
@@ -513,6 +588,16 @@ def main(argv=None):  # pragma: no cover - CLI
     print('user={} written={}'.format(res.user, res.written))
     for u, e in res.mapped.items():
         print(json.dumps({u: e}, ensure_ascii=False))
+    if pres is not None:
+        for n in pres.notes:
+            print('push note:', n)
+        for k, why in sorted(pres.skipped.items()):
+            print('not sent {}: {}'.format(k, why))
+        for line in pres.lines:
+            print(line)
+        print('sent={}'.format(pres.sent))
+        if pres.sent:
+            state.save()
     return 0
 
 
