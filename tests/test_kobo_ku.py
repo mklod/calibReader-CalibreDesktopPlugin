@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--1258
+# Last modified: 2026-11-05--1315
 #
 # test_kobo_ku.py — the Kobo Utilities (USB) route, Kobo -> CalibReader (plugin 1.7.0, tester
 # preview): kobo_ku.py. Design: docs/handoffs/104-kobo-sync/KOBO-UTILITIES.md section 8.
@@ -1630,6 +1630,22 @@ class EditedBookTests(ImportBase):
         e = self.entry()
         self.assertEqual((e['textAnchor'], e['kobo']['precision']), (0, kobo_ku.CHAPTER))
         self.assertTrue(self.memory[self.uuids[1].lower()].get('edited'))
+
+    def test_b_after_recheck_only_an_epub_newer_than_the_recheck_too_is_flagged(self):
+        # re-review round 5: a Kobo probably keeps a replaced book's original DateCreated, so a re-sent
+        # edited book still "looks" older than its EPUB; after "Re-check numbering" the EPUB must also be
+        # newer than the time Re-check was clicked
+        copies = {1: datetime.datetime(2026, 9, 1, tzinfo=UTC).timestamp()}     # the Kobo's (original) date
+        self.run_import({1: (self.PRESENT, None, '2026-11-01T08:00:00Z')}, kobo_copies=copies)
+        self.assertEqual(self.entry()['kobo']['precision'], kobo_ku.CHAPTER)     # flagged (EPUB of 2026-10-01)
+        kobo_ku.reset_numbering(self.memory, now=datetime.datetime(2026, 10, 15, tzinfo=UTC))   # sent again, Re-check
+        self.memory['.'].update(spans=10, missing=0, decided=True)
+        self.run_import({1: (self.OTHER, None, '2026-11-01T09:00:00Z')}, kobo_copies=copies)
+        self.assertEqual(self.entry()['kobo']['precision'], kobo_ku.SPAN)        # not flagged again
+        self.assertEqual(self.memory['.']['rechecked_at'], '2026-10-15T00:00:00.000Z')
+        self.edited('2026-10-20')                                                # edited after the Re-check
+        self.run_import({1: (self.PRESENT, None, '2026-11-01T10:00:00Z')}, kobo_copies=copies)
+        self.assertEqual(self.entry()['kobo']['precision'], kobo_ku.CHAPTER)
 
     def test_b_a_kobo_copy_newer_than_the_epub_changes_nothing(self):
         copies = {1: datetime.datetime(2026, 10, 15, tzinfo=UTC).timestamp()}   # sent after the last edit
