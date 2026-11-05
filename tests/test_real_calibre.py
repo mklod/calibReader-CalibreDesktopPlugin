@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0721
+# Last modified: 2026-11-05--0845
 #
 # test_real_calibre.py — CalibReader Sync against REAL calibre (LibraryDatabase, set_field,
 # metadata.db, JSONConfig, the Settings widget), not the in-memory FakeDB of sync_core.py.
@@ -505,8 +505,19 @@ class RealServiceTests(RealKoboRunTests):
         open(path, 'wb').close()
 
     def plugin_installed(self):
+        import zipfile
         os.makedirs(os.path.dirname(self.zip), exist_ok=True)
-        open(self.zip, 'wb').close()
+        with zipfile.ZipFile(self.zip, 'w') as z:            # S5: the job checks it is >= 1.6.0
+            with open(os.path.join(REPO, '__init__.py'), 'rb') as f:
+                z.writestr('__init__.py', f.read())
+            z.writestr('kobo_service.py', '# the job\n')
+
+    def heartbeat(self, seconds_ago=0):
+        import kobo_service
+        t = datetime.datetime.now(UTC) - datetime.timedelta(seconds=seconds_ago)
+        iso = t.strftime('%Y-%m-%dT%H:%M:%S.') + '{:03d}Z'.format(t.microsecond // 1000)
+        kobo_service.save_state(self.lib.path, {'last_run_at': iso, 'last_ok_at': iso, 'status': 'done',
+                                                'summary': '0 places imported, 0 sent'})
 
     def positions(self):
         with open(os.path.join(self.lib.path, 'CalibReader_positions.json'), 'rb') as f:
@@ -515,6 +526,7 @@ class RealServiceTests(RealKoboRunTests):
     def test_with_the_job_installed_automatic_runs_leave_the_kobo_to_it(self):
         self.set_kobo(push=True, push_since=self.SINCE, service=True)
         self.plist_present()
+        self.heartbeat()                                     # S1: a good job run in the last 15 minutes
         res = self.run_ui()                                  # start-up / poll / follow-up kick
         self.wait_push()
         self.assertFalse(res.kobo_push_started)
@@ -523,6 +535,14 @@ class RealServiceTests(RealKoboRunTests):
         pres = self.wait_push()
         self.assertTrue(res.kobo_push_started, res.notes)
         self.assertEqual((len(pres.sent), len(self.cw.requests)), (1, 1))
+
+    def test_S1_a_job_that_has_not_run_well_lately_leaves_the_kobo_to_calibre(self):
+        # review S1: launchd could not start it, or it died: calibre's own automatic runs resume.
+        self.set_kobo(push=True, push_since=self.SINCE, service=True)
+        self.plist_present()
+        self.heartbeat(seconds_ago=16 * 60)
+        self.run_ui()
+        self.assertEqual(len(self.wait_push().sent), 1)
 
     def test_without_the_plist_calibre_keeps_doing_it(self):
         self.set_kobo(push=True, push_since=self.SINCE, service=True)    # ticked, but not on disk
@@ -1051,6 +1071,34 @@ class RealSettingsDialogTests(RealCalibreBase):
                 w.save_kobo()
                 self.assertEqual(uninstall.call_count, calls + 1)
                 self.assertNotIn(self.lib.path, PREFS['kobo'])
+        finally:
+            PREFS['kobo'] = {}
+
+    def test_S5_every_background_job_is_listed_with_a_remove_button(self):
+        # review S5: jobs for renamed or removed libraries too, each with Remove (macOS).
+        import kobo_service
+        from qt.core import QLabel, QPushButton
+        from ui import PREFS
+        gone = os.path.join(os.path.dirname(self.lib.path), 'Renamed Library')
+        jobs = [{'label': 'com.calibreader.sync.kobo.aaaaaaaaaaaa', 'library': self.lib.path, 'loaded': True,
+                 'library_exists': True, 'plist': 'a.plist'},
+                {'label': 'com.calibreader.sync.kobo.bbbbbbbbbbbb', 'library': gone, 'loaded': True,
+                 'library_exists': False, 'plist': 'b.plist'}]
+        try:
+            PREFS['kobo'] = {gone: {'app_db': 'x', 'service': True}}
+            with mock.patch.object(kobo_service, 'supported', return_value=True), \
+                    mock.patch.object(kobo_service, 'installed_jobs', return_value=jobs), \
+                    mock.patch.object(kobo_service, 'status_text', return_value='Background job: off.'), \
+                    mock.patch.object(kobo_service, 'remove_job', return_value=(True, 'removed')) as remove:
+                w = self.widget()
+                text = ' '.join(label.text() for label in w.findChildren(QLabel))
+                self.assertIn(gone, text)
+                self.assertIn('folder not found', text)
+                buttons = [b for b in w.findChildren(QPushButton) if b.text() == 'Remove']
+                self.assertEqual(len(buttons), 2)
+                buttons[1].click()
+                remove.assert_called_once_with('com.calibreader.sync.kobo.bbbbbbbbbbbb')
+                self.assertIs(PREFS['kobo'][gone]['service'], False)
         finally:
             PREFS['kobo'] = {}
 

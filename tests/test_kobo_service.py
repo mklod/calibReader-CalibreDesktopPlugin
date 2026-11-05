@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0802
+# Last modified: 2026-11-05--0845
 #
 # Step 3 (plugin 1.6.0, tester preview): the Kobo sync without calibre running.
 # kobo_service.run_once is what the launchd job runs (calibre-debug -e <copy>/kobo_service.py
@@ -11,14 +11,19 @@
 
 import contextlib
 import datetime
+import errno
 import hashlib
 import io
 import json
 import os
 import plistlib
 import shutil
+import signal
+import sqlite3
 import subprocess
 import sys
+import unicodedata
+import zipfile
 import tempfile
 import threading
 import time
@@ -56,6 +61,27 @@ def sha(path):
         return hashlib.sha256(f.read()).hexdigest()
 
 
+FAKE_DEBUG = '/Applications/calibre.app/Contents/MacOS/calibre-debug'
+
+
+def make_plugin_zip(path, version=(1, 6, 0), with_service=True):
+    '''calibre's installed plugin, as calibre keeps it: <config>/plugins/CalibReader Sync.zip.'''
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with zipfile.ZipFile(path, 'w') as z:
+        z.writestr('__init__.py', "class CalibReaderSyncPlugin(object):\n    version               = ({}, {}, {})\n"
+                   .format(*version))
+        if with_service:
+            z.writestr('kobo_service.py', '# the 1.6.0 job\n')
+
+
+def heartbeat(library, seconds_ago=0):
+    '''The job's state as a successful run leaves it.'''
+    t = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=seconds_ago)
+    iso = t.strftime('%Y-%m-%dT%H:%M:%S.') + '{:03d}Z'.format(t.microsecond // 1000)
+    kobo_service.save_state(library, {'last_run_at': iso, 'last_ok_at': iso, 'status': 'done',
+                                      'summary': '0 places imported, 0 sent', 'note': ''})
+
+
 class EnvMixin(object):
     '''Every path of the job in a temp folder (never ~/Library).'''
 
@@ -79,14 +105,14 @@ class ServiceBase(EnvMixin, tkp.PushBase):
         self.start_env(self.dir)
         self.config = os.path.join(self.dir, 'calibre-config')
         os.makedirs(os.path.join(self.config, 'plugins'))
-        open(os.path.join(self.config, 'plugins', kobo_service.PLUGIN_ZIP), 'wb').close()
+        make_plugin_zip(os.path.join(self.config, 'plugins', kobo_service.PLUGIN_ZIP))
         self.metadata_db()                      # the job looks books up in metadata.db (read-only)
         self.set_prefs(service=True)
 
-    def set_prefs(self, **extra):
+    def set_prefs(self, pushed=None, **extra):
         entry = {'app_db': self.app_db, 'user': 'admin', 'cw_url': self.cw.url}
         entry.update(extra)
-        prefs = {'kobo': {self.lib: entry}, 'kobo_pushed': {}, 'libraries': {}}
+        prefs = {'kobo': {self.lib: entry}, 'kobo_pushed': pushed or {}, 'libraries': {}}
         with open(kobo_service.prefs_path(self.config), 'w', encoding='utf-8', newline='\n') as f:
             json.dump(prefs, f, indent=2)        # calibre's JSONConfig writes plain JSON like this
 
@@ -439,6 +465,8 @@ class FakeLaunchctl(object):
         self.calls = []
         self.loaded = set()
         self.bootstrap_code = bootstrap_code
+        self.last_exit = '(never exited)'
+        self.on_bootstrap = None
 
     def __call__(self, args, timeout=15):
         self.calls.append(list(args))
@@ -447,7 +475,10 @@ class FakeLaunchctl(object):
             if self.bootstrap_code:
                 return self.bootstrap_code, 'Bootstrap failed: 5: Input/output error'
             with open(args[3], 'rb') as f:
-                self.loaded.add(plistlib.load(f)['Label'])
+                plist = plistlib.load(f)
+            if self.on_bootstrap:
+                self.on_bootstrap(plist)
+            self.loaded.add(plist['Label'])
             return 0, ''
         if verb == 'bootout':
             label = args[2].split('/')[-1]
@@ -456,14 +487,17 @@ class FakeLaunchctl(object):
                 return 0, ''
             return 3, 'Boot-out failed: 3: No such process'
         if verb == 'print':
-            return (0, 'state = not running') if args[2].split('/')[-1] in self.loaded else (113, 'Could not find')
+            if args[2].split('/')[-1] in self.loaded:
+                return 0, 'state = not running\n\tlast exit code = {}\n'.format(self.last_exit)
+            return 113, 'Could not find service'
+
         return 64, 'unknown'
 
     def verbs(self):
         return [c[1] for c in self.calls]
 
 
-class InstallerTests(EnvMixin, unittest.TestCase):
+class InstallerBase(EnvMixin, unittest.TestCase):
 
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix='kobo-install-')
@@ -476,8 +510,12 @@ class InstallerTests(EnvMixin, unittest.TestCase):
         self.launchctl = FakeLaunchctl()
 
     def install(self, **kw):
+        kw.setdefault('debug', FAKE_DEBUG)
         return kobo_service.install(self.lib, self.config, self.app_db, repo_reader, run=self.launchctl,
                                     sleep=lambda s: None, **kw)
+
+
+class InstallerTests(InstallerBase):
 
     def test_the_label_is_per_library(self):
         label = kobo_service.label_for(self.lib)
@@ -504,13 +542,21 @@ class InstallerTests(EnvMixin, unittest.TestCase):
         self.assertEqual(p['ProcessType'], 'Background')
         plistlib.loads(plistlib.dumps(p))                        # a valid plist
 
-    def test_program_args_use_calibre_debug_then_python3(self):
+    def test_program_args_run_calibre_debug(self):
         script = os.path.join(kobo_service.service_dir(), 'kobo_service.py')
         args = kobo_service.program_args(self.lib, self.config, debug='/Apps/calibre-debug')
         self.assertEqual(args, ['/Apps/calibre-debug', '-e', script, '--', 'run', '--library', self.lib,
                                 '--config-dir', self.config])
-        args = kobo_service.program_args(self.lib, self.config, debug='', python='/usr/bin/python3')
-        self.assertEqual(args, ['/usr/bin/python3', script, 'run', '--library', self.lib, '--config-dir', self.config])
+
+    def test_N1_no_python3_fallback_install_refuses_without_calibre_debug(self):
+        # review N1: /usr/bin/python3 is the developer-tools stub or Python 3.9 on a stock Mac, and
+        # Python <= 3.10 parses none of the stamps: no job rather than a job that does nothing.
+        with mock.patch.object(kobo_service, 'find_calibre_debug', return_value=None):
+            ok, message = self.install(debug=None)
+        self.assertFalse(ok)
+        self.assertIn('calibre-debug', message)
+        self.assertEqual(self.launchctl.calls, [])
+        self.assertFalse(os.path.exists(kobo_service.plist_path(kobo_service.label_for(self.lib))))
 
     def test_install_copies_the_modules_writes_the_plist_and_loads_it(self):
         ok, message = self.install()
@@ -529,6 +575,7 @@ class InstallerTests(EnvMixin, unittest.TestCase):
                                       kobo_service.plist_path(label)]])
         self.assertLess(self.launchctl.verbs().index('bootout'), self.launchctl.verbs().index('bootstrap'))
         self.assertIn(label, self.launchctl.loaded)
+        heartbeat(self.lib)
         self.assertTrue(kobo_service.installed_here(self.lib, {'service': True}))
         self.assertFalse(kobo_service.installed_here(self.lib, {'service': False}))
 
@@ -579,9 +626,11 @@ class InstallerTests(EnvMixin, unittest.TestCase):
     def test_the_status_line(self):
         self.assertIn('off', kobo_service.status_text(self.lib, run=self.launchctl))
         self.install()
-        self.assertIn('Not run yet', kobo_service.status_text(self.lib, run=self.launchctl))
-        kobo_service.save_state(self.lib, {'last_run_at': kobo_service.now_iso(), 'status': 'done',
-                                           'summary': '1 place imported, 0 sent', 'note': ''})
+        self.assertIn('starting', kobo_service.status_text(self.lib, run=self.launchctl))
+        heartbeat(self.lib)
+        state = kobo_service.load_state(self.lib)
+        state['summary'] = '1 place imported, 0 sent'
+        kobo_service.save_state(self.lib, state)
         text = kobo_service.status_text(self.lib, run=self.launchctl)
         self.assertIn('on (launchd', text)
         self.assertIn('Last run', text)
@@ -714,6 +763,311 @@ class SharedMemoryTests(ServiceBase):
         self.assertEqual(self.puts(), [])
         self.assertFalse(os.path.exists(self.positions_path) and
                          kobo_import.KOBO_DEVICE_ID in open(self.positions_path, encoding='utf-8').read())
+
+
+# -- fix round 1 (REVIEW-STEP3.md) -----------------------------------------------------------------
+
+class ReviewB1Tests(InstallerBase):
+    """B1: launchd opens the plist's StandardOutPath as the user when it starts the job and does
+    not create a missing folder: install() creates the log and support folders first."""
+
+    def test_B1_the_log_and_support_folders_exist_before_launchd_loads_the_job(self):
+        os.environ['CALIBREADER_SYNC_LOGS'] = os.path.join(self.dir, 'Library', 'Logs', 'CalibReaderSync')
+        os.environ['CALIBREADER_SYNC_HOME'] = os.path.join(self.dir, 'Library', 'Application Support', 'CRS')
+        seen = {}
+
+        def check(plist):
+            seen['logs'] = os.path.isdir(os.path.dirname(plist['StandardOutPath']))
+            seen['home'] = os.path.isdir(kobo_service.support_dir())
+        self.launchctl.on_bootstrap = check
+        ok, message = self.install()
+        self.assertTrue(ok, message)
+        self.assertEqual(seen, {'logs': True, 'home': True})
+
+
+class ReviewB1RunTests(ServiceBase):
+
+    def test_B1_each_run_creates_them_again_if_missing(self):
+        self.assertEqual(self.run_job().status, 'done')
+        for folder in (kobo_service.log_dir(), kobo_service.support_dir()):
+            shutil.rmtree(folder)
+        self.touch_app()
+        self.assertEqual(self.run_job().status, 'done')
+        self.assertTrue(os.path.isfile(kobo_service.log_path()))
+        self.assertTrue(os.path.isdir(kobo_service.support_dir()))
+
+
+class ReviewS1Tests(InstallerBase):
+    """S1: calibre stands down only while the job is healthy (a good run in the last 15 minutes);
+    otherwise the status line says the job isn't running, with launchd's reason when it has one."""
+
+    def test_S1_calibre_stands_down_only_for_a_healthy_job(self):
+        self.install()
+        entry = {'service': True}
+        self.assertFalse(kobo_service.installed_here(self.lib, entry))      # no good run yet
+        heartbeat(self.lib)
+        self.assertTrue(kobo_service.installed_here(self.lib, entry))
+        heartbeat(self.lib, seconds_ago=16 * 60)
+        self.assertFalse(kobo_service.installed_here(self.lib, entry))
+
+    def test_S1_the_status_line_says_launchd_cannot_start_it(self):
+        self.install()
+        self.launchctl.last_exit = '78: EX_CONFIG'
+        backdate = time.time() - 600
+        os.utime(kobo_service.plist_path(kobo_service.label_for(self.lib)), (backdate, backdate))
+        text = kobo_service.status_text(self.lib, run=self.launchctl)
+        self.assertIn("isn't running", text)
+        self.assertIn('78', text)
+        self.assertIn('calibre does the Kobo work itself', text)
+
+    def test_S1_the_status_line_says_when_it_last_ran_well(self):
+        self.install()
+        heartbeat(self.lib, seconds_ago=20 * 60)
+        text = kobo_service.status_text(self.lib, run=self.launchctl)
+        self.assertIn("isn't running", text)
+        self.assertIn('last ran well', text)
+
+    def test_S1_install_refuses_calibre_in_a_disk_image_or_translocated(self):
+        for path in ('/Volumes/calibre-9.14/calibre.app/Contents/MacOS/calibre-debug',
+                     '/private/var/folders/x1/abc/T/AppTranslocation/0A1B2C3D/d/calibre.app/Contents/MacOS/'
+                     'calibre-debug'):
+            ok, message = self.install(debug=path)
+            self.assertFalse(ok, path)
+            self.assertIn('Move calibre to Applications first', message)
+            self.assertFalse(os.path.exists(kobo_service.plist_path(kobo_service.label_for(self.lib))))
+        self.assertEqual(self.launchctl.calls, [])
+
+
+class ReviewS1RunTests(ServiceBase):
+
+    def test_S1_a_good_run_is_the_heartbeat_and_a_failed_run_is_not(self):
+        self.assertEqual(self.run_job().status, 'done')
+        ok_at = kobo_service.load_state(self.lib)['last_ok_at']
+        time.sleep(0.01)
+        self.set_prefs(service=True, app_db=os.path.join(self.dir, 'nowhere', 'app.db'))
+        self.assertEqual(self.run_job().status, 'failed')
+        self.assertEqual(kobo_service.load_state(self.lib)['last_ok_at'], ok_at)
+
+
+class ReviewS2Tests(ServiceBase):
+    """S2: an import or a push that failed makes the run a failed one, and the error stays (status
+    line, state) until a run succeeds; "no change" never hides it."""
+
+    def test_S2_a_failed_import_is_a_failed_run_until_one_succeeds(self):
+        self.set_prefs(service=True, app_db=os.path.join(self.dir, 'nowhere', 'app.db'))
+        out = self.run_job()
+        self.assertEqual(out.status, 'failed')
+        out = self.run_job()                                     # nothing changed: still not "no change"
+        self.assertEqual(out.status, 'failed')
+        state = kobo_service.load_state(self.lib)
+        self.assertIn('not found', state['error'])
+        self.set_prefs(service=True)
+        self.assertEqual(self.run_job().status, 'done')
+        self.assertNotIn('error', kobo_service.load_state(self.lib))
+
+    def test_S2_a_failed_push_is_a_failed_run(self):
+        self.set_prefs(service=True, push=True, push_since=tkp.SINCE, cw_url=tkp.closed_port())
+        self.ahead_span()
+        out = self.run_job()
+        self.assertEqual(out.status, 'failed')
+        self.assertIn('did not answer', kobo_service.load_state(self.lib)['error'])
+
+    def test_S2_the_status_line_keeps_the_error(self):
+        self.set_prefs(service=True, app_db=os.path.join(self.dir, 'nowhere', 'app.db'))
+        self.run_job()
+        launchctl = FakeLaunchctl()
+        kobo_service.install(self.lib, self.config, self.app_db, repo_reader, run=launchctl,
+                             sleep=lambda s: None, debug=FAKE_DEBUG)
+        self.run_job()
+        text = kobo_service.status_text(self.lib, run=launchctl)
+        self.assertIn('not found', text)
+
+    def test_S2_unticking_sending_mid_batch_is_not_a_failure(self):
+        self.set_prefs(service=True, push=True, push_since=tkp.SINCE)
+        self.ahead_span()
+        self.kobo(62, '2026-10-30 21:03:48', tkp.CH.format(1), 'KoboSpan', 'kobo.3.5', 12.0, 3.0)
+        self.app(tkp.THIRD, 3, self.anchor_of(3, 'kobo.5.1', plus=7))
+        real = kobo_push._send
+
+        def first_then_untick(*a, **kw):
+            self.set_prefs(service=True, push=False)
+            return real(*a, **kw)
+        with mock.patch('kobo_push._send', side_effect=first_then_untick):
+            out = self.run_job()
+        self.assertEqual(out.status, 'done', out.notes)
+
+
+class ReviewS3Tests(ServiceBase):
+    """S3: macOS privacy (EPERM/EACCES on open, or sqlite "unable to open database file" for a file
+    that is there) gives one clear message naming the folder and what to do."""
+
+    def blocked(self, folder):
+        real = open
+
+        def guarded(path, *a, **kw):
+            if os.path.dirname(os.path.abspath(str(path))) == os.path.abspath(folder):
+                raise PermissionError(errno.EPERM, 'Operation not permitted', str(path))
+            return real(path, *a, **kw)
+        return mock.patch.object(kobo_service, '_open', side_effect=guarded)
+
+    def test_S3_a_library_macos_keeps_the_job_out_of(self):
+        self.kobo(60, '2026-10-30 21:03:48', tkp.CH.format(2), 'KoboSpan', 'kobo.5.1', 40.0, 3.0)
+        with self.blocked(self.lib):
+            out = self.run_job()
+        self.assertEqual(out.status, 'failed')
+        note = kobo_service.load_state(self.lib)['error']
+        self.assertTrue(note.startswith('macOS did not let the background job read '), note)
+        self.assertIn(kobo_service.scrub_line(self.lib), note)
+        self.assertIn('Full Disk Access', note)
+        self.assertFalse(os.path.exists(self.positions_path))
+
+    def test_S3_an_app_db_macos_keeps_the_job_out_of(self):
+        with self.blocked(os.path.dirname(self.app_db)):
+            out = self.run_job()
+        self.assertEqual(out.status, 'failed')
+        note = kobo_service.load_state(self.lib)['error']
+        self.assertTrue(note.startswith('macOS did not let the background job read '), note)
+        self.assertIn(kobo_service.scrub_line(os.path.dirname(self.app_db)), note)
+
+    def test_S3_sqlite_unable_to_open_a_file_that_is_there_is_the_same_message(self):
+        boom = sqlite3.OperationalError('unable to open database file')
+        with mock.patch('kobo_import.metadata_lookup', side_effect=boom):
+            out = self.run_job()
+        self.assertEqual(out.status, 'failed')
+        self.assertTrue(kobo_service.load_state(self.lib)['error'].startswith(
+            'macOS did not let the background job read '))
+
+
+class ReviewS4Tests(ServiceBase):
+    """S4: one journal-level lock around every read-modify-write: two libraries' writers in two
+    processes lose none of each other's records (the reviewer's p_journal_race2)."""
+
+    def test_S4_two_libraries_saving_one_journal_lose_nothing(self):
+        journal = os.path.join(self.dir, 'journal.json')
+        child = os.path.join(self.dir, 'journal_child.py')
+        with open(child, 'w', encoding='utf-8') as f:
+            f.write('import random, sys, time\nsys.path.insert(0, {!r})\nimport kobo_push\n'
+                    'journal, lib, rounds = sys.argv[1], sys.argv[2], int(sys.argv[3])\nerrors = 0\n'
+                    'for i in range(rounds):\n'
+                    '    st = kobo_push.load_state(journal, lib)\n'
+                    '    st.memory["book-%d" % i] = {{"pushed_at": str(i)}}\n'
+                    '    try:\n        st.save()\n    except Exception:\n        errors += 1\n'
+                    '    time.sleep(random.random() * 0.006)\n'
+                    'print("errors", errors, flush=True)\n'.format(REPO))
+        libs = [os.path.join(self.dir, 'libA'), os.path.join(self.dir, 'libB')]
+        rounds = 60
+        procs = [subprocess.Popen(py(child, journal, lib, str(rounds)), stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, text=True) for lib in libs]
+        outs = [p.communicate(timeout=300)[0] for p in procs]
+        for out in outs:
+            self.assertIn('errors 0', out, out)
+        with open(journal, encoding='utf-8') as f:
+            table = json.load(f)
+        lost = {lib: rounds - len(table.get(os.path.realpath(lib), {})) for lib in libs}
+        self.assertEqual(lost, {lib: 0 for lib in libs})
+
+
+class ReviewS5Tests(ServiceBase):
+    """S5: the job runs only for calibre's CalibReader Sync >= 1.6.0 with the box still ticked; every
+    background job is listed (renamed or removed libraries too) and can be removed."""
+
+    def test_S5_an_older_plugin_in_calibre_means_the_job_does_nothing(self):
+        make_plugin_zip(os.path.join(self.config, 'plugins', kobo_service.PLUGIN_ZIP), (1, 5, 0), with_service=False)
+        self.kobo(60, '2026-10-30 21:03:48', tkp.CH.format(2), 'KoboSpan', 'kobo.5.1', 40.0, 3.0)
+        out = self.run_job()
+        self.assertEqual(out.status, 'off')
+        self.assertIn('1.5.0', self.log_text())
+        self.assertFalse(os.path.exists(self.positions_path))
+
+    def test_S5_a_plugin_zip_that_cannot_be_read_means_nothing_this_run(self):
+        with open(os.path.join(self.config, 'plugins', kobo_service.PLUGIN_ZIP), 'wb') as f:
+            f.write(b'PK\x03\x04 half written')
+        self.kobo(60, '2026-10-30 21:03:48', tkp.CH.format(2), 'KoboSpan', 'kobo.5.1', 40.0, 3.0)
+        self.assertEqual(self.run_job().status, 'off')
+        self.assertFalse(os.path.exists(self.positions_path))
+
+    def test_S5_a_library_that_is_gone_says_so(self):
+        gone = os.path.join(self.dir, 'Renamed Library')
+        prefs = {'kobo': {gone: {'app_db': self.app_db, 'user': 'admin', 'service': True}}}
+        with open(kobo_service.prefs_path(self.config), 'w', encoding='utf-8') as f:
+            json.dump(prefs, f)
+        out = kobo_service.run_once(gone, config_dir=self.config)
+        self.assertEqual(out.status, 'failed')
+        error = kobo_service.load_state(gone)['error']
+        self.assertIn(kobo_service.scrub_line(gone), error)
+        self.assertIn('Settings', error)
+
+    def test_S5_every_job_is_listed_and_can_be_removed(self):
+        launchctl = FakeLaunchctl()
+        other = os.path.join(self.dir, 'Old Library')
+        os.mkdir(other)
+        for lib in (self.lib, other):
+            ok, message = kobo_service.install(lib, self.config, self.app_db, repo_reader, run=launchctl,
+                                               sleep=lambda s: None, debug=FAKE_DEBUG)
+            self.assertTrue(ok, message)
+        shutil.rmtree(other)                                     # renamed in calibre since
+        jobs = {j['library']: j for j in kobo_service.installed_jobs(run=launchctl)}
+        self.assertEqual(set(jobs), {self.lib, other})
+        self.assertTrue(jobs[self.lib]['library_exists'])
+        self.assertFalse(jobs[other]['library_exists'])
+        self.assertTrue(jobs[other]['loaded'])
+        ok, _ = kobo_service.remove_job(jobs[other]['label'], run=launchctl)
+        self.assertTrue(ok)
+        self.assertNotIn(jobs[other]['label'], launchctl.loaded)
+        self.assertEqual([j['library'] for j in kobo_service.installed_jobs(run=launchctl)], [self.lib])
+
+
+class ReviewNitTests(ServiceBase):
+
+    def test_N3_the_job_fills_in_from_calibres_copy_of_the_push_memory(self):
+        # calibre's PREFS copy holds our push; the journal lost its part
+        self.set_prefs(service=True, push=True, push_since=tkp.SINCE)
+        self.ahead_span()
+        self.assertEqual(self.run_job().pres.sent, [tkp.UUID])
+        record = self.journal()[tkp.UUID]
+        os.remove(kobo_service.journal_path(self.config))
+        self.set_prefs(service=True, push=True, push_since=tkp.SINCE,
+                       pushed={self.lib: {tkp.UUID: record}})
+        before = open(self.positions_path, 'rb').read()
+        out = self.run_job()
+        self.assertEqual((out.kres.written, out.pres.sent), ([], []))
+        self.assertEqual(open(self.positions_path, 'rb').read(), before)
+
+    def test_N4_the_home_folder_is_shortened_and_the_state_is_scrubbed(self):
+        home = os.path.expanduser('~')
+        self.assertEqual(kobo_service.scrub_line('note: ' + os.path.join(home, 'Books')),
+                         'note: ' + os.path.join('~', 'Books'))
+        self.set_prefs(service=True, app_db=self.dir + '/kobo/' + tkp.TOKEN + '/app.db')
+        self.run_job()
+        with open(kobo_service.state_path(self.lib), encoding='utf-8') as f:
+            self.assertNotIn(tkp.TOKEN, f.read())
+
+    def test_N5_a_kill_mid_write_leaves_no_temp_file_in_the_library(self):
+        data = {'schema': 1, 'positions': {}}
+        target = os.path.join(self.lib, 'CalibReader_positions.json')
+        with mock.patch('json.dump', side_effect=SystemExit(143)):
+            with self.assertRaises(SystemExit):
+                kobo_import._write_atomic(target, data)
+        self.assertEqual([n for n in os.listdir(self.lib) if '.crtmp.' in n], [])
+        handler = signal.getsignal(signal.SIGTERM)
+        try:
+            kobo_service.exit_on_sigterm()
+            self.assertIsNot(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
+        finally:
+            signal.signal(signal.SIGTERM, handler)
+
+    def test_N6_a_lock_that_cannot_be_made_is_a_failed_run_with_a_line(self):
+        with mock.patch.object(kobo_service.LibraryLock, 'acquire', side_effect=OSError(28, 'No space left')):
+            out = self.run_job()
+        self.assertEqual(out.status, 'failed')
+        self.assertIn('No space left', self.log_text())
+
+    def test_N8_a_decomposed_library_path_is_the_same_library(self):
+        nfc = unicodedata.normalize('NFC', os.path.join(self.dir, 'Biblioth\u00e8que calibre'))
+        nfd = unicodedata.normalize('NFD', nfc)
+        self.assertEqual(kobo_service.library_key(nfc), kobo_service.library_key(nfd))
+        prefs = {'kobo': {nfc: {'app_db': self.app_db, 'service': True}}}
+        self.assertIsNotNone(kobo_service.library_entry(prefs, nfd))
 
 
 if __name__ == '__main__':
