@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0712
+# Last modified: 2026-11-05--0851
 #
 # kobo_push.py — CalibReader's reading place to the Kobo, through Calibre-Web
 # (step 2 of the Kobo sync, plugin 1.5.0, tester preview).
@@ -68,6 +68,7 @@ try:
     from calibre_plugins.calibreader_sync.kobo_position import (
         BOOK_PERCENT, CHAPTER_PERCENT, CHAPTER_START, SPAN, Book, kobo_location, map_bookmark,
     )
+    from calibre_plugins.calibreader_sync.kobo_service import FileLock
 except ImportError:  # pragma: no cover - standalone / test import
     from kobo_import import (
         FUTURE_SLACK, KOBO_DEVICE_ID, MAX_BOOKS, POSITIONS_FILE, _connect_ro, _is_newer, _load_positions,
@@ -76,6 +77,7 @@ except ImportError:  # pragma: no cover - standalone / test import
     from kobo_position import (
         BOOK_PERCENT, CHAPTER_PERCENT, CHAPTER_START, SPAN, Book, kobo_location, map_bookmark,
     )
+    from kobo_service import FileLock
 
 VERSION = '1.6.0'
 DEFAULT_CALIBRE_WEB = 'http://127.0.0.1:8083'
@@ -150,6 +152,7 @@ class KoboPushResult(object):
         self.skipped = {}          # uuid -> why not sent
         self.precisions = {}       # uuid -> kobo_position precision used
         self.notes = []            # things that need attention
+        self.info = []             # 1.6.0 (review S2): the notes among them that only inform
         self.lines = []            # what was sent, with the precision (the run's result)
         self.more = False          # L1: books left for the next run (never set by a failure)
         self.failure = None        # 'network' | 'timeout' | 'server' | 'address' | 'book' | None
@@ -675,6 +678,7 @@ def push_positions(library_path, app_db, lookup, base_url=DEFAULT_CALIBRE_WEB, m
         res.notes.append('Calibre-Web\'s library folder ({}) is not visible on this computer, so CalibReader '
                          'cannot confirm it is this library: only books the Kobo has already opened are sent '
                          '({} held back).'.format(served or 'unknown', unproven))
+        res.info.append(res.notes[-1])
     if dirty:
         save()
     if no_token:
@@ -689,6 +693,7 @@ def push_positions(library_path, app_db, lookup, base_url=DEFAULT_CALIBRE_WEB, m
             break
         if still_on is not None and not still_on():
             res.notes.append('Sending to the Kobo was turned off; nothing more sent.')
+            res.info.append(res.notes[-1])
             res.more = False                # R1-S3: unticking stops the batch at once
             break
         # S3: the Kobo's row as it is now; a Kobo sync since the run began wins this run.
@@ -801,15 +806,18 @@ class StateFile(object):
     --push run). One JSON file on this computer: {library: {'push_since': iso, uuid:
     record, ...}}. 1.6.0 (R2-N2): calibre's journal (ui.KOBO_JOURNAL) is THE file: the
     plugin, the background job (kobo_service) and the CLI (its default --state) all use
-    it, one at a time (kobo_service.LibraryLock), each loading it afresh per run.'''
+    it, one at a time per library (kobo_service.LibraryLock), each loading it afresh per
+    run. Review S4: the libraries' writers share the FILE, so every read and every
+    read-modify-replace holds the journal's own lock (<journal>.lock, across processes).'''
 
     def __init__(self, path, library_path):
         self.path = os.path.expanduser(path)
         self.key = os.path.realpath(library_path)
         self.table = {}
         try:
-            with open(self.path, 'rb') as f:
-                table = json.loads(f.read().decode('utf-8'))
+            with _STATE_LOCK, self._lock():
+                with open(self.path, 'rb') as f:
+                    table = json.loads(f.read().decode('utf-8'))
             if isinstance(table, dict):
                 self.table = table
         except (OSError, ValueError):
@@ -821,10 +829,17 @@ class StateFile(object):
         self.since = since if isinstance(since, str) and since else None
         self.memory = mine
 
+    def _lock(self):
+        return FileLock(self.path + '.lock')
+
     def save(self, *ignored):
         '''Write this library's part; the other libraries' parts are re-read from disk
-        first and kept (re-review R1-S2: one file, several libraries, a worker thread).'''
-        with _STATE_LOCK:
+        first and kept (re-review R1-S2: one file, several libraries, a worker thread),
+        all under the journal's lock (review S4: several processes).'''
+        folder = os.path.dirname(self.path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        with _STATE_LOCK, self._lock():
             mine = dict(self.memory)
             table = {}
             try:
@@ -844,19 +859,23 @@ class StateFile(object):
                     mine['push_since'] = theirs['push_since']
             table[self.key] = mine
             self.table = table
-            folder = os.path.dirname(self.path)
-            if folder:
-                os.makedirs(folder, exist_ok=True)
-            tmp = '{}.{}.tmp'.format(self.path, threading.get_ident())
-            with open(tmp, 'w', encoding='utf-8', newline='\n') as f:
-                json.dump(table, f, indent=2, ensure_ascii=False)
-                f.write('\n')
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, self.path)
+            tmp = '{}.{}.{}.tmp'.format(self.path, os.getpid(), threading.get_ident())
+            try:
+                with open(tmp, 'w', encoding='utf-8', newline='\n') as f:
+                    json.dump(table, f, indent=2, ensure_ascii=False)
+                    f.write('\n')
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, self.path)
+            except BaseException:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                raise
 
 
-_STATE_LOCK = threading.Lock()
+_STATE_LOCK = threading.RLock()
 
 
 def load_state(path, library_path):

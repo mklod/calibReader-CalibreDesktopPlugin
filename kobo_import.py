@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0712
+# Last modified: 2026-11-05--0851
 #
 # kobo_import.py — Kobo reading positions (Calibre-Web's app.db) into
 # CalibReader_positions.json, the sidecar the CalibReader apps already read.
@@ -251,7 +251,9 @@ def _write_atomic(path, data):
             os.rename(path, bak)
             os.rename(tmp, path)
             os.remove(bak)
-    except OSError:
+    except BaseException:
+        # 1.6.0 (review N5): also when the background job is stopped mid-write (SIGTERM ->
+        # SystemExit): no stray temp file left in the library folder, which syncs to the phones.
         if os.path.exists(tmp):
             try:
                 os.remove(tmp)

@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0845
+# Last modified: 2026-11-05--0858
 #
 # Step 3 (plugin 1.6.0, tester preview): the Kobo sync without calibre running.
 # kobo_service.run_once is what the launchd job runs (calibre-debug -e <copy>/kobo_service.py
@@ -240,7 +240,7 @@ class RunTests(ServiceBase):
             f.write('{\n  "kobo": {\n    "')                   # calibre writing it at this instant
         self.kobo(60, '2026-10-30 21:03:48', tkp.CH.format(2), 'KoboSpan', 'kobo.5.1', 40.0, 3.0)
         out = self.run_job()
-        self.assertEqual(out.status, 'error')
+        self.assertEqual(out.status, 'failed')                   # review S2: a failed run, kept as such
         self.assertFalse(os.path.exists(self.positions_path))
 
     def test_the_kobo_place_is_imported_with_calibre_closed(self):
@@ -398,7 +398,7 @@ class RunTests(ServiceBase):
         self.touch_app()
         with mock.patch('kobo_push._send', side_effect=AssertionError('no request during the backoff')):
             out = self.run_job(now=t0 + datetime.timedelta(seconds=60))
-        self.assertEqual(out.status, 'done')
+        self.assertEqual(out.status, 'failed')                   # review S2: Calibre-Web still owed a send
         self.assertTrue(any('waits until' in n for n in out.notes), out.notes)
         self.touch_app(anchor=200)
         with mock.patch('kobo_push._send', wraps=kobo_push._send) as send:
