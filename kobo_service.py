@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0734
+# Last modified: 2026-11-05--0802
 #
 # kobo_service.py — the Kobo sync without calibre running (plugin 1.6.0, tester preview).
 #
@@ -596,12 +596,17 @@ def plist_for(library, config_dir, app_db, label=None, args=None):
         if os.environ.get(name):
             env[name] = os.environ[name]
     out = os.path.join(log_dir(), 'kobo-launchd.log')
+    # WatchPaths: macOS reports a file as changed when it is CLOSED after a write, and Calibre-Web
+    # keeps app.db open (SQLAlchemy's pool), so app.db alone almost never fires. SQLite's rollback
+    # journal (Calibre-Web's journal_mode is DELETE) is created and deleted by every write: it
+    # fires at once (Mac e2e). The WAL file covers a Calibre-Web set to WAL. Best effort all the
+    # same (launchd.plist(5): race-prone); StartInterval is the guarantee.
     return {
         'Label': label,
         'ProgramArguments': args or program_args(library, config_dir),
         'RunAtLoad': True,
         'StartInterval': INTERVAL,
-        'WatchPaths': [app_db, app_db + '-wal'],
+        'WatchPaths': [app_db, app_db + '-journal', app_db + '-wal'],
         'ThrottleInterval': THROTTLE,
         'ProcessType': 'Background',
         'LowPriorityIO': True,
