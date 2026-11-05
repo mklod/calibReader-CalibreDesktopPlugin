@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--1223
+# Last modified: 2026-11-05--1258
 #
 # test_real_calibre.py — CalibReader Sync against REAL calibre (LibraryDatabase, set_field,
 # metadata.db, JSONConfig, the Settings widget), not the in-memory FakeDB of sync_core.py.
@@ -1338,6 +1338,52 @@ class RealKoboUtilitiesTests(RealCalibreBase):
         lines = [line for line in res.kobo_ku_lines if title in line]
         self.assertTrue(lines and 'text/nowhere.xhtml' in lines[0] and 'not in this book' in lines[0],
                         res.kobo_ku_lines)
+
+    def test_b_a_connected_kobo_list_flags_a_book_whose_epub_is_newer_than_its_copy(self):
+        # residual (b): calibre's own in-memory list of the connected Kobo's books (Main.booklists());
+        # read-only, no device I/O. Book 1's EPUB (added just now) is newer than its Kobo copy (2026-01-01).
+        import ui
+        (b1, u1), = self.books[:1]
+        self.fill(b1, KU_CH.format(1) + '#kobo.3.2', 4, datetime.datetime(2026, 11, 1, 10, 0, tzinfo=UTC))
+        self.set_ku(decided=True)
+        action = self.action()
+
+        class KOBOTOUCH(object):
+            name = 'Kobo Touch/Glo/Mini/Aura HD/Aura H2O/Glo HD/Touch 2'
+
+        class DeviceManager(object):
+            connected_device = KOBOTOUCH()
+
+        class DeviceBook(object):
+            application_id = b1
+            datetime = time.gmtime(datetime.datetime(2026, 1, 1, tzinfo=UTC).timestamp())
+        action.gui.device_manager = DeviceManager()
+        action.gui.booklists = lambda: ([DeviceBook()], [], [])
+        try:
+            res = self.run_ui()
+        finally:
+            del action.gui.device_manager
+            del action.gui.booklists
+        entry = self.entries()[u1]
+        self.assertEqual((entry['textAnchor'], entry['kobo']['precision']), (0, 'chapter'), res.notes)
+        self.assertIn('edited', entry['kobo']['note'])
+
+    def test_b_without_a_connected_kobo_nothing_changes(self):
+        (b1, u1), = self.books[:1]
+        self.fill(b1, KU_CH.format(1) + '#kobo.3.2', 4, datetime.datetime(2026, 11, 1, 10, 0, tzinfo=UTC))
+        self.set_ku(decided=True)
+        action = self.action()
+
+        class DeviceManager(object):
+            connected_device = None
+        action.gui.device_manager = DeviceManager()
+        action.gui.booklists = lambda: (_ for _ in ()).throw(AssertionError('no device: never read'))
+        try:
+            self.run_ui()
+        finally:
+            del action.gui.device_manager
+            del action.gui.booklists
+        self.assertEqual(self.entries()[u1]['kobo']['precision'], 'span')
 
     def test_a_newer_calibre_web_place_wins(self):
         (b1, u1), = self.books[:1]
