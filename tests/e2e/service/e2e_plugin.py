@@ -65,7 +65,13 @@ def settings(a):
         w.save_kobo()                                       # OK
         entry = (ui.PREFS.get('kobo', {}) or {}).get(a.library)
         print('PREFS kobo entry:', json.dumps(entry, sort_keys=True))
-        print('status line after:', config.ConfigWidget(gui).kobo_service_status.text())
+        after = config.ConfigWidget(gui)
+        print('status line after:', after.kobo_service_status.text())
+        from qt.core import QLabel, QPushButton
+        rows = [l.text() for l in after.findChildren(QLabel) if l.text().endswith(')') and
+                ('(on)' in l.text() or 'not loaded' in l.text() or 'folder not found' in l.text())]
+        print('Settings > Kobo, background jobs on this Mac:', rows,
+              '| Remove buttons:', len([b for b in after.findChildren(QPushButton) if b.text() == 'Remove']))
     finally:
         db.close()
 
