@@ -433,16 +433,24 @@ the Kobo. One way only (Kobo → CalibReader).
   fewer than half the values read as Kobo locations is refused. The % read and
   last-read columns are optional; pick the last-read one for the right order
   between the Kobo and the app (without it, a place is dated when the plugin
-  first sees it). None of them may be one of CalibReader's own columns, and
-  CalibReader's own % / last-read pickers never suggest a `#kobo_…` column.
-- **Read-only.** The columns are read through calibre (nothing is ever written
-  to `metadata.db`); the Kobo and its `KoboReader.sqlite` are never opened.
+  first sees it), and the % one (the only check that a sentence landed in the
+  right part of the book). None of them may be one of CalibReader's own
+  columns: Settings warns, and OK saves nothing while they clash. Settings
+  never pre-selects any column, CalibReader's own % / last-read included.
+- **Read-only.** Kobo Utilities' columns are only read, through calibre; the
+  Kobo and its `KoboReader.sqlite` are never opened. The place goes into
+  `CalibReader_positions.json`; CalibReader's own % / last-read columns, when
+  set, follow it as they follow any device (a CalibReader column that is also
+  one of the route's Kobo Utilities columns is never written).
 - **Precision.** When the Kobo stored its sentence (`…xhtml#kobo.N.M`), the
   plugin finds that sentence in the KEPUB calibre's Kobo driver sends for the
-  book: the book's KEPUB format if it has one (calibre sends that first), else
-  calibre's own kepubify of the EPUB with the driver's settings, made in calibre
-  and kept in calibre's cache folder (`CalibReaderSync/kepub`, at most 200 MB,
-  least recently used out first; safe to delete). Without a sentence: the
+  book: calibre's own kepubify of the EPUB with the driver's settings, made in
+  calibre and kept in calibre's cache folder (`CalibReaderSync/kepub`, at most
+  200 MB in all, temporary files included, least recently used out first; safe
+  to delete); for a book that also has a KEPUB format, both numberings are tried
+  and the earlier place is kept (marked approximate when they disagree), never
+  one after the Kobo's. With the Kobo Touch Extended driver plugin installed,
+  every sentence is passed on as approximate. Without a sentence: the
   chapter's start (`precision: chapter`), or the Kobo's % (`percent`). Device
   paths (`file:///mnt/onboard/…!…`), URL-encoded names and EPUB CFIs are read
   too; an unknown fragment is read as its chapter.
@@ -701,7 +709,11 @@ column (1.3.0).
   calibre's Kobo driver sends (calibre's own kepubify, cached up to 200 MB).
 - The column chooser is never pre-selected, previews three values and refuses a
   column that does not read as Kobo locations; CalibReader's own % / last-read
-  pickers no longer suggest `#kobo_…` columns.
+  pickers are never pre-selected any more (review B1), and a clash between
+  them and Kobo Utilities' columns is warned about and saves nothing.
+- Review round 1: never a place after the Kobo's (a stored KEPUB and calibre's
+  own numbering are both tried; Kobo Touch Extended = approximate); no
+  conversion leftovers outside the 200 MB cache.
 - Tests: `tests/test_kobo_ku.py`, more real-Calibre tests, the span parity run
   `tests/make_ku_parity_fixture.py`.
 

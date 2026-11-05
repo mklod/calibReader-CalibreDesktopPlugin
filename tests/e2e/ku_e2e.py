@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--1033
+# Last modified: 2026-11-05--1118
 #
 # ku_e2e.py — the Kobo Utilities (USB) route end to end through the PLUGIN path, under
 # calibre-debug with the plugin INSTALLED (from the 1.7.0 zip) in an isolated calibre config
@@ -59,6 +59,12 @@ def settings(a):
         w = config.ConfigWidget(gui)
         print('location column choices:', [w.ku_location.itemData(i) for i in range(w.ku_location.count())])
         print('selected before (never pre-selected):', repr(w.ku_location.currentData()))
+        print('CalibReader's own % / last-read pre-selected:', repr(w.combos['percent'].currentData()),
+              repr(w.combos['last_read'].currentData()))
+        if a.own_percent:
+            w.combos['percent'].setCurrentIndex(w.combos['percent'].findData(a.own_percent))
+        if a.own_last_read:
+            w.combos['last_read'].setCurrentIndex(w.combos['last_read'].findData(a.own_last_read))
         w.ku_location.setCurrentIndex(w.ku_location.findData(a.location))
         print('preview:\n  ' + w.ku_preview.text().replace('\n', '\n  '))
         if a.percent:
@@ -66,7 +72,13 @@ def settings(a):
         if a.last_read:
             w.ku_last_read.setCurrentIndex(w.ku_last_read.findData(a.last_read))
         w._show_ku_error = lambda message: print('ERROR DIALOG:', message)
-        w.save_settings()                                   # OK
+        print('warning shown:', repr(w.ku_clash_note.text()))
+        ok = w.validate()                                   # OK: calibre asks validate() first
+        print('validate (dialog may close):', ok)
+        if ok:
+            w.save_settings()
+        from calibre_plugins.calibreader_sync.sync_core import SETTINGS_KEY
+        print('saved CalibReader settings:', json.dumps(db.new_api.pref(SETTINGS_KEY, None), sort_keys=True))
         print('PREFS kobo_ku entry:', json.dumps((ui.PREFS.get('kobo_ku', {}) or {}).get(a.library), sort_keys=True))
         print('status:', config.ConfigWidget(gui).ku_status.text())
     finally:
@@ -131,6 +143,8 @@ def main():
     s.add_argument('--location', required=True)
     s.add_argument('--percent', default='')
     s.add_argument('--last-read', default='')
+    s.add_argument('--own-percent', default='')
+    s.add_argument('--own-last-read', default='')
     r = sub.add_parser('run')
     r.add_argument('library')
     a = ap.parse_args()
