@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0734
+# Last modified: 2026-11-05--0802
 #
 # Step 3 (plugin 1.6.0, tester preview): the Kobo sync without calibre running.
 # kobo_service.run_once is what the launchd job runs (calibre-debug -e <copy>/kobo_service.py
@@ -493,7 +493,11 @@ class InstallerTests(EnvMixin, unittest.TestCase):
         self.assertEqual(p['ProgramArguments'], args)
         self.assertEqual(p['StartInterval'], 300)
         self.assertIs(p['RunAtLoad'], True)
-        self.assertEqual(p['WatchPaths'], [self.app_db, self.app_db + '-wal'])
+        # Mac e2e: Calibre-Web keeps app.db open (SQLAlchemy's pool), and macOS reports a file
+        # as changed when it is closed, so app.db alone fired WatchPaths once in six Kobo syncs.
+        # SQLite's rollback journal (Calibre-Web's journal_mode is DELETE) is created and deleted
+        # by every write: watching it fired at the second of each Kobo PUT.
+        self.assertEqual(p['WatchPaths'], [self.app_db, self.app_db + '-journal', self.app_db + '-wal'])
         self.assertGreaterEqual(p['ThrottleInterval'], 30)
         self.assertNotIn('KeepAlive', p)
         self.assertEqual(p['EnvironmentVariables']['CALIBRE_CONFIG_DIRECTORY'], self.config)
