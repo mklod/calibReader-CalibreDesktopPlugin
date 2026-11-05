@@ -1,4 +1,4 @@
-# Last modified: 2026-11-02--1415
+# Last modified: 2026-11-05--0358
 #
 # Kobo position -> CalibReader position (kobo_position.map_bookmark), on a real
 # public-domain book from the SAFE library: Kafka, The Metamorphosis (Project
@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(HERE))
 from kobo_position import (  # noqa: E402
     BOOK_PERCENT, CFI, CHAPTER_PERCENT, CHAPTER_START, SPAN, Book, ChapterText, map_bookmark,
 )
+import kobo_position  # noqa: E402
 
 EPUB = os.path.join(HERE, 'fixtures', 'metamorphosis.epub')
 KEPUB = os.path.join(HERE, 'fixtures', 'metamorphosis.kepub')
@@ -215,6 +216,127 @@ class MappingTests(unittest.TestCase):
     def test_nothing_usable_is_none(self):
         self.assertIsNone(map_bookmark(self.epub, bm(None, None, None, None, None)))
         self.assertIsNone(map_bookmark(self.epub, bm('', 'KoboSpan', '', None, None)))
+
+class ReverseMappingTests(unittest.TestCase):
+    '''Step 2 (CalibReader -> Kobo): the app's chapter + textAnchor -> the Kobo
+    bookmark to PUT (kobo_position.kobo_location). Round trip through step 1's
+    map_bookmark: lands at or just before the app's place.'''
+
+    @classmethod
+    def setUpClass(cls):
+        cls.epub = Book(EPUB)
+        cls.kepub = Book(KEPUB)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.epub.close()
+        cls.kepub.close()
+
+    def back(self, loc, kepub='same'):
+        '''Where step 1's import puts the pushed bookmark.'''
+        row = {'location_type': loc['type'], 'location_value': loc['value'], 'location_source': loc['source'],
+               'progress_percent': loc['progressPercent'],
+               'content_source_progress_percent': loc['contentSourceProgressPercent']}
+        return map_bookmark(self.epub, row, self.kepub if kepub == 'same' else kepub)
+
+    def spans(self, chapter):
+        kct = self.kepub.text(chapter)
+        return [i for i in kct.ids if re.match(r'^kobo\.\d+\.\d+$', i)]
+
+    def starts(self, chapter):
+        out = set()
+        for s in self.spans(chapter):
+            hit = kobo_position.resolve_span(self.epub, self.kepub, chapter, s)
+            if hit is not None and hit[1] == SPAN:
+                out.add(hit[0])
+        return sorted(out)
+
+    def test_every_span_start_round_trips_exactly(self):
+        # anchor = a span's own place -> that span (or one at the same place) -> the same anchor
+        checked = 0
+        for ch in (1, 2, 3, 4, 5):
+            for sid in self.spans(ch):
+                hit = kobo_position.resolve_span(self.epub, self.kepub, ch, sid)
+                if hit is None or hit[1] != SPAN:
+                    continue
+                loc = kobo_position.kobo_location(self.epub, ch, hit[0], self.kepub)
+                self.assertEqual((loc['type'], loc['precision']), ('KoboSpan', SPAN), sid)
+                self.assertEqual(loc['source'], self.epub.chapters[ch])
+                back = self.back(loc)
+                self.assertEqual((back['chapter'], back['textAnchor']), (ch, hit[0]), (sid, loc['value']))
+                self.assertEqual(loc['anchor'], hit[0])
+                checked += 1
+        self.assertGreater(checked, 900)
+
+    def test_any_place_lands_at_or_just_before_it(self):
+        # Every 23rd character of the story: the span the character is in; back <= place,
+        # and the next span starts after the place (it is the sentence the place is in).
+        for ch in (2, 3, 4):
+            starts = self.starts(ch)
+            text = self.epub.text(ch).text
+            for anchor in range(0, self.epub.text(ch).length, 23):
+                loc = kobo_position.kobo_location(self.epub, ch, anchor, self.kepub)
+                back = self.back(loc)
+                self.assertEqual(back['chapter'], ch)
+                if back['textAnchor'] > anchor:
+                    # only before the chapter's first span, with nothing but whitespace between
+                    self.assertEqual(back['textAnchor'], starts[0])
+                    self.assertFalse(text[anchor:back['textAnchor']].strip(), (ch, anchor))
+                    continue
+                self.assertEqual(back['textAnchor'], max(s for s in starts if s <= anchor), (ch, anchor))
+
+    def test_the_end_of_chapter_marker_is_the_last_span(self):
+        L = self.epub.text(2).length
+        loc = kobo_position.kobo_location(self.epub, 2, L, self.kepub)
+        self.assertEqual(self.back(loc)['textAnchor'], self.starts(2)[-1])
+
+    def test_the_sentence_is_the_apps_sentence(self):
+        # "A collection of textile samples..." (kobo.3.5): any character inside it maps to it.
+        start = kobo_position.resolve_span(self.epub, self.kepub, 2, 'kobo.3.5')[0]
+        for inside in (start, start + 5, start + 40):
+            self.assertEqual(kobo_position.kobo_location(self.epub, 2, inside, self.kepub)['value'], 'kobo.3.5')
+
+    def test_percentages_are_text_fractions(self):
+        loc = kobo_position.kobo_location(self.epub, 3, 20000, self.kepub)
+        lengths = self.epub.lengths()
+        a = loc['anchor']
+        self.assertAlmostEqual(loc['contentSourceProgressPercent'], 100.0 * a / lengths[3], places=2)
+        self.assertAlmostEqual(loc['progressPercent'], 100.0 * (sum(lengths[:3]) + a) / sum(lengths), places=2)
+
+    def test_without_a_kepub_source_and_percentages_only(self):
+        text = self.epub.text(3).text
+        for anchor in (0, 1, 777, 20000, 40208):
+            loc = kobo_position.kobo_location(self.epub, 3, anchor, None)
+            self.assertEqual((loc['type'], loc['value'], loc['precision']), ('', '', CHAPTER_PERCENT))
+            self.assertEqual(loc['source'], CH.format(2))
+            back = self.back(loc, kepub=None)
+            self.assertEqual((back['chapter'], back['precision']), (3, CHAPTER_PERCENT))
+            self.assertEqual(back['textAnchor'], loc['anchor'], anchor)
+            # at or before the place, never past a word boundary before it
+            if back['textAnchor'] <= anchor:
+                self.assertNotIn(' ', text[back['textAnchor']:anchor].strip(), anchor)
+            else:
+                self.assertFalse(text[anchor:back['textAnchor']].strip(), anchor)   # leading whitespace only
+
+    def test_a_chapter_without_spans_uses_the_percentages(self):
+        loc = kobo_position.kobo_location(self.epub, 0, 3, self.kepub)      # the cover wrapper
+        self.assertEqual((loc['type'], loc['value'], loc['precision']), ('', '', CHAPTER_PERCENT))
+        self.assertEqual(loc['source'], 'OEBPS/wrap0000.xhtml')
+
+    def test_the_source_mirrors_the_kobos_own_spelling(self):
+        anchor = kobo_position.resolve_span(self.epub, self.kepub, 3, 'kobo.5.1')[0]
+        kobo_said = '7446794606207039498_5200-h-1.htm.xhtml'          # the Kobo's Source for chapter 2
+        loc = kobo_position.kobo_location(self.epub, 3, anchor, self.kepub, kobo_source=kobo_said)
+        self.assertEqual(loc['source'], '7446794606207039498_5200-h-2.htm.xhtml')
+        loc = kobo_position.kobo_location(self.epub, 3, anchor, self.kepub, kobo_source='/' + CH.format(1))
+        self.assertEqual(loc['source'], '/' + CH.format(2))
+        loc = kobo_position.kobo_location(self.epub, 3, anchor, self.kepub, kobo_source='not-in-this-book.xhtml')
+        self.assertEqual(loc['source'], CH.format(2))
+        self.assertEqual(self.back(loc)['chapter'], 3)
+
+    def test_a_chapter_out_of_range_is_none(self):
+        self.assertIsNone(kobo_position.kobo_location(self.epub, 6, 0, self.kepub))
+        self.assertIsNone(kobo_position.kobo_location(self.epub, -1, 0, self.kepub))
 
 
 if __name__ == '__main__':
