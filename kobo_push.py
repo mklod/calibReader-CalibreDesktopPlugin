@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0556
+# Last modified: 2026-11-05--0659
 #
 # kobo_push.py — CalibReader's reading place to the Kobo, through Calibre-Web
 # (step 2 of the Kobo sync, plugin 1.5.0, tester preview).
@@ -27,8 +27,8 @@
 #     meanwhile, that book waits for the next run (S3).
 #   * Precision: with the book's KEPUB (listed by calibre, or beside the EPUB
 #     when Calibre-Web added it while calibre ran: S2), the KoboSpan the app's
-#     sentence is in (kobo_position.kobo_location); otherwise Source and the two
-#     percentages.
+#     sentence is in (kobo_position.kobo_location); otherwise the two percentages,
+#     with an empty Location (1.6.0, R2-N1: no chapter path left in Calibre-Web).
 #   * Echo guard: what was sent is remembered per book (`memory`: the plugin's
 #     prefs or the CLI's state file, never the shared sidecar); step 1's import
 #     skips our own push coming back, also in the Kobo's own terms (S1).
@@ -702,6 +702,13 @@ def push_positions(library_path, app_db, lookup, base_url=DEFAULT_CALIBRE_WEB, m
             _SETTLED[fkey] = settled + (why,)
             continue
         loc = dict(loc)
+        if not loc['value']:
+            # Step 3 (R2-N1): the Kobo gets a push without a span as % only (Calibre-Web
+            # forwards a Location only when its Value is set). Calibre-Web keeps whatever
+            # Location it last stored while a later Kobo PUT carries none, so our chapter path
+            # would sit there and the import's M5 rule would skip every later %-only Kobo move.
+            # An empty Location (never null: null would keep the Kobo's old span).
+            loc['source'] = ''
         if loc['type'] == 'KoboSpan' and span_key(fresh.get('location_value')) is not None:
             # Ruling (round 1): a span ahead of the Kobo's never comes with a % below the Kobo's
             # own (the guard above refused a Kobo at FINISHED_PERCENT or more: R1-N1); in the
@@ -755,7 +762,7 @@ def push_positions(library_path, app_db, lookup, base_url=DEFAULT_CALIBRE_WEB, m
         res.precisions[book_uuid] = loc['precision']
         if log:
             log(scrub('Kobo push {} -> {} {} in {} ({}; app chapter {} textAnchor {}, lands at {}; {:.2f} %)'.format(
-                book_uuid, loc['type'] or 'Source', loc['value'] or '', loc['source'], loc['precision'],
+                book_uuid, loc['type'] or '%', loc['value'] or '', loc['source'] or 'no Location', loc['precision'],
                 entry['chapter'], entry['textAnchor'], loc['anchor'], float(loc['progressPercent'])), token))
     res.lines = _precision_lines(res.precisions, had_kepub)
     return res
