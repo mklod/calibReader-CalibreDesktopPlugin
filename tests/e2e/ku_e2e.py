@@ -59,7 +59,7 @@ def settings(a):
         w = config.ConfigWidget(gui)
         print('location column choices:', [w.ku_location.itemData(i) for i in range(w.ku_location.count())])
         print('selected before (never pre-selected):', repr(w.ku_location.currentData()))
-        print('CalibReader's own % / last-read pre-selected:', repr(w.combos['percent'].currentData()),
+        print("CalibReader's own % / last-read pre-selected:", repr(w.combos['percent'].currentData()),
               repr(w.combos['last_read'].currentData()))
         if a.own_percent:
             w.combos['percent'].setCurrentIndex(w.combos['percent'].findData(a.own_percent))
