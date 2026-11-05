@@ -324,7 +324,8 @@ Kobo's place in each book to CalibReader:
 
 **Off by default.** Tick **Also send CalibReader's place to the Kobo (tester
 preview)** in **Settings → Kobo via Calibre-Web** (the `app.db` path must be
-set too). Nothing is ever sent while it is unticked.
+set too). Nothing is ever sent while it is unticked, and only places you read
+**after ticking it** are sent (ticking it sends nothing old).
 
 - When you have read further in CalibReader than on the Kobo, the plugin sends
   that place to **Calibre-Web**, the way a Kobo does (`PUT
@@ -334,23 +335,29 @@ set too). Nothing is ever sent while it is unticked.
   computer). The Kobo token is read from `app.db` (still read-only) and never
   shown or logged.
 - **Forward only.** A place is sent only when CalibReader's entry is newer
-  than the Kobo's AND ahead of it (chapter, then position in the chapter; the
-  % when the Kobo's place is % only). Never a place behind the Kobo's: the
-  Kobo cannot ask before moving you back.
-- **Precision.** With the book's KEPUB in the library (Calibre-Web with
-  kepubify): the Kobo's sentence-span (`kobo.P.S`) the app's place is in.
-  Without: the chapter and the percentages (Calibre-Web passes only the % to
+  than the Kobo's AND ahead of it, and then once more just before sending, in
+  the Kobo's own terms: its sentence-span against ours (`kobo.P.S`, or a later
+  chapter), otherwise the % the Kobo will get against the Kobo's own %. What
+  cannot be compared is not sent. Never a place behind the Kobo's: the Kobo
+  cannot ask before moving you back. If the Kobo syncs while calibre is
+  sending, that book waits for the next sync.
+- **Precision.** With the book's KEPUB (Calibre-Web with kepubify; found next
+  to the EPUB even before calibre lists it): the Kobo's sentence-span the app's
+  place is in. Without: the percentages only (Calibre-Web passes no chapter to
   the Kobo then).
 - Only books Calibre-Web has synced to that user's Kobo; read status and
   reading statistics in Calibre-Web are left alone.
 - The plugin remembers what it sent (calibre's config folder, this computer),
   so the Kobo import does not read its own push back as a Kobo move.
-- Calibre-Web not running, a wrong address or a refused token: one note, nothing
-  retried; the next sync tries again.
+- Sending runs in the background: calibre never waits for Calibre-Web, and the
+  status bar shows the result. Calibre-Web not running, a wrong address or a
+  refused token: one note, nothing retried; automatic sends pause for 5
+  minutes, the Sync Read Status button tries at once.
 - **Open question:** whether a real Kobo moves to a place sent from the server.
   That is what this tester preview finds out.
 - Outside calibre: `python3 kobo_import.py --library … --app-db … --user …
-  --push [--calibre-web http://…] [--state file]`.
+  --push [--calibre-web http://…] [--state file] [--since ISO-time]` (sending
+  starts at the first `--push` run unless `--since` says otherwise).
 
 ### Testing
 
@@ -579,6 +586,10 @@ column (1.3.0).
   The Kobo import skips the plugin's own push coming back. A Calibre-Web that
   is down or refuses: one note, no retry.
 - New setting: Calibre-Web address (default `http://127.0.0.1:8083`).
+- Review round 1: only places read after ticking the box; forward-only checked
+  again in the Kobo's own terms just before each send; the Kobo reporting our
+  place in its own terms is not imported back; a KEPUB Calibre-Web added while
+  calibre runs is found; sends run off calibre's GUI thread with a time limit.
 - Tests: `tests/test_kobo_push.py`; `tests/e2e/` (a Kobo simulator for a local
   Calibre-Web). The two POSIX file-mode tests are skipped on Windows.
 
