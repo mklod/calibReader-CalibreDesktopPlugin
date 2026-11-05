@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0713
+# Last modified: 2026-11-05--0854
 #
 # CalibReader Sync — the toolbar action (GUI only).
 # calibre imports this module only in its main window, through
@@ -39,8 +39,9 @@
 # Settings -> Kobo "Keep syncing when calibre is closed", macOS). Every Kobo run here
 # takes the library's lock (kobo_service.LibraryLock), shared with the background job
 # and the CLI: busy = no Kobo work this run, one note; the lock is held from the import
-# until the push worker ends. With the job installed for the open library, automatic
-# runs leave the Kobo to it (the button still runs it). The push journal is read from
+# until the push worker ends. With the job installed for the open library AND healthy (a
+# good run in the last 15 minutes: review S1), automatic runs leave the Kobo to it (the
+# button still runs it); a job that cannot start or keeps failing gives it back. The push journal is read from
 # disk at the start of every Kobo run (one echo memory with the job and the CLI, R2-N2);
 # PREFS['kobo_pushed'] only fills in a library the journal has no part for. When calibre
 # starts, a background job's copy of the Kobo modules that differs from this plugin's is

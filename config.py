@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0714
+# Last modified: 2026-11-05--0854
 #
 # config.py — the plugin's settings dialog (Preferences > Plugins > CalibReader
 # Sync > Customize, or the "Settings…" item in the toolbar button's menu).
@@ -25,6 +25,8 @@
 # a copy of the Kobo modules, a launchd LaunchAgent for this library, loaded at once);
 # unticked (or the app.db path cleared) takes it down. A status line shows launchd's view
 # and the job's last run. Stored as 'service' in the same per-library Kobo prefs.
+# Review round 1 (S5): every background job on this Mac is listed with a Remove button,
+# also one for a library calibre no longer shows.
 #
 # 1.3.1: no read column is pre-selected or saved unless the user picks one (H1);
 # a chosen column that can't be used means read status is not synced (M1); OK
@@ -218,8 +220,49 @@ class ConfigWidget(QWidget):
             kobo_service.status_text(self.gui.library_path) if mac else '')
         self.kobo_service_status.setVisible(mac)
         v.addWidget(self.kobo_service_status)
+        if mac:
+            self._job_rows(v)
         v.addWidget(self._text('Saved on this computer only, for this library.'))
         v.addStretch(1)
+
+    def _job_rows(self, v):
+        '''1.6.0 (review S5): every CalibReader background job on this Mac, for any library,
+        including one calibre no longer shows (renamed, moved or removed), each with Remove.'''
+        jobs = kobo_service.installed_jobs()
+        if not jobs:
+            return
+        v.addWidget(self._text('Background jobs on this Mac:'))
+        grid = QGridLayout()
+        for row, job in enumerate(jobs):
+            state = ('folder not found: renamed or moved in calibre?' if not job['library_exists']
+                     else ('on' if job['loaded'] else 'not loaded'))
+            label = self._text('{} ({})'.format(job['library'] or job['label'], state))
+            button = QPushButton('Remove', self)
+            button.setToolTip('Stop and remove this background job ({}).'.format(job['label']))
+            button.clicked.connect(lambda checked=False, j=job, l=label, b=button: self._remove_job(j, l, b))
+            grid.addWidget(label, row, 0)
+            grid.addWidget(button, row, 1)
+        grid.setColumnStretch(0, 1)
+        v.addLayout(grid)
+
+    def _remove_job(self, job, label, button):
+        ok, message = kobo_service.remove_job(job['label'])
+        if not ok:
+            self._show_error(message)
+            return
+        PREFS = self._prefs()
+        if PREFS is not None and job['library']:
+            table = dict(PREFS.get('kobo', {}) or {})
+            entry = table.get(job['library'])
+            if isinstance(entry, dict) and entry.get('service') is True:
+                entry = dict(entry)
+                entry['service'] = False
+                table[job['library']] = entry
+                PREFS['kobo'] = table
+        if job['library'] == self.gui.library_path:
+            self.kobo_service.setChecked(False)
+        label.setText('{} (removed)'.format(job['library'] or job['label']))
+        button.setEnabled(False)
 
     # -- building blocks ------------------------------------------------------
 
