@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0543
+# Last modified: 2026-11-05--0710
 #
 # test_real_calibre.py — CalibReader Sync against REAL calibre (LibraryDatabase, set_field,
 # metadata.db, JSONConfig, the Settings widget), not the in-memory FakeDB of sync_core.py.
@@ -470,6 +470,145 @@ class RealKoboRunTests(RealCalibreBase):
         self.assertEqual(self.kicks.starts, 1)
 
 
+@unittest.skipUnless(HAVE_CALIBRE, 'needs calibre (run tests/run_calibre.sh)')
+class RealServiceTests(RealKoboRunTests):
+    '''1.6.0 (step 3): calibre and the background job (kobo_service) on one library: the
+    plugin stands down when the job is installed, takes the same lock (held until its push
+    worker ends) and shares one echo memory with the job (calibre's journal, re-read at
+    every Kobo run).'''
+
+    def setUp(self):
+        RealKoboRunTests.setUp(self)
+        self.home = tempfile.mkdtemp(prefix='cr-svc-')
+        self.env = mock.patch.dict(os.environ, {
+            'CALIBREADER_SYNC_HOME': os.path.join(self.home, 'home'),
+            'CALIBREADER_SYNC_LOGS': os.path.join(self.home, 'logs'),
+            'CALIBREADER_SYNC_AGENTS': os.path.join(self.home, 'LaunchAgents'),
+        })
+        self.env.start()
+        os.environ.pop('CALIBREADER_SYNC_LABEL', None)
+        self.zip = os.path.join(config_dir, 'plugins', 'CalibReader Sync.zip')
+
+    def tearDown(self):
+        import ui
+        self.env.stop()
+        shutil.rmtree(self.home, ignore_errors=True)
+        for path in (ui.KOBO_JOURNAL, self.zip):
+            if os.path.exists(path):
+                os.remove(path)
+        RealKoboRunTests.tearDown(self)
+
+    def plist_present(self):
+        import kobo_service
+        path = kobo_service.plist_path(kobo_service.label_for(self.lib.path))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, 'wb').close()
+
+    def plugin_installed(self):
+        os.makedirs(os.path.dirname(self.zip), exist_ok=True)
+        open(self.zip, 'wb').close()
+
+    def positions(self):
+        with open(os.path.join(self.lib.path, 'CalibReader_positions.json'), 'rb') as f:
+            return f.read()
+
+    def test_with_the_job_installed_automatic_runs_leave_the_kobo_to_it(self):
+        self.set_kobo(push=True, push_since=self.SINCE, service=True)
+        self.plist_present()
+        res = self.run_ui()                                  # start-up / poll / follow-up kick
+        self.wait_push()
+        self.assertFalse(res.kobo_push_started)
+        self.assertEqual(self.cw.requests, [])
+        res = self.run_ui(manual=True)                       # the button still does it
+        pres = self.wait_push()
+        self.assertTrue(res.kobo_push_started, res.notes)
+        self.assertEqual((len(pres.sent), len(self.cw.requests)), (1, 1))
+
+    def test_without_the_plist_calibre_keeps_doing_it(self):
+        self.set_kobo(push=True, push_since=self.SINCE, service=True)    # ticked, but not on disk
+        self.run_ui()
+        self.assertEqual(len(self.wait_push().sent), 1)
+
+    def test_the_button_does_no_kobo_work_while_the_job_holds_the_lock(self):
+        import kobo_service
+        self.set_kobo(push=True, push_since=self.SINCE)
+        lock = kobo_service.LibraryLock(self.lib.path, 'the background job')
+        self.assertTrue(lock.acquire())
+        try:
+            res = self.run_ui(manual=True)
+            self.wait_push()
+        finally:
+            lock.release()
+        self.assertEqual(self.cw.requests, [])
+        self.assertFalse(res.kobo_push_started)
+        self.assertTrue(any('the background job' in n for n in res.notes), res.notes)
+        res = self.run_ui(manual=True)                       # free again: it runs
+        self.assertEqual(len(self.wait_push().sent), 1)
+
+    def test_calibres_run_holds_the_lock_until_its_push_worker_is_done(self):
+        import kobo_push
+        import kobo_service
+        self.set_kobo(push=True, push_since=self.SINCE)
+        gate, entered = threading.Event(), threading.Event()
+        real = kobo_push._send
+
+        def held(*a, **kw):
+            entered.set()
+            gate.wait(10)
+            return real(*a, **kw)
+        job = kobo_service.LibraryLock(self.lib.path, 'the background job')
+        try:
+            with mock.patch('kobo_push._send', side_effect=held):
+                self.run_ui()
+                self.assertTrue(entered.wait(10))            # the PUT is in flight on the worker
+                self.assertFalse(job.acquire())
+                self.assertIn('calibre', job.holder())
+                gate.set()
+                self.wait_push()
+        finally:
+            gate.set()
+        self.assertTrue(job.acquire())                       # released when the worker ended
+        job.release()
+
+    def test_a_push_by_the_job_is_not_a_kobo_move_for_calibre(self):
+        import kobo_service
+        self.plugin_installed()
+        self.set_kobo(push=True, push_since=self.SINCE, service=True)    # ui.PREFS: on disk now
+        out = kobo_service.run_once(self.lib.path, config_dir=config_dir)
+        self.assertEqual(out.pres.sent, [self.uuid], out.notes)
+        before = self.positions()
+        res = self.run_ui(manual=True)                       # calibre opened afterwards
+        pres = self.wait_push()
+        self.assertEqual(res.kobo_imported, 0, res.notes)
+        self.assertEqual(self.positions(), before)
+        self.assertEqual((pres.sent, len(self.cw.requests)), ([], 1))
+
+    def test_a_push_by_calibre_is_not_a_kobo_move_for_the_job(self):
+        import kobo_service
+        self.plugin_installed()
+        self.set_kobo(push=True, push_since=self.SINCE, service=True)
+        self.run_ui(manual=True)
+        self.assertEqual(len(self.wait_push().sent), 1)
+        before = self.positions()
+        out = kobo_service.run_once(self.lib.path, config_dir=config_dir)    # calibre closed afterwards
+        self.assertEqual(out.status, 'done', out.notes)
+        self.assertEqual((out.kres.written, out.pres.sent, len(self.cw.requests)), ([], [], 1))
+        self.assertEqual(self.positions(), before)
+
+    def test_calibre_starting_refreshes_a_stale_copy(self):
+        import kobo_service
+
+        def stale(name):
+            with open(os.path.join(REPO, name), 'rb') as f:
+                return f.read() + b'\n# 1.5.9\n'
+        kobo_service.install_files(stale)
+        self.action()._refresh_service_copy()
+        for name in kobo_service.MODULES:
+            with open(os.path.join(kobo_service.service_dir(), name), 'rb') as f, \
+                    open(os.path.join(REPO, name), 'rb') as g:
+                self.assertEqual(f.read(), g.read(), name)
+
+
 class RealSyncPathTests(RealCalibreBase):
 
     def test_apply_stamp_and_local_time(self):
@@ -835,6 +974,49 @@ class RealSettingsDialogTests(RealCalibreBase):
             from qt.core import QLabel
             text = ' '.join(label.text() for label in self.widget().findChildren(QLabel))
             self.assertIn('percentages only', text)
+        finally:
+            PREFS['kobo'] = {}
+
+    def test_keep_syncing_when_calibre_is_closed_box(self):
+        # 1.6.0: off by default; macOS only; OK with it ticked sets the job up (kobo_service.install
+        # with this library, calibre's config folder, the app.db and the plugin's own files);
+        # unticked, it is taken down. The job is never set up by anything else.
+        import kobo_service
+        from ui import PREFS
+        app_db = os.path.join(self.lib.path, 'app.db')
+        try:
+            w = self.widget()
+            self.assertFalse(w.kobo_service.isChecked())
+            self.assertIn('Keep syncing when calibre is closed', w.kobo_service.text())
+            self.assertEqual(w.kobo_service.isEnabled(), kobo_service.supported())
+            with mock.patch.object(kobo_service, 'supported', return_value=True), \
+                    mock.patch.object(kobo_service, 'install', return_value=(True, 'on')) as install, \
+                    mock.patch.object(kobo_service, 'uninstall', return_value=(True, 'off')) as uninstall, \
+                    mock.patch.object(kobo_service, 'status_text', return_value='Background job: off.'):
+                w = self.widget()
+                self.assertTrue(w.kobo_service.isEnabled())
+                w.kobo_db.setText(app_db)
+                w.save_kobo()                                   # OK without the box: nothing set up
+                self.assertEqual(install.call_count, 0)
+                self.assertIs(PREFS['kobo'][self.lib.path].get('service', False), False)
+                w = self.widget()
+                w.kobo_service.setChecked(True)
+                w.save_kobo()
+                self.assertIs(PREFS['kobo'][self.lib.path]['service'], True)
+                (library, cfg, db, read), _ = install.call_args
+                self.assertEqual((library, cfg, db), (self.lib.path, config_dir, app_db))
+                self.assertTrue(read('kobo_service.py').startswith(b'# Last modified'))
+                self.assertTrue(self.widget().kobo_service.isChecked())     # reopened: still on
+                install.return_value = (False, 'launchctl could not load the background job (exit 5: x).')
+                w = self.widget()
+                with mock.patch.object(type(w), '_show_error') as shown:
+                    w.save_kobo()                               # OK again: refresh; it fails
+                self.assertIs(PREFS['kobo'][self.lib.path]['service'], False)
+                self.assertIn('exit 5', shown.call_args[0][0])
+                w = self.widget()
+                self.assertFalse(w.kobo_service.isChecked())
+                w.save_kobo()
+                self.assertGreaterEqual(uninstall.call_count, 1)
         finally:
             PREFS['kobo'] = {}
 

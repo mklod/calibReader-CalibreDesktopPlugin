@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0414
+# Last modified: 2026-11-05--0710
 #
 # run_tests.py — runs every CalibReader Sync test and REFUSES a run that executed nothing.
 #
@@ -29,7 +29,8 @@ import unittest
 TESTS = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(TESTS)
 IN_FILE = ('sidecar_merge.py', 'sync_core.py')
-MODULES = ('test_real_calibre.py', 'test_kobo_position.py', 'test_kobo_import.py', 'test_kobo_push.py')
+MODULES = ('test_real_calibre.py', 'test_kobo_position.py', 'test_kobo_import.py', 'test_kobo_push.py',
+           'test_kobo_service.py')
 
 
 def in_file_suite(path):
