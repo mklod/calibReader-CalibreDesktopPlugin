@@ -499,6 +499,11 @@ class CalibReaderSyncAction(InterfaceAction):
                     res.notes.append('Kobo Utilities: what was seen could not be saved ({}); it is looked at '
                                      'again next run.'.format(exc))
             res.last_store = kobo_ku.last_store_seen(values, memory)
+            if res.problems:
+                uuids = {(u or '').lower(): i for i, u in api.all_field_for('uuid', ids).items()}
+                for uuid in res.problems:
+                    book_id = uuids.get(uuid.lower())
+                    res.titles[uuid] = api.field_for('title', book_id) if book_id is not None else uuid
             return res
         finally:
             lock.release()
@@ -507,6 +512,11 @@ class CalibReaderSyncAction(InterfaceAction):
         lines = []
         if ku.written:
             lines.append('Kobo Utilities (USB): {} reading place(s) passed to the app.'.format(len(ku.written)))
+        problems = sorted(ku.problems.items(), key=lambda kv: ku.titles.get(kv[0], kv[0]))
+        for uuid, why in problems[:8]:
+            lines.append('Kobo Utilities (USB), not imported: {}: {}.'.format(ku.titles.get(uuid, uuid), why))
+        if len(problems) > 8:
+            lines.append('Kobo Utilities (USB): {} more not imported.'.format(len(problems) - 8))
         if not ku.busy:
             lines.append('Kobo Utilities (USB): ' + kobo_ku.store_line(ku.last_store))
             hint = kobo_ku.staleness_hint(ku.last_store, PREFS.get('kobo_ku_device_seen') or None)

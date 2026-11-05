@@ -721,6 +721,8 @@ class KuImportResult(object):
         self.memory_changed = False
         self.busy = False          # the library's Kobo lock was taken (ui.py)
         self.last_store = None
+        self.problems = {}         # uuid -> why, for books whose Kobo place could not be used (summary)
+        self.titles = {}           # uuid -> title (ui.py fills it for the summary)
 
     def status_line(self):
         if self.written:
@@ -738,6 +740,9 @@ def _finer_calibre_web(current, entry):
     if k.get('precision') not in ('span', 'cfi'):
         return False
     return entry['kobo']['precision'] not in (SPAN, CFI) and current.get('chapter') == entry['chapter']
+
+
+PROBLEMS = ('no-place', 'unreadable', 'failed', 'no-epub', 'same-date')   # shown in the summary
 
 
 def _iso(t):
@@ -905,6 +910,9 @@ def import_ku(library_path, source, values, lookup, memory, kepub_for=None, now=
         memory['.'] = {'since': now_s}
     for u, record in pending.items():
         memory[u] = record
+    for uuid, why in res.skipped.items():
+        if isinstance(uuid, str) and (pending.get(uuid.lower()) or {}).get('status') in PROBLEMS:
+            res.problems[uuid] = why
     res.memory_changed = bool(first_run or pending)
     return res
 
