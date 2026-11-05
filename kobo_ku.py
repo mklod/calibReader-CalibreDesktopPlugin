@@ -487,6 +487,19 @@ def prefs_entry(location, percent, last_read):
                          'percent': _lookup(percent), 'last_read': _lookup(last_read), 'boundReader': None}]}
 
 
+def own_column_clash(source, settings):
+    '''Kobo Utilities columns that are also CalibReader's own (read / % / last-read, which the
+    plugin writes): the route must not read back the plugin's own writes as the Kobo's.'''
+    mine = {(settings or {}).get(k) for k in ('read_column', 'percent_column', 'last_read_column')} - {'', None}
+    return sorted(mine & {source.get(k) for k in ('location', 'percent', 'last_read') if source.get(k)})
+
+
+def clash_note(clash):
+    return ('Kobo Utilities: {} {} also CalibReader\'s own column in Settings (the plugin writes into {}), so '
+            'Kobo Utilities places are not imported. Pick other columns in Settings.'.format(
+                ' and '.join(clash), 'is' if len(clash) == 1 else 'are', 'it' if len(clash) == 1 else 'them'))
+
+
 def source_signature(source):
     return '|'.join((source.get('location') or '', source.get('percent') or '', source.get('last_read') or ''))
 

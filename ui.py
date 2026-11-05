@@ -461,6 +461,10 @@ class CalibReaderSyncAction(InterfaceAction):
         if not source:
             return None
         res = kobo_ku.KuImportResult()
+        clash = kobo_ku.own_column_clash(source, normalise_settings(api.pref(SETTINGS_KEY, None)))
+        if clash:
+            res.notes.append(kobo_ku.clash_note(clash))
+            return res
         lock = kobo_service.LibraryLock(library, 'calibre')
         if not lock.acquire():
             res.busy = self._ku_busy = True
