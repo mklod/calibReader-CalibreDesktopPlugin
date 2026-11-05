@@ -373,34 +373,48 @@ keep running; calibre need not.
   `~/Library/Application Support/CalibReaderSync/service/`, writes
   `~/Library/LaunchAgents/com.calibreader.sync.kobo.<12 letters>.plist` (one
   per library) and loads it with `launchctl bootstrap gui/<your user id>`. No
-  password, no admin rights. It runs calibre's own Python (`calibre-debug -e`),
-  so nothing else needs installing. Unticking it (or clearing the app.db path)
-  unloads the job and removes the plist. OK with it ticked after a plugin
-  update refreshes the copy (calibre also refreshes it when it starts).
+  password, no admin rights. It also creates the job's log and support folders
+  first. It runs calibre's own Python (`calibre-debug -e`), so nothing else
+  needs installing; it refuses (with "Move calibre to Applications first …")
+  when calibre runs from its disk image or from a temporary copy macOS made of
+  a downloaded app. Unticking it (or clearing the app.db path) unloads the job
+  and removes the plist. OK with it ticked after a plugin update refreshes the
+  copy (calibre also refreshes it when it starts).
 - **The same settings.** The job reads this library's Kobo settings from
   calibre's own settings file at every run, and again before every send:
   untick "Also send…" and it stops sending from the next request on. It never
-  changes calibre's settings, and it never runs while that box is unticked or
-  the plugin is removed from calibre.
+  changes calibre's settings, and it never runs while that box is unticked, the
+  plugin is removed from calibre, or calibre's CalibReader Sync is older than
+  1.6.0 (untick before installing an older build).
 - **One at a time.** The job, calibre and `kobo_import.py` share one lock per
   library: whoever finds it taken skips that run (one line says so) and never
-  waits. With the job set up, calibre's own automatic Kobo runs leave the Kobo
-  to it; **Sync Read Status** still does the Kobo part (under the same lock).
+  waits. While the job is set up and healthy (a good run in the last 15
+  minutes), calibre's own automatic Kobo runs leave the Kobo to it; if it
+  cannot start or keeps failing, calibre does the Kobo work itself again.
+  **Sync Read Status** always does the Kobo part (under the same lock). The
+  lock is per computer: a second computer's calibre on the same library is not
+  kept apart from this one's job.
   They share one memory of what was sent (calibre's
   `plugins/calibreader_sync_kobo_pushed.json`), so neither reads the other's
   send back as a Kobo move.
-- **Status and log.** Settings shows whether launchd has the job and its last
-  run. The log is `~/Library/Logs/CalibReaderSync/kobo.log`: one line per run
-  (what was imported and sent), notes, and a book's reason for not sending only
-  when it changes; rotated at 256 KB (3 old files kept); never the Kobo token.
-  A run that finds nothing new says "no change".
+- **Status and log.** Settings shows whether the job is on, starting or not
+  running (and why: launchd's exit code, or the last run's error, which stays
+  until a run succeeds), and its last run. Below it, every CalibReader
+  background job on this Mac, with Remove, including jobs for libraries calibre
+  no longer shows. The log is `~/Library/Logs/CalibReaderSync/kobo.log`: one
+  line per run (what was imported and sent, "no change", "failed: …",
+  "nothing done: …"), notes, and a book's reason for not sending only when it
+  changes; rotated at 256 KB (3 old files kept); never the Kobo token; the home
+  folder shown as `~`.
 - After Calibre-Web failed, the job waits 5 minutes before sending again (the
   import goes on).
 - macOS only for now (Windows Task Scheduler and Linux systemd timers are
-  sketched in the design notes). Not yet checked: a library or app.db in a
-  folder macOS guards (Documents, Desktop, Downloads, an external drive or a
-  network share) may need macOS's permission for the job; if the log shows
-  "Operation not permitted", that is it.
+  sketched in the design notes). Not yet checked on a real protected folder:
+  a library or app.db in a folder macOS guards (Documents, Desktop, Downloads,
+  iCloud Drive, an external drive or a network share) may need macOS's
+  permission for the job. The job then says "macOS did not let the background
+  job read <folder>. In System Settings > Privacy & Security > Full Disk
+  Access, turn on calibre …".
 
 ### Testing
 
@@ -629,8 +643,13 @@ column (1.3.0).
   changes, using calibre's own Python. Status line in Settings; log in
   `~/Library/Logs/CalibReaderSync/kobo.log`.
 - One lock per library for the job, calibre and the command line; calibre's
-  automatic Kobo runs stand down while the job is set up (the button still
-  works).
+  automatic Kobo runs stand down while the job is set up and healthy (the
+  button still works).
+- Review round 1: the log and support folders are created before launchd
+  starts the job; no set-up from a disk image or a translocated calibre; a
+  failed run keeps its error in the status line; one plain message for macOS
+  privacy blocks; the push memory is locked across processes; the job stops
+  for an older calibre plugin; Settings lists every job with Remove.
 - One memory of what was sent, shared by calibre, the job and the command line
   (calibre's journal, re-read at every run; the command line's default
   `--state`), so none of them reads another's send back as a Kobo move.
