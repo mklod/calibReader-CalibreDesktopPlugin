@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--1121
+# Last modified: 2026-11-05--1141
 #
 # kobo_ku.py — Kobo reading places stored by the Kobo Utilities calibre plugin (USB sync)
 # into CalibReader_positions.json (plugin 1.7.0, tester preview). Kobo -> CalibReader only.
@@ -87,7 +87,22 @@ DUMMY_TITLE_PAGE = 'kobo-title-page-generated-by-calibre'   # calibre's kepubify
 AGREE_CHARS = 3             # review S1: two numberings landing this close agree
 STALE_TEMP_SECONDS = 600    # review S2: a temp file / work folder this old in the cache is a leftover
 KTE_NOTE = ('the Kobo Touch Extended driver plugin is installed in calibre, so the Kobo\'s copy of a book may be '
-            'numbered differently from calibre\'s own: the Kobo\'s sentence is passed on as an approximate place')
+            'numbered differently from calibre\'s own: the Kobo\'s sentence is passed on as the start of its chapter')
+# Re-review S1-R1: Kobo Touch Extended's numbering left on the Kobo after it was uninstalled. 76 % of its
+# span ids do not exist in calibre's numbering (24,800 of 32,620, measured), calibre-made ones 0 of
+# 343,676: a library is "foreign" once at least FOREIGN_MIN span values were looked at and FOREIGN_SHARE
+# or more of them were missing from the KEPUB calibre sends.
+FOREIGN_MIN = 5
+FOREIGN_SHARE = 0.4
+FOREIGN_NOTE = ('most of the Kobo\'s sentence ids in this library are not in calibre\'s own KEPUB numbering (another '
+                'tool, such as Kobo Touch Extended, made the Kobo\'s copies), so the Kobo\'s sentence is passed on as '
+                'the start of its chapter')
+# Re-review NIT-R1-1: the only names the cache ever removes.
+_OWN_NAMES = re.compile(r'^(?:[0-9a-f]{24}\.kepub|[0-9a-f]{24}\.\d+\.\d+\.tmp|work-\d+-\d+-.*)$')
+
+
+class MissingSpan(str):
+    '''The reason map_ku gives when the Kobo's span id is in none of the KEPUBs (S1-R1 counts it).'''
 
 LOCATION_TYPES = ('text', 'comments')
 PERCENT_TYPES = ('int', 'float')
@@ -211,13 +226,15 @@ def _for_lookup(href):
     return href.replace('%', '%25').replace('#', '%23')
 
 
-def map_ku(epub, parsed, percent=None, kepub=None):
+def map_ku(epub, parsed, percent=None, kepub=None, coarse=None):
     '''A parsed KU location (+ the Kobo's book %) -> ({chapter, textAnchor, progress, precision
     [, note]}, None) or (None, why). `kepub`: a callable -> (Book of the KEPUB calibre sends for
     this book, None) or (None, why); called only for a span. Review S1: it may give a LIST of
     Books (a stored KEPUB and calibre's own conversion, when it is not known which one the Kobo
     has): the span is resolved in each and the EARLIEST landing is kept, never one after the
-    Kobo's real place; landings more than AGREE_CHARS apart are marked span~.'''
+    Kobo's real place; landings more than AGREE_CHARS apart are marked span~. Re-review B1-R1 /
+    S1-R1: `coarse` (a reason) maps a span to the start of its chapter (precision chapter) without
+    resolving it: the Kobo's copy may be numbered by another converter.'''
     pct = _pct(percent)
     n = len(epub.chapters)
     if n == 0:
@@ -254,7 +271,10 @@ def map_ku(epub, parsed, percent=None, kepub=None):
         return 100.0 * (sum(lengths[:ch]) + anchor) / total
 
     anchor = precision = note = None
-    if parsed['form'] == 'span':
+    span_found = False
+    if parsed['form'] == 'span' and coarse:
+        note = coarse if isinstance(coarse, str) else None
+    elif parsed['form'] == 'span':
         book, why = kepub() if kepub is not None else (None, 'calibre\'s KEPUB converter is not available here')
         books = [b for b in (book if isinstance(book, (list, tuple)) else [book]) if b is not None]
         if not books:
@@ -262,8 +282,9 @@ def map_ku(epub, parsed, percent=None, kepub=None):
         else:
             hits = [h for h in (resolve_span(epub, b, chapter, parsed['span']) for b in books) if h is not None]
             if not hits:
-                return None, ('span {} is not in the KEPUB calibre sends for this book (the book changed since it '
-                              'was sent, or another tool made the Kobo\'s copy)'.format(parsed['span']))
+                return None, MissingSpan('span {} is not in the KEPUB calibre sends for this book (the book changed '
+                                         'since it was sent, or another tool made the Kobo\'s copy)'.format(parsed['span']))
+            span_found = True
             anchor, precision = min(hits)
             spread = max(h[0] for h in hits) - anchor
             if spread > AGREE_CHARS:
@@ -292,6 +313,8 @@ def map_ku(epub, parsed, percent=None, kepub=None):
              'precision': precision}
     if note:
         place['note'] = note
+    if span_found:
+        place['span_found'] = True               # S1-R1: the span id was in a KEPUB (a sample)
     return place, None
 
 
@@ -453,6 +476,8 @@ class KepubCache(object):
             return []
         out = []
         for name in names:
+            if not _OWN_NAMES.match(name):
+                continue                        # NIT-R1-1: never anything the cache did not make
             p = os.path.join(self.folder, name)
             try:
                 st = os.stat(p)
@@ -823,7 +848,8 @@ class KuImportResult(object):
         self.busy = False          # the library's Kobo lock was taken (ui.py)
         self.last_store = None
         self.problems = {}         # uuid -> why, for books whose Kobo place could not be used (summary)
-        self.uncertain = ''        # review S1: why spans were passed on as approximate (summary)
+        self.uncertain = ''        # B1-R1: Kobo Touch Extended installed: spans passed on as their chapter start
+        self.foreign = ''          # S1-R1: another converter's numbering in this library (summary)
         self.titles = {}           # uuid -> title (ui.py fills it for the summary)
 
     def status_line(self):
@@ -873,6 +899,9 @@ def import_ku(library_path, source, values, lookup, memory, kepub_for=None, now=
     pending = {}                       # uuid -> record, saved once the run is through
     mapped = {}                        # uuid -> (uuid as in the library, entry, record)
     attempted = future = 0
+    run_seen = run_missing = 0         # S1-R1: span values looked at / not in calibre's numbering, this run
+    spans = []                         # span-form books, decided once the library's numbering is known
+    meta_changed = False
     start = clock()
     for book_id in sorted(values, key=lambda b: (str(type(b)), b)):
         loc, pct, last_read = values[book_id]
@@ -950,9 +979,13 @@ def import_ku(library_path, source, values, lookup, memory, kepub_for=None, now=
                 opened.append(book)
                 books.append(book)
             return (books if len(books) > 1 else books[0]), None
+        alt = alt_why = None
         try:
             epub = Book(epub_path)
             place, why = map_ku(epub, parsed, pct, kepub=kepub)
+            if parsed is not None and parsed['form'] == 'span':
+                # B1-R1 / S1-R1: the chapter start, in case the Kobo's copy has another numbering
+                alt, alt_why = map_ku(epub, parsed, pct, coarse=True)
         except Exception as exc:
             pending[u] = dict(record, status='failed')
             res.skipped[uuid] = 'could not read the EPUB ({})'.format(exc)
@@ -961,26 +994,80 @@ def import_ku(library_path, source, values, lookup, memory, kepub_for=None, now=
             for b in [epub] + opened:
                 if b is not None:
                     b.close()
+        if parsed is not None and parsed['form'] == 'span':
+            record['span'] = True
+            sample = bool(place and place.get('span_found')) or isinstance(why, MissingSpan)
+            run_seen += sample
+            run_missing += isinstance(why, MissingSpan)
+            spans.append((u, uuid, place, why, alt, alt_why, record, kinfo, parsed, loc, pct, last_read, stamp, kind))
+            continue
         if place is None:
             # NIT 7: a 0 % / 100 % with no location is the Kobo's status, not a problem to report
             pending[u] = dict(record, status='status' if parsed is None else 'no-place')
             res.skipped[uuid] = why
             continue
-        if kinfo.get('uncertain') and place['precision'] == SPAN:
-            place['precision'] = SPAN_APPROX            # review S1: Kobo Touch Extended
-            place['note'] = kinfo['uncertain']
-            res.uncertain = kinfo['uncertain']
-        kobo = {'source': KU_DEVICE_ID, 'location': loc, 'href': parsed['href'] if parsed else None,
-                'value': (parsed['span'] or parsed['cfi'] or '') if parsed else '', 'percent': pct,
-                'lastRead': last_read, 'stamp': kind, 'precision': place['precision']}
-        if parsed and parsed['rule'] == 'unknown fragment':
-            kobo['fragment'] = parsed['fragment']
-        if place.get('note'):
-            kobo['note'] = place['note']
-        kobo.update(kinfo)
-        entry = {'chapter': place['chapter'], 'page': 0, 'scrollY': 0, 'progress': place['progress'],
-                 'textAnchor': place['textAnchor'], 'updated_at': stamp, 'deviceId': KU_DEVICE_ID, 'kobo': kobo}
-        mapped[u] = (uuid, entry, record)
+        mapped[u] = (uuid, _ku_entry(place, parsed, loc, pct, last_read, stamp, kind, kinfo), record, False)
+    # S1-R1: is this library's Kobo numbering calibre's? (counts kept across runs; "foreign" sticks)
+    meta = dict(memory.get('.') or {})
+    seen, missing = meta.get('spans', 0) + run_seen, meta.get('missing', 0) + run_missing
+    foreign = bool(meta.get('foreign')) or (seen >= FOREIGN_MIN and missing >= FOREIGN_SHARE * seen)
+    provisional = not foreign and seen < FOREIGN_MIN and missing > 0
+    newly_foreign = foreign and not meta.get('foreign')
+    if foreign or (provisional and spans):
+        res.foreign = FOREIGN_NOTE
+    for (u, uuid, place, why, alt, alt_why, record, kinfo, parsed, loc, pct, last_read, stamp, kind) in spans:
+        coarse = kinfo.get('uncertain') or (FOREIGN_NOTE if (foreign or provisional) else None)
+        if coarse:
+            place, why = alt, alt_why                    # never after the Kobo's place: its chapter start
+            if place is not None:
+                place = dict(place, note=coarse)
+            if kinfo.get('uncertain'):
+                res.uncertain = kinfo['uncertain']
+        if place is None:
+            pending[u] = dict(record, status='no-place')
+            res.skipped[uuid] = why
+            continue
+        place.pop('span_found', None)
+        mapped[u] = (uuid, _ku_entry(place, parsed, loc, pct, last_read, stamp, kind, kinfo), record, False)
+    if newly_foreign:
+        # S1-R1: span places written before the library was known to be foreign may be after the
+        # Kobo's place: our own entries (still ours, same location) go back to their chapter start.
+        positions = data['positions']
+        keys = {k.lower(): k for k in positions}
+        for book_id, (loc, pct, last_read) in values.items():
+            info = lookup(book_id)
+            if not info or not info[0] or not isinstance(loc, str):
+                continue
+            uuid, epub_path = info[0], info[1]
+            u = uuid.lower()
+            before = memory.get(u)
+            current = positions.get(keys.get(u, uuid))
+            if (u in mapped or not isinstance(before, dict) or before.get('status') != 'written'
+                    or not before.get('span') or not _ours(current, loc)):
+                continue
+            parsed = parse_location(loc)
+            epub = None
+            try:
+                epub = Book(epub_path)
+                place, why = map_ku(epub, parsed, _pct(_number(pct)), coarse=FOREIGN_NOTE)
+            except Exception:
+                place = None
+            finally:
+                if epub is not None:
+                    epub.close()
+            if place is None:
+                continue
+            k = current.get('kobo') or {}
+            entry = _ku_entry(place, parsed, loc.strip(), _pct(_number(pct)), _stamp(last_read),
+                              current.get('updated_at'), k.get('stamp'), {key: k[key] for key in ('kepub', 'calibre')
+                                                                          if key in k})
+            mapped[u] = (uuid, entry, dict(before), True)
+    meta.update({'spans': seen, 'missing': missing, 'foreign': foreign})
+    if first_run:
+        meta.setdefault('since', now_s)
+    if meta != (memory.get('.') or {}):
+        memory['.'] = meta
+        meta_changed = True
     if future:
         res.notes.append('{} Kobo Utilities place(s) have a last-read date more than 10 minutes in the future: the '
                          'Kobo\'s clock looks wrong. Not imported.'.format(future))
@@ -991,10 +1078,14 @@ def import_ku(library_path, source, values, lookup, memory, kepub_for=None, now=
             return res
         table = fresh['positions']
         keys = {k.lower(): k for k in table}
-        for u, (uuid, entry, record) in mapped.items():
+        for u, (uuid, entry, record, own_fix) in mapped.items():
             key = keys.get(u, uuid)
             current = table.get(key)
-            if isinstance(current, dict) and not _is_newer(entry['updated_at'], current.get('updated_at')):
+            if own_fix:
+                # S1-R1: replaces only our own entry for the same Kobo value, whatever the stamps
+                if not (_ours(current, entry['kobo']['location']) and current.get('updated_at') == entry['updated_at']):
+                    continue
+            elif isinstance(current, dict) and not _is_newer(entry['updated_at'], current.get('updated_at')):
                 pending[u] = dict(record, status='kept')
                 res.skipped[uuid] = 'CalibReader\'s place is as new or newer'
                 continue
@@ -1017,15 +1108,32 @@ def import_ku(library_path, source, values, lookup, memory, kepub_for=None, now=
                 res.notes.append('Could not write {} ({}).'.format(POSITIONS_FILE, exc))
                 pending = {u: r for u, r in pending.items() if r.get('status') != 'written'}
                 res.written, res.mapped = [], {}
-    if first_run:
-        memory['.'] = {'since': now_s}
     for u, record in pending.items():
         memory[u] = record
     for uuid, why in res.skipped.items():
         if isinstance(uuid, str) and (pending.get(uuid.lower()) or {}).get('status') in PROBLEMS:
             res.problems[uuid] = why
-    res.memory_changed = bool(first_run or pending)
+    res.memory_changed = bool(first_run or pending or meta_changed)
     return res
+
+
+def _ours(current, location):
+    '''Is the positions entry this plugin's Kobo Utilities entry for this very Kobo value?'''
+    return (isinstance(current, dict) and current.get('deviceId') == KU_DEVICE_ID
+            and isinstance(current.get('kobo'), dict) and current['kobo'].get('location') == (location or '').strip())
+
+
+def _ku_entry(place, parsed, loc, pct, last_read, stamp, kind, kinfo):
+    kobo = {'source': KU_DEVICE_ID, 'location': loc, 'href': parsed['href'] if parsed else None,
+            'value': (parsed['span'] or parsed['cfi'] or '') if parsed else '', 'percent': pct,
+            'lastRead': last_read, 'stamp': kind, 'precision': place['precision']}
+    if parsed and parsed['rule'] == 'unknown fragment':
+        kobo['fragment'] = parsed['fragment']
+    if place.get('note'):
+        kobo['note'] = place['note']
+    kobo.update(kinfo or {})
+    return {'chapter': place['chapter'], 'page': 0, 'scrollY': 0, 'progress': place['progress'],
+            'textAnchor': place['textAnchor'], 'updated_at': stamp, 'deviceId': KU_DEVICE_ID, 'kobo': kobo}
 
 
 # -- command line (e2e, or a library without calibre open) ------------------------------------------

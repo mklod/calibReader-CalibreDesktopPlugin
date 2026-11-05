@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--1118
+# Last modified: 2026-11-05--1141
 #
 # config.py — the plugin's settings dialog (Preferences > Plugins > CalibReader
 # Sync > Customize, or the "Settings…" item in the toolbar button's menu).
@@ -329,8 +329,9 @@ class ConfigWidget(QWidget):
         if not location:
             return None
         if self._ku_check is not None and not self._ku_check.get('ok'):
-            return (self._ku_check.get('message') + ' Pick Kobo Utilities\' location column, or "Don\'t use (off)". '
-                    'Nothing was saved.')
+            # re-review NIT-R1-4: say which column to change
+            return ('The Kobo Utilities location column {}: {} Pick Kobo Utilities\' location column, or "Don\'t use '
+                    '(off)". Nothing was saved.'.format(location, self._ku_check.get('message')))
         mine = set(self._own_selected().values()) - {''}
         clash = sorted(mine & self._ku_selected())
         if clash:
@@ -400,7 +401,9 @@ class ConfigWidget(QWidget):
         last = kobo_ku.last_store_seen(values, memory)
         prefs = self._prefs()
         hint = kobo_ku.staleness_hint(last, (prefs.get('kobo_ku_device_seen') if prefs is not None else None) or None)
-        self.ku_status.setText(kobo_ku.store_line(last) + ((' ' + hint) if hint else ''))
+        foreign = ' ' + kobo_ku.FOREIGN_NOTE[0].upper() + kobo_ku.FOREIGN_NOTE[1:] + '.' if (
+            (memory.get('.') or {}).get('foreign')) else ''              # re-review S1-R1
+        self.ku_status.setText(kobo_ku.store_line(last) + ((' ' + hint) if hint else '') + foreign)
 
     def _show_ku_error(self, message):
         from calibre.gui2 import error_dialog

@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--1118
+# Last modified: 2026-11-05--1141
 #
 # test_real_calibre.py — CalibReader Sync against REAL calibre (LibraryDatabase, set_field,
 # metadata.db, JSONConfig, the Settings widget), not the in-memory FakeDB of sync_core.py.
@@ -1322,13 +1322,16 @@ class RealKoboUtilitiesTests(RealCalibreBase):
         self.assertFalse([e for e in entries.values() if e.get('deviceId') == 'kobo-utilities'])
 
     def test_the_summary_names_a_book_not_imported_and_why(self):
+        # (re-review S1-R1: a span id missing from calibre's numbering now goes to its chapter start,
+        # so the book named here is one whose chapter is not in the book)
         (b1, u1), = self.books[:1]
-        self.fill(b1, KU_CH.format(1) + '#kobo.999.1', 4, datetime.datetime(2026, 11, 1, 10, 0, tzinfo=UTC))
+        self.fill(b1, 'text/nowhere.xhtml#kobo.1.1', 4, datetime.datetime(2026, 11, 1, 10, 0, tzinfo=UTC))
         self.set_ku()
         res = self.run_ui(manual=True)
         title = self.lib.api.field_for('title', b1)
         lines = [line for line in res.kobo_ku_lines if title in line]
-        self.assertTrue(lines and 'kobo.999.1' in lines[0] and 'not in the KEPUB' in lines[0], res.kobo_ku_lines)
+        self.assertTrue(lines and 'text/nowhere.xhtml' in lines[0] and 'not in this book' in lines[0],
+                        res.kobo_ku_lines)
 
     def test_a_newer_calibre_web_place_wins(self):
         (b1, u1), = self.books[:1]
@@ -1583,7 +1586,8 @@ class RealKuReviewRound1Tests(RealCalibreBase):
 
     # -- S1 (Kobo Touch Extended) -----------------------------------------------------------
 
-    def test_S1_with_kobo_touch_extended_installed_spans_are_approximate(self):
+    def test_S1_with_kobo_touch_extended_installed_spans_go_to_their_chapter_start(self):
+        # re-review B1-R1 supersedes round 1's span~
         import kobo_ku
         import ui
         self.columns(('kobo_reading_location', 'Kobo location', 'text'), ('kobo_last_read', 'Kobo last read', 'datetime'))
@@ -1596,8 +1600,9 @@ class RealKuReviewRound1Tests(RealCalibreBase):
             res = self.run_ui()
         with open(os.path.join(self.lib.path, 'CalibReader_positions.json'), encoding='utf-8') as f:
             entry = json.load(f)['positions'][u1]
-        self.assertEqual(entry['kobo']['precision'], 'span~')
-        self.assertTrue(any('Kobo Touch Extended' in line for line in res.kobo_ku_lines), res.kobo_ku_lines)
+        self.assertEqual((entry['chapter'], entry['textAnchor'], entry['kobo']['precision']), (2, 0, 'chapter'))
+        self.assertTrue(any('Kobo Touch Extended' in line and 'start of its chapter' in line
+                            for line in res.kobo_ku_lines), res.kobo_ku_lines)
 
     # -- NITs 1, 2, 10 ----------------------------------------------------------------------
 
