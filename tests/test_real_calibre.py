@@ -1295,6 +1295,20 @@ class RealKoboUtilitiesTests(RealCalibreBase):
         # picked by hand they are still there to pick (only never suggested)
         self.assertGreaterEqual(w.combos['percent'].findData('#kobo_percent_read'), 0)
 
+    def test_a_ku_column_that_calibreader_also_writes_stops_the_ku_route(self):
+        # CalibReader writing the app's % into the column the KU route reads would come back as a
+        # "Kobo" place: the route does not run, one note says why.
+        (b1, u1), = self.books[:1]
+        self.fill(b1, None, 40, datetime.datetime(2026, 11, 1, 10, 0, tzinfo=UTC))
+        self.lib.set_settings({'version': 1, 'percent_column': '#kobo_percent_read', 'last_read_column': '',
+                               'progress_threshold': 1, 'auto_sync': True})
+        self.set_ku()
+        res = self.run_ui()
+        self.assertEqual(res.kobo_ku_imported, 0)
+        self.assertTrue(any('#kobo_percent_read' in n and 'CalibReader' in n for n in res.notes), res.notes)
+        entries = self.entries()
+        self.assertFalse([e for e in entries.values() if e.get('deviceId') == 'kobo-utilities'])
+
     def test_a_newer_calibre_web_place_wins(self):
         (b1, u1), = self.books[:1]
         with open(os.path.join(self.lib.path, 'CalibReader_positions.json'), 'w', encoding='utf-8') as f:
