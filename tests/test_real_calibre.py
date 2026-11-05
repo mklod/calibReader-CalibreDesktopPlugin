@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0413
+# Last modified: 2026-11-05--0429
 #
 # test_real_calibre.py — CalibReader Sync against REAL calibre (LibraryDatabase, set_field,
 # metadata.db, JSONConfig, the Settings widget), not the in-memory FakeDB of sync_core.py.
@@ -185,13 +185,108 @@ class RealCalibreBase(unittest.TestCase):
             library_view = View()
             current_db = self.lib.legacy
 
+        class Kick(object):
+            starts = 0
+
+            def start(self, ms):
+                Kick.starts += 1
+
         class Action(object):
             gui = Gui()
+            _kick = Kick()
+            _run_kobo = ui.CalibReaderSyncAction._run_kobo     # the real Kobo step (1.5.0)
+        self.kicks = Kick
         from sync_core import SETTINGS_KEY, normalise_settings
         settings = normalise_settings(self.lib.api.pref(SETTINGS_KEY, None))
         if approve is None:
             return ui.CalibReaderSyncAction._run(Action(), self.lib.api, settings)
         return ui.CalibReaderSyncAction._run(Action(), self.lib.api, settings, approve=approve)
+
+
+@unittest.skipUnless(HAVE_CALIBRE, 'needs calibre (run tests/run_calibre.sh)')
+class RealKoboRunTests(RealCalibreBase):
+    '''1.5.0: the Kobo step of a real run (ui._run -> _run_kobo -> kobo_push.sync_kobo), with
+    calibre's own lookup (format_abspath EPUB/KEPUB), the plugin's real JSONConfig and a
+    stand-in Calibre-Web on 127.0.0.1 (tests/test_kobo_push.FakeCalibreWeb).'''
+
+    def setUp(self):
+        RealCalibreBase.setUp(self)
+        if TESTS not in sys.path:
+            sys.path.insert(0, TESTS)
+        import test_kobo_push as tkp
+        self.tkp = tkp
+        (self.book, self.uuid), = self.lib.books(1)
+        fixtures = os.path.join(TESTS, 'fixtures')
+        self.lib.api.add_format(self.book, 'EPUB', os.path.join(fixtures, 'metamorphosis.epub'))
+        self.lib.api.add_format(self.book, 'KEPUB', os.path.join(fixtures, 'metamorphosis.kepub'))
+        self.app_db = os.path.join(self.lib.path, '..', os.path.basename(self.lib.path) + '-app.db')
+        con = sqlite3.connect(self.app_db)
+        con.executescript(tkp.SCHEMA)
+        con.execute("INSERT INTO user VALUES (1, 'admin', 'a@x', 1)")
+        con.execute('INSERT INTO remote_auth_token (auth_token, user_id, token_type) VALUES (?, 1, 1)', (tkp.TOKEN,))
+        con.execute('INSERT INTO settings VALUES (1, ?)', (self.lib.path,))
+        cur = con.execute("INSERT INTO kobo_reading_state (user_id, book_id, last_modified, priority_timestamp) "
+                          "VALUES (1, ?, '2026-10-30 21:03:48', '2026-10-30 21:03:48')", (self.book,))
+        con.execute("INSERT INTO kobo_bookmark (kobo_reading_state_id, last_modified, location_source, location_type, "
+                    "location_value, progress_percent, content_source_progress_percent) "
+                    "VALUES (?, '2026-10-30 21:03:48', ?, 'KoboSpan', 'kobo.3.5', 12.0, 3.0)",
+                    (cur.lastrowid, tkp.CH.format(1)))
+        con.commit()
+        con.close()
+        self.cw = tkp.FakeCalibreWeb(self.app_db, {self.uuid: self.book})
+        with open(os.path.join(self.lib.path, 'CalibReader_positions.json'), 'w', encoding='utf-8') as f:
+            json.dump({'schema': 1, 'positions': {self.uuid: {
+                'chapter': 3, 'page': 1, 'scrollY': 0, 'progress': 0.4, 'textAnchor': 2900,
+                'updated_at': '2026-10-31T10:00:00.000Z', 'deviceId': tkp.PHONE}}}, f)
+
+    def tearDown(self):
+        self.cw.stop()
+        try:
+            os.remove(self.app_db)
+        except OSError:
+            pass
+        RealCalibreBase.tearDown(self)
+
+    def set_kobo(self, **extra):
+        import ui
+        entry = {'app_db': self.app_db, 'user': 'admin', 'cw_url': self.cw.url}
+        entry.update(extra)
+        ui.PREFS['kobo'] = {self.lib.path: entry}
+
+    def test_nothing_is_sent_until_the_box_is_ticked(self):
+        self.set_kobo()                                     # Settings saved, box never ticked
+        res = self.run_ui()
+        self.assertEqual((self.cw.requests, res.kobo_pushed), ([], 0))
+        self.set_kobo(push=False)
+        self.run_ui()
+        self.assertEqual(self.cw.requests, [])
+        self.assertFalse([n for n in res.notes if 'Kobo' in n], res.notes)
+
+    def test_ticked_it_sends_the_span_once_and_the_import_skips_the_echo(self):
+        import ui
+        self.set_kobo(push=True)
+        res = self.run_ui()
+        self.assertEqual(res.kobo_pushed, 1, res.notes)
+        (_, path, body, user, _), = self.cw.requests
+        self.assertNotIn(self.tkp.TOKEN, ' '.join(res.notes + res.kobo_push_lines))
+        loc = body['ReadingStates'][0]['CurrentBookmark']['Location']
+        self.assertEqual((loc['Type'], loc['Source']), ('KoboSpan', self.tkp.CH.format(2)))
+        self.assertTrue(any('sentence' in line for line in res.kobo_push_lines), res.kobo_push_lines)
+        self.assertIn('sent to the Kobo', res.status_line())
+        memory = ui.PREFS['kobo_pushed'][self.lib.path]
+        self.assertEqual(memory[self.uuid.lower()]['value'], loc['Value'])
+        before = open(os.path.join(self.lib.path, 'CalibReader_positions.json'), 'rb').read()
+        res = self.run_ui()                                  # Calibre-Web stamped our push: newer than the app's
+        self.assertEqual((res.kobo_imported, res.kobo_pushed, len(self.cw.requests)), (0, 0, 1), res.notes)
+        self.assertEqual(open(os.path.join(self.lib.path, 'CalibReader_positions.json'), 'rb').read(), before)
+
+    def test_calibre_web_down_is_one_note_and_no_follow_up_run(self):
+        self.set_kobo(push=True, cw_url=self.tkp.closed_port())
+        res = self.run_ui()
+        self.assertEqual(res.kobo_pushed, 0)
+        self.assertEqual(len([n for n in res.notes if 'did not answer' in n]), 1, res.notes)
+        self.assertEqual(self.kicks.starts, 0)
+        self.assertIn('needs attention', res.status_line())
 
 
 class RealSyncPathTests(RealCalibreBase):
