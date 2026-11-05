@@ -378,6 +378,97 @@ class RealKoboRunTests(RealCalibreBase):
         self.assertIn('push_since', ui.PREFS['kobo'][self.lib.path])
         self.assertTrue(pres is None or not pres.sent)
 
+    # -- re-review round 1 ---------------------------------------------------------------
+    def second_book(self):
+        '''A second book on the Kobo with an app place (for a batch of two PUTs).'''
+        (_, _), (book2, uuid2) = self.lib.books(2)
+        fixtures = os.path.join(TESTS, 'fixtures')
+        self.lib.api.add_format(book2, 'EPUB', os.path.join(fixtures, 'metamorphosis.epub'))
+        self.lib.api.add_format(book2, 'KEPUB', os.path.join(fixtures, 'metamorphosis.kepub'))
+        con = sqlite3.connect(self.app_db)
+        cur = con.execute("INSERT INTO kobo_reading_state (user_id, book_id, last_modified, priority_timestamp) "
+                          "VALUES (1, ?, '2026-10-30 21:03:48', '2026-10-30 21:03:48')", (book2,))
+        con.execute("INSERT INTO kobo_bookmark (kobo_reading_state_id, last_modified) VALUES (?, '2026-10-30 21:03:48')",
+                    (cur.lastrowid,))
+        con.commit()
+        con.close()
+        self.cw.books[uuid2] = book2
+        path = os.path.join(self.lib.path, 'CalibReader_positions.json')
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+        data['positions'][uuid2] = {'chapter': 3, 'page': 1, 'scrollY': 0, 'progress': 0.4, 'textAnchor': 500,
+                                    'updated_at': '2026-10-31T10:00:00.000Z', 'deviceId': self.tkp.PHONE}
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+        return uuid2
+
+    def test_R1S3_unticking_stops_a_running_batch(self):
+        import kobo_push
+        self.second_book()
+        self.set_kobo(push=True, push_since=self.SINCE)
+        gate, entered = threading.Event(), threading.Event()
+        real = kobo_push._send
+
+        def held(*a, **kw):
+            entered.set()
+            gate.wait(10)
+            return real(*a, **kw)
+        with mock.patch('kobo_push._send', side_effect=held):
+            self.run_ui()
+            self.assertTrue(entered.wait(10))                  # the first PUT is in flight
+            self.set_kobo(push=False)                         # the tester unticks the box
+            gate.set()
+            pres = self.wait_push()
+        self.assertEqual(len(self.cw.requests), 1)
+        self.assertTrue(any('turned off' in n for n in pres.notes), pres.notes)
+
+    def test_R1S2_a_push_in_flight_is_already_on_disk(self):
+        import kobo_push
+        import ui
+        self.set_kobo(push=True, push_since=self.SINCE)
+        gate, entered = threading.Event(), threading.Event()
+        real = kobo_push._send
+
+        def held(*a, **kw):
+            entered.set()
+            gate.wait(10)
+            return real(*a, **kw)
+        try:
+            with mock.patch('kobo_push._send', side_effect=held):
+                self.run_ui()
+                self.assertTrue(entered.wait(10))              # the PUT is in flight
+                # calibre closes now: a new session reads what the old one had on disk
+                fresh = kobo_push.load_state(ui.KOBO_JOURNAL, self.lib.path).memory
+                self.assertIn(self.uuid.lower(), fresh)
+                self.assertIs(fresh[self.uuid.lower()]['confirmed'], False)
+                gate.set()
+                pres = self.wait_push()
+            self.assertEqual(len(pres.sent), 1)
+            confirmed = kobo_push.load_state(ui.KOBO_JOURNAL, self.lib.path).memory[self.uuid.lower()]
+            self.assertIs(confirmed['confirmed'], True)
+        finally:
+            gate.set()
+            if os.path.exists(ui.KOBO_JOURNAL):
+                os.remove(ui.KOBO_JOURNAL)
+
+    def test_R1N3_a_run_that_found_the_worker_busy_is_run_again_after_it(self):
+        import kobo_push
+        self.set_kobo(push=True, push_since=self.SINCE)
+        gate, entered = threading.Event(), threading.Event()
+        real = kobo_push._send
+
+        def held(*a, **kw):
+            entered.set()
+            gate.wait(10)
+            return real(*a, **kw)
+        with mock.patch('kobo_push._send', side_effect=held):
+            self.run_ui()
+            res = self.run_ui()                                # the worker is still sending
+            self.assertFalse(res.kobo_push_started)
+            gate.set()
+            self.wait_push()
+        self.assertEqual(self.kicks.starts, 1)
+
 
 class RealSyncPathTests(RealCalibreBase):
 

@@ -948,14 +948,15 @@ class ReviewS1Tests(PushBase):
         self.kobo_moves(60, 'KoboSpan', 'kobo.5.1', '/' + CH.format(2), 34.0, 7.0)
         self.assert_no_kobo_entry()
 
-    def test_S1_a_percent_push_landing_slightly_ahead_is_ours(self):
+    def test_S1_a_percent_push_landing_slightly_behind_is_ours(self):
         self.kobo(61, '2026-10-30 21:03:48')
         self.app(NOKEPUB, 3, 20000)
         _, pres = self.sync(since=SINCE)
         self.assertEqual(pres.sent, [NOKEPUB])
         sent = self.memory[NOKEPUB]['progressPercent']
-        # the Kobo lands by its own measure a little further on and reports its own place
-        self.kobo_moves(61, '', '', CH.format(2), sent + 1.0, 55.0)
+        # the Kobo lands by its own measure a little before our % and reports its own place
+        # (re-review R1-S1: further on than our % + 0.5 is a real move, not ours)
+        self.kobo_moves(61, '', '', CH.format(2), sent - 1.0, 45.0)
         self.assert_no_kobo_entry()
 
     def test_S1_a_real_move_outside_the_window_is_imported(self):
@@ -1095,6 +1096,195 @@ class ReviewNitTests(PushBase):
         self.assertTrue(self.puts()[0][1].startswith('/kobo/{}/v1/'.format(TOKEN)))
         self.assertTrue(any('/kobo/' in n for n in res.notes), res.notes)
         self.assertNotIn(TOKEN2, ' '.join(res.notes))
+
+
+
+# -- re-review round 1 (REVIEW-STEP2.md "Re-review round 1") ----------------------------------
+
+class ReReviewS1Tests(PushBase):
+    '''R1-S1: an echo window swallows only the Kobo's report OF OUR PUSH (its place still
+    matches what we sent); a Kobo move beyond it imports exactly as in 1.4.0, and once the app
+    or the Kobo has moved on, the record no longer hides anything.'''
+
+    def pushed_percent(self):
+        # the Kobo (plain EPUB) at 44 % of the book; the app at 60 % of Part II's text (45.66 %)
+        self.kobo(61, '2026-10-30 21:03:48', CH.format(2), '', '', 44.0, 30.0)
+        self.app(NOKEPUB, 3, int(40209 * 0.60))
+        _, pres = self.sync()
+        self.assertEqual(pres.sent, [NOKEPUB])
+        return self.memory[NOKEPUB]['progressPercent']
+
+    def test_R1S1_a_forward_kobo_move_after_a_percent_push_is_imported(self):
+        sent = self.pushed_percent()
+        self.assertAlmostEqual(sent, 45.66, delta=0.05)
+        self.kobo_moves(61, '', '', CH.format(2), 47.5, 55.0)            # read on, on the Kobo
+        kres, _ = self.sync(push=False)
+        self.assertEqual(kres.written, [NOKEPUB])
+        self.assertEqual(self.read_positions()['positions'][NOKEPUB]['deviceId'], kobo_import.KOBO_DEVICE_ID)
+
+    def test_R1S1_the_kobo_at_our_percent_within_rounding_is_still_ours(self):
+        sent = self.pushed_percent()
+        self.kobo_moves(61, '', '', CH.format(2), round(sent + 0.4, 1), 61.0)
+        before = open(self.positions_path, 'rb').read()
+        kres, _ = self.sync(push=False)
+        self.assertEqual(kres.written, [])
+        self.assertEqual(open(self.positions_path, 'rb').read(), before)
+
+    def test_R1S1_a_kobo_span_after_ours_is_a_real_move(self):
+        self.kobo(60, '2026-10-30 21:03:48', CH.format(1), 'KoboSpan', 'kobo.3.5', 12.0, 3.0)
+        self.app(UUID, 3, self.anchor_of(3, 'kobo.5.1'))                 # exactly on kobo.5.1's start
+        _, pres = self.sync()
+        self.assertEqual(pres.sent, [UUID])
+        self.kobo_moves(60, 'KoboSpan', 'kobo.5.2', CH.format(2), 30.0, 7.5)
+        kres, _ = self.sync(push=False)
+        self.assertEqual(kres.written, [UUID])
+
+    def test_R1S1_a_kobo_paging_back_after_the_app_moved_on_shows_the_card_again(self):
+        # re-review probe: span push in Part II; the app reads on into Part III (Calibre-Web
+        # unreachable, so not sent); then the Kobo pages back about a page in Part II.
+        self.kobo(60, '2026-10-30 21:03:48', CH.format(1), 'KoboSpan', 'kobo.3.5', 12.0, 3.0)
+        anchor = self.anchor_of(3, 'kobo.8.1', plus=5)
+        self.app(UUID, 3, anchor)
+        _, pres = self.sync()
+        self.assertEqual(pres.sent, [UUID])
+        self.app(UUID, 4, 9000, stamp=iso_in(0))
+        _, pres = self.sync(url=closed_port())
+        self.assertEqual(pres.sent, [])
+        time.sleep(0.01)
+        e, k = kobo_position.Book(EPUB), kobo_position.Book(KEPUB)
+        try:
+            _, spans = kobo_position.kepub_spans(e, k, 3)
+        finally:
+            e.close()
+            k.close()
+        sid = max((a, s) for a, s in spans if a <= anchor - 1200)[1]
+        self.kobo_moves(60, 'KoboSpan', sid, CH.format(2), 30.0, 20.0)
+        kres, _ = self.sync(push=False)
+        self.assertEqual(kres.written, [UUID])
+
+    def test_R1S1_after_a_real_kobo_move_a_page_back_is_imported(self):
+        self.kobo(60, '2026-10-30 21:03:48', CH.format(1), 'KoboSpan', 'kobo.3.5', 12.0, 3.0)
+        self.app(UUID, 3, self.anchor_of(3, 'kobo.5.1', plus=7))
+        _, pres = self.sync()
+        self.assertEqual(pres.sent, [UUID])
+        self.kobo_moves(60, 'KoboSpan', 'kobo.20.1', CH.format(2), 45.0, 30.0)   # the Kobo reads on
+        kres, _ = self.sync(push=False)
+        self.assertEqual(kres.written, [UUID])
+        time.sleep(0.01)
+        self.kobo_moves(60, 'KoboSpan', 'kobo.4.7', CH.format(2), 30.0, 7.0)     # then pages way back
+        kres, _ = self.sync(push=False)
+        self.assertEqual(kres.written, [UUID])
+        self.assertEqual(self.read_positions()['positions'][UUID]['kobo']['value'], 'kobo.4.7')
+
+
+class ReReviewS2Tests(PushBase):
+    '''R1-S2: what is about to be sent is persisted BEFORE the PUT (unconfirmed), then confirmed
+    or dropped; a calibre that closes mid-send never sees its own push come back as a card.'''
+
+    def test_R1S2_the_record_is_persisted_before_the_put_and_confirmed_after(self):
+        self.kobo(60, '2026-10-30 21:03:48')
+        self.app(UUID, 3, 500)
+        saved = []
+
+        def persist(memory):
+            saved.append(json.loads(json.dumps(memory)))
+        at_put = []
+        real = kobo_push._send
+
+        def send(*a, **kw):
+            at_put.append(json.loads(json.dumps(saved[-1])) if saved else None)
+            return real(*a, **kw)
+        with mock.patch('kobo_push._send', side_effect=send):
+            res = self.push(persist=persist)
+        self.assertEqual(res.sent, [UUID])
+        self.assertIs(at_put[0][UUID]['confirmed'], False)               # on disk before the request
+        self.assertIs(saved[-1][UUID]['confirmed'], True)
+
+    def test_R1S2_a_failed_put_is_dropped_from_what_was_persisted(self):
+        self.kobo(60, '2026-10-30 21:03:48')
+        self.app(UUID, 3, 500)
+        saved = []
+        res = self.push(url=closed_port(), persist=lambda m: saved.append(dict(m)))
+        self.assertEqual(res.sent, [])
+        self.assertNotIn(UUID, saved[-1])
+
+    def test_R1S2_calibre_closing_mid_send_does_not_bring_our_push_back(self):
+        # re-review probe: the PUT lands, calibre closes before the GUI thread saves anything.
+        self.kobo(60, '2026-10-30 21:03:48', CH.format(1), 'KoboSpan', 'kobo.3.5', 12.0, 3.0)
+        self.app(UUID, 3, self.anchor_of(3, 'kobo.5.1', plus=7))
+        journal = os.path.join(self.dir, 'journal.json')
+        state = kobo_push.load_state(journal, self.lib)
+        worker_memory = state.memory
+        res = kobo_push.push_positions(self.lib, self.app_db, self.lookup, base_url=self.cw.url, memory=worker_memory,
+                                       user='admin', since=SINCE, persist=lambda m: state.save())
+        self.assertEqual(res.sent, [UUID])
+        del worker_memory, state                                          # calibre gone
+        after_restart = kobo_push.load_state(journal, self.lib).memory
+        before = open(self.positions_path, 'rb').read()
+        kres = kobo_import.import_positions(self.lib, self.app_db, self.lookup, user='admin', pushed=after_restart)
+        self.assertEqual(kres.written, [])
+        self.assertEqual(open(self.positions_path, 'rb').read(), before)
+
+    def test_R1S2_an_unconfirmed_record_whose_put_never_landed_is_sent_again(self):
+        # calibre died after persisting, before the PUT: Calibre-Web still has the old place.
+        self.kobo(60, '2026-10-30 21:03:48')
+        self.app(UUID, 3, 500)
+        self.memory[UUID] = {'type': 'KoboSpan', 'value': 'kobo.5.9', 'source': CH.format(2), 'progressPercent': 30.0,
+                             'contentSourceProgressPercent': 5.0, 'precision': 'span', 'chapter': 3,
+                             'textAnchor': 480, 'app_chapter': 3, 'app_textAnchor': 500,
+                             'app_updated_at': '2026-10-31T10:00:00.000Z', 'pushed_at': '2026-10-31T10:00:01Z',
+                             'confirmed': False}
+        res = self.push()
+        self.assertEqual(res.sent, [UUID])
+        self.assertIs(self.memory[UUID]['confirmed'], True)
+
+    def test_R1S2_the_state_file_keeps_other_libraries(self):
+        path = os.path.join(self.dir, 'journal.json')
+        a, b = kobo_push.load_state(path, self.lib), kobo_push.load_state(path, self.dir)
+        a.memory['x'] = {'value': 'a'}
+        a.save()
+        b.memory['y'] = {'value': 'b'}
+        b.save()                                                          # must not drop library a
+        self.assertEqual(kobo_push.load_state(path, self.lib).memory, {'x': {'value': 'a'}})
+
+
+class ReReviewS3Tests(PushBase):
+    '''R1-S3: the consent is checked before EVERY PUT of a running batch.'''
+
+    def test_R1S3_unticking_stops_the_batch_at_once(self):
+        for bid, uuid in ((60, UUID), (61, NOKEPUB), (62, THIRD)):
+            self.kobo(bid, '2026-10-30 21:03:48')
+            self.app(uuid, 3, 500)
+        answers = iter([True])
+        res = self.push(still_on=lambda: next(answers, False))           # unticked after the first PUT
+        self.assertEqual(len(self.puts()), 1)
+        self.assertEqual((len(res.sent), res.more), (1, False))
+        self.assertTrue(any('turned off' in n for n in res.notes), res.notes)
+
+    def test_R1S3_off_before_the_first_put_sends_nothing(self):
+        self.kobo(60, '2026-10-30 21:03:48')
+        self.app(UUID, 3, 500)
+        res = self.push(still_on=lambda: False)
+        self.assertEqual((res.sent, self.puts()), ([], []))
+
+
+class ReReviewNitTests(PushBase):
+
+    def test_R1N1_a_kobo_at_100_percent_is_not_sent_a_place(self):
+        # an old Part I span with 100 % (a Finished PUT kept the old Location): never raise to 100 %
+        self.kobo(60, '2026-10-31 09:00:00', CH.format(1), 'KoboSpan', 'kobo.3.5', 100.0, 100.0)
+        self.app(UUID, 3, self.anchor_of(3, 'kobo.5.1', plus=7), stamp='2026-10-31T10:00:00.000Z')
+        res = self.push()
+        self.assertEqual((res.sent, self.puts()), ([], []))
+        self.assertIn('finished', res.skipped[UUID])
+
+    def test_R1N1_the_chapter_percent_is_not_below_the_kobos_own_in_the_same_chapter(self):
+        self.kobo(60, '2026-10-30 21:03:48', CH.format(2), 'KoboSpan', 'kobo.5.1', 30.0, 9.0)
+        self.app(UUID, 3, self.anchor_of(3, 'kobo.6.1', plus=3))
+        res = self.push()
+        self.assertEqual(res.sent, [UUID])
+        bm = self.puts()[0][2]['ReadingStates'][0]['CurrentBookmark']
+        self.assertGreaterEqual(bm['ContentSourceProgressPercent'], 9.0)
 
 
 if __name__ == '__main__':
