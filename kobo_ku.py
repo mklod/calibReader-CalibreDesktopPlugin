@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--1033
+# Last modified: 2026-11-05--1118
 #
 # kobo_ku.py — Kobo reading places stored by the Kobo Utilities calibre plugin (USB sync)
 # into CalibReader_positions.json (plugin 1.7.0, tester preview). Kobo -> CalibReader only.
@@ -48,6 +48,7 @@ import re
 import sqlite3
 import threading
 import time
+import zipfile
 from urllib.parse import unquote
 
 try:
@@ -82,6 +83,10 @@ CACHE_CAP = 200 * 1024 * 1024   # ruling 6: the kepub cache, in bytes
 STALE_DAYS = 14             # 8.6: "Kobo Utilities has not stored positions since …"
 FUTURE_SLACK = _dt.timedelta(minutes=10)   # M2: a Kobo date this far ahead of us is a wrong clock
 DUMMY_TITLE_PAGE = 'kobo-title-page-generated-by-calibre'   # calibre's kepubify adds it before a coverless book
+AGREE_CHARS = 3             # review S1: two numberings landing this close agree
+STALE_TEMP_SECONDS = 600    # review S2: a temp file / work folder this old in the cache is a leftover
+KTE_NOTE = ('the Kobo Touch Extended driver plugin is installed in calibre, so the Kobo\'s copy of a book may be '
+            'numbered differently from calibre\'s own: the Kobo\'s sentence is passed on as an approximate place')
 
 LOCATION_TYPES = ('text', 'comments')
 PERCENT_TYPES = ('int', 'float')
@@ -208,7 +213,10 @@ def _for_lookup(href):
 def map_ku(epub, parsed, percent=None, kepub=None):
     '''A parsed KU location (+ the Kobo's book %) -> ({chapter, textAnchor, progress, precision
     [, note]}, None) or (None, why). `kepub`: a callable -> (Book of the KEPUB calibre sends for
-    this book, None) or (None, why); called only for a span.'''
+    this book, None) or (None, why); called only for a span. Review S1: it may give a LIST of
+    Books (a stored KEPUB and calibre's own conversion, when it is not known which one the Kobo
+    has): the span is resolved in each and the EARLIEST landing is kept, never one after the
+    Kobo's real place; landings more than AGREE_CHARS apart are marked span~.'''
     pct = _pct(percent)
     n = len(epub.chapters)
     if n == 0:
@@ -241,14 +249,19 @@ def map_ku(epub, parsed, percent=None, kepub=None):
     anchor = precision = note = None
     if parsed['form'] == 'span':
         book, why = kepub() if kepub is not None else (None, 'calibre\'s KEPUB converter is not available here')
-        if book is None:
+        books = [b for b in (book if isinstance(book, (list, tuple)) else [book]) if b is not None]
+        if not books:
             note = 'span not mapped: {}'.format(why or 'no KEPUB')
         else:
-            hit = resolve_span(epub, book, chapter, parsed['span'])
-            if hit is None:
+            hits = [h for h in (resolve_span(epub, b, chapter, parsed['span']) for b in books) if h is not None]
+            if not hits:
                 return None, ('span {} is not in the KEPUB calibre sends for this book (the book changed since it '
                               'was sent, or another tool made the Kobo\'s copy)'.format(parsed['span']))
-            anchor, precision = hit
+            anchor, precision = min(hits)
+            spread = max(h[0] for h in hits) - anchor
+            if spread > AGREE_CHARS:
+                precision = SPAN_APPROX
+                note = ('two numberings disagree ({} characters apart): the earlier place kept'.format(spread))
             if pct is not None and abs(pct_at(chapter, anchor) - pct) > DISTRUST_POINTS:
                 note = 'span not trusted: it is {:.0f} % into the book, the Kobo says {:.0f} %'.format(
                     pct_at(chapter, anchor), pct)
@@ -325,22 +338,35 @@ def calibre_options():
 
 
 def calibre_kepubify(options=None):
-    '''-> regenerate(src, out) running calibre's own kepubify in-process, or None outside calibre.'''
+    '''-> regenerate(src, out) running calibre's own kepubify in-process, or None outside calibre.
+    Review S2: kepubify_path unpacks the book into a calibre temp folder that stays until calibre
+    quits; this runs the same three steps (get_container, kepubify_container, commit) in a work
+    folder of ours next to `out` (inside the cache, counted against its cap), removed at once.'''
     try:
         from calibre.ebooks.oeb.polish.kepubify import kepubify_path
     except Exception:
         return None
     try:
-        from calibre.ebooks.oeb.polish.kepubify import make_options
-    except Exception:                       # pragma: no cover - every calibre 8.0-9.14 has it
-        make_options = None
+        from calibre.ebooks.oeb.polish.container import get_container
+        from calibre.ebooks.oeb.polish.kepubify import kepubify_container, make_options
+    except Exception:                       # pragma: no cover - every calibre 8.0-9.14 has them
+        get_container = None
     justify = bool((options or {}).get('prefer_justification'))
 
     def regenerate(src, out):
-        if make_options is None:            # pragma: no cover
+        if get_container is None:           # pragma: no cover
             kepubify_path(src, outpath=out, allow_overwrite=True)
             return
-        kepubify_path(src, outpath=out, allow_overwrite=True, opts=make_options(prefer_justification=justify))
+        import shutil
+        import tempfile
+        work = tempfile.mkdtemp(prefix='work-{}-{}-'.format(os.getpid(), threading.get_ident()),
+                                dir=os.path.dirname(os.path.abspath(out)))
+        try:
+            container = get_container(src, tdir=work, tweak_mode=True)
+            kepubify_container(container, make_options(prefer_justification=justify))
+            container.commit(outpath=out)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
     return regenerate
 
 
@@ -382,11 +408,17 @@ class KepubCache(object):
             return None, 'the EPUB could not be read ({})'.format(exc)
         out = os.path.join(self.folder, key + '.kepub')
         if os.path.isfile(out):
-            try:
-                os.utime(out, None)             # recently used
-                return out, None
-            except OSError:
-                pass                            # deleted meanwhile: make it again
+            if zipfile.is_zipfile(out):
+                try:
+                    os.utime(out, None)         # recently used
+                    return out, None
+                except OSError:
+                    pass                        # deleted meanwhile: make it again
+            else:
+                try:
+                    os.remove(out)              # NIT 8: damaged (a crash, a disk error): made again
+                except OSError:
+                    pass
         try:
             os.makedirs(self.folder, exist_ok=True)
         except OSError as exc:
@@ -406,22 +438,59 @@ class KepubCache(object):
         self.evict(keep=out)
         return out, None
 
-    def evict(self, keep=None):
+    def _entries(self):
+        '''[(mtime, bytes, path, is_dir)] of everything in the cache folder (sub-folders summed).'''
         try:
             names = os.listdir(self.folder)
         except OSError:
-            return
-        files = []
+            return []
+        out = []
         for name in names:
-            if not name.endswith('.kepub'):
-                continue
             p = os.path.join(self.folder, name)
             try:
                 st = os.stat(p)
             except OSError:
                 continue
-            files.append((st.st_mtime, st.st_size, p))
-        total = sum(size for _, size, _ in files)
+            size, is_dir = st.st_size, os.path.isdir(p)
+            if is_dir:
+                size = 0
+                for d, _, fs in os.walk(p):
+                    for f in fs:
+                        try:
+                            size += os.path.getsize(os.path.join(d, f))
+                        except OSError:
+                            pass
+            out.append((st.st_mtime, size, p, is_dir))
+        return out
+
+    def used(self):
+        '''Bytes the plugin keeps in its cache folder: KEPUBs, temp files and work folders.'''
+        return sum(size for _, size, _, _ in self._entries())
+
+    def evict(self, keep=None):
+        '''Review S2: everything in the folder counts against the cap. Leftovers (a temp file or
+        a work folder older than STALE_TEMP_SECONDS: calibre killed mid-conversion) go first,
+        then the least recently used KEPUBs.'''
+        entries = self._entries()
+        total = sum(size for _, size, _, _ in entries)
+        now = time.time()
+        files = []
+        for mtime, size, p, is_dir in entries:
+            name = os.path.basename(p)
+            if name.endswith('.kepub') and not is_dir:
+                files.append((mtime, size, p))
+                continue
+            if now - mtime < STALE_TEMP_SECONDS:
+                continue                        # a conversion running right now
+            try:
+                if is_dir:
+                    import shutil
+                    shutil.rmtree(p)
+                else:
+                    os.remove(p)
+                total -= size
+            except OSError:
+                pass
         for _, size, p in sorted(files):
             if total <= self.cap:
                 break
@@ -434,23 +503,47 @@ class KepubCache(object):
                 pass
 
 
-def make_kepub_for(formats_of, cache, format_map=None, kepubify=None):
+def kte_installed():
+    '''Is the Kobo Touch Extended driver plugin installed and enabled in this calibre? (Review S1:
+    it makes its own KEPUBs, and the plugin cannot tell which driver sent a book.)'''
+    try:
+        from calibre.customize.ui import initialized_plugins, is_disabled
+        for plugin in initialized_plugins():
+            name = '{} {}'.format(getattr(plugin, 'name', '') or '', type(plugin).__name__).replace(' ', '').lower()
+            if 'kobotouchextended' in name and not is_disabled(plugin):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def make_kepub_for(formats_of, cache, format_map=None, kepubify=None, kte=None):
     '''-> kepub_for(book_id, epub_path, kepub_path) for import_ku: the KEPUB the Kobo got, by
-    what calibre's Kobo driver sends for that book (driver_plan).'''
+    what calibre's Kobo driver sends for that book (driver_plan). Review S1: a stored KEPUB may
+    have been added after the book was sent (Calibre-Web's kepubify, a KEPUB conversion), so with
+    an EPUB too both numberings are given (stored, then calibre's own) and map_ku keeps the
+    earlier landing. With Kobo Touch Extended installed (`kte`, default: kte_installed()) the
+    info says the numbering is uncertain.'''
     if format_map is None or kepubify is None:
         fmap, kon = driver_settings()
         format_map = fmap if format_map is None else format_map
         kepubify = kon if kepubify is None else kepubify
+    uncertain = {'uncertain': KTE_NOTE} if (kte_installed() if kte is None else kte) else {}
 
     def kepub_for(book_id, epub_path, kepub_path):
         plan = driver_plan(formats_of(book_id), format_map, kepubify)
         if plan == 'kepub':
-            if kepub_path and os.path.isfile(kepub_path):
-                return kepub_path, None, {'kepub': 'stored KEPUB'}
-            return None, 'the book\'s KEPUB file is missing', {}
+            if not (kepub_path and os.path.isfile(kepub_path)):
+                return None, 'the book\'s KEPUB file is missing', {}
+            if epub_path and os.path.isfile(epub_path):
+                path, why = cache.path_for(book_id, epub_path)
+                if path:
+                    return [kepub_path, path], None, dict(uncertain, kepub='stored KEPUB + calibre kepubify',
+                                                          calibre=cache.version)
+            return kepub_path, None, dict(uncertain, kepub='stored KEPUB')
         if plan == 'kepubify':
             path, why = cache.path_for(book_id, epub_path)
-            return path, why, {'kepub': 'calibre kepubify', 'calibre': cache.version}
+            return path, why, dict(uncertain, kepub='calibre kepubify', calibre=cache.version)
         if plan == 'epub':
             return None, 'calibre\'s Kobo driver sends this book as a plain EPUB (its KEPUB conversion is off)', {}
         return None, 'calibre\'s Kobo driver sends this book in another format', {}
@@ -705,8 +798,9 @@ def staleness_hint(last_store, device_seen, now=None):
     if last is None:
         return ('A Kobo was connected, but Kobo Utilities has not stored any reading positions yet. In Kobo '
                 'Utilities, run "Store current reading position", or switch on its auto-store on connect.')
-    return ('Kobo Utilities has not stored positions since {}, though a Kobo was connected since. In Kobo Utilities, '
-            'run "Store current reading position", or switch on its auto-store on connect.'.format(last_store[:10]))
+    return ('The newest Kobo reading Kobo Utilities stored is from {}, and a Kobo was connected since. If you have '
+            'read on the Kobo since then, run "Store current reading position" in Kobo Utilities, or switch on its '
+            'auto-store on connect.'.format(last_store[:10]))
 
 
 # -- the import -----------------------------------------------------------------------------------
@@ -722,6 +816,7 @@ class KuImportResult(object):
         self.busy = False          # the library's Kobo lock was taken (ui.py)
         self.last_store = None
         self.problems = {}         # uuid -> why, for books whose Kobo place could not be used (summary)
+        self.uncertain = ''        # review S1: why spans were passed on as approximate (summary)
         self.titles = {}           # uuid -> title (ui.py fills it for the summary)
 
     def status_line(self):
@@ -839,11 +934,15 @@ def import_ku(library_path, source, values, lookup, memory, kepub_for=None, now=
                 return None, 'calibre\'s KEPUB converter is not available here'
             kpath, why, extra = kepub_for(book_id, epub_path, kepub_path)
             kinfo.update(extra or {})
-            if not kpath:
+            paths = [kpath] if isinstance(kpath, str) else [k for k in (kpath or []) if k]
+            if not paths:
                 return None, why
-            book = Book(kpath)
-            opened.append(book)
-            return book, None
+            books = []
+            for path in paths:
+                book = Book(path)
+                opened.append(book)
+                books.append(book)
+            return (books if len(books) > 1 else books[0]), None
         try:
             epub = Book(epub_path)
             place, why = map_ku(epub, parsed, pct, kepub=kepub)
@@ -856,9 +955,14 @@ def import_ku(library_path, source, values, lookup, memory, kepub_for=None, now=
                 if b is not None:
                     b.close()
         if place is None:
-            pending[u] = dict(record, status='no-place')
+            # NIT 7: a 0 % / 100 % with no location is the Kobo's status, not a problem to report
+            pending[u] = dict(record, status='status' if parsed is None else 'no-place')
             res.skipped[uuid] = why
             continue
+        if kinfo.get('uncertain') and place['precision'] == SPAN:
+            place['precision'] = SPAN_APPROX            # review S1: Kobo Touch Extended
+            place['note'] = kinfo['uncertain']
+            res.uncertain = kinfo['uncertain']
         kobo = {'source': KU_DEVICE_ID, 'location': loc, 'href': parsed['href'] if parsed else None,
                 'value': (parsed['span'] or parsed['cfi'] or '') if parsed else '', 'percent': pct,
                 'lastRead': last_read, 'stamp': kind, 'precision': place['precision']}
