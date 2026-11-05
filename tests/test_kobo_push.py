@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0556
+# Last modified: 2026-11-05--0659
 #
 # Step 2, CalibReader -> Kobo (kobo_push): the app's place in
 # CalibReader_positions.json is PUT to Calibre-Web's Kobo API, forward-only,
@@ -426,7 +426,8 @@ class ForwardOnlyTests(PushBase):
         res = self.push()
         self.assertEqual(res.sent, [NOKEPUB])
         bm = self.puts()[0][2]['ReadingStates'][0]['CurrentBookmark']
-        self.assertEqual(bm['Location'], {'Type': '', 'Value': '', 'Source': CH.format(2)})
+        # Step 3 (R2-N1): an empty Location, never null and never our chapter path.
+        self.assertEqual(bm['Location'], {'Type': '', 'Value': '', 'Source': ''})
         self.assertAlmostEqual(bm['ContentSourceProgressPercent'], 100.0 * 20000 / 40209, delta=0.05)
         self.assertEqual(res.precisions[NOKEPUB], kobo_position.CHAPTER_PERCENT)
         self.assertTrue(any('chapter %' in line for line in res.lines), res.lines)
@@ -1335,6 +1336,53 @@ class ReReview2Tests(PushBase):
         self.kobo_moves(60, 'KoboSpan', 'kobo.4.7', CH.format(2), 30.0, 7.0)
         kres, _ = self.sync(push=False)
         self.assertEqual(kres.written, [UUID])
+
+
+class R2N1Tests(PushBase):
+    """Step 3 (R2-N1): after a push the Kobo got as % only, Calibre-Web keeps our Location
+    whenever a later Kobo PUT has none. With our chapter path in it, the import's M5 rule
+    ("Kobo location unchanged since the last import") then skipped every %-only Kobo move
+    after the first: CalibReader stopped following that book. The %-only push leaves the
+    Location empty, so later %-only Kobo moves are still imported."""
+
+    def kobo_moves_by_percent(self, book_id, pct, cpct, user=1):
+        '''A Kobo PUT with no Location (Calibre-Web keeps the old one).'''
+        self.cw.save(user, book_id, pct, cpct, None)
+
+    def test_R2N1_a_percent_only_push_stores_no_chapter_path(self):
+        self.kobo(61, '2026-10-30 21:03:48', CH.format(2), '', '', 44.0, 30.0)
+        self.app(NOKEPUB, 3, int(40209 * 0.60))
+        _, pres = self.sync()
+        self.assertEqual(pres.sent, [NOKEPUB])
+        self.assertEqual(self.kobo_row(61)[:3], ('', '', ''))
+        self.assertEqual(self.memory[NOKEPUB]['source'], '')
+
+    def test_R2N1_every_later_percent_only_kobo_move_is_imported(self):
+        self.kobo(61, '2026-10-30 21:03:48', CH.format(2), '', '', 44.0, 30.0)
+        self.app(NOKEPUB, 3, int(40209 * 0.60))
+        _, pres = self.sync()
+        self.assertEqual(pres.sent, [NOKEPUB])
+        time.sleep(0.01)
+        self.kobo_moves_by_percent(61, 47.5, 55.0)                     # read on, on the Kobo
+        kres, _ = self.sync(push=False)
+        self.assertEqual(kres.written, [NOKEPUB])
+        first = self.read_positions()['positions'][NOKEPUB]
+        time.sleep(0.01)
+        self.kobo_moves_by_percent(61, 52.0, 70.0)                     # and on again
+        kres, _ = self.sync(push=False)
+        self.assertEqual(kres.written, [NOKEPUB], kres.skipped)
+        second = self.read_positions()['positions'][NOKEPUB]
+        self.assertEqual(second['deviceId'], kobo_import.KOBO_DEVICE_ID)
+        self.assertGreater(second['progress'], first['progress'])
+
+    def test_R2N1_our_empty_location_still_comes_back_as_our_echo(self):
+        self.kobo(61, '2026-10-30 21:03:48', CH.format(2), '', '', 44.0, 30.0)
+        self.app(NOKEPUB, 3, int(40209 * 0.60))
+        self.sync()
+        before = open(self.positions_path, 'rb').read()
+        kres, _ = self.sync(push=False)
+        self.assertEqual(kres.written, [])
+        self.assertEqual(open(self.positions_path, 'rb').read(), before)
 
 
 if __name__ == '__main__':
