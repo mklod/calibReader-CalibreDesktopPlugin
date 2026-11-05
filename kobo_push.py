@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0516
+# Last modified: 2026-11-05--0543
 #
 # kobo_push.py — CalibReader's reading place to the Kobo, through Calibre-Web
 # (step 2 of the Kobo sync, plugin 1.5.0, tester preview).
@@ -63,7 +63,7 @@ import urllib.request
 try:
     from calibre_plugins.calibreader_sync.kobo_import import (
         FUTURE_SLACK, KOBO_DEVICE_ID, MAX_BOOKS, POSITIONS_FILE, _connect_ro, _is_newer, _load_positions,
-        _parse_iso, import_positions, kobo_stamp, pick_user, served_library,
+        _parse_iso, import_positions, is_echo, kobo_stamp, pick_user, served_library,
     )
     from calibre_plugins.calibreader_sync.kobo_position import (
         BOOK_PERCENT, CHAPTER_PERCENT, CHAPTER_START, SPAN, Book, kobo_location, map_bookmark,
@@ -71,7 +71,7 @@ try:
 except ImportError:  # pragma: no cover - standalone / test import
     from kobo_import import (
         FUTURE_SLACK, KOBO_DEVICE_ID, MAX_BOOKS, POSITIONS_FILE, _connect_ro, _is_newer, _load_positions,
-        _parse_iso, import_positions, kobo_stamp, pick_user, served_library,
+        _parse_iso, import_positions, is_echo, kobo_stamp, pick_user, served_library,
     )
     from kobo_position import (
         BOOK_PERCENT, CHAPTER_PERCENT, CHAPTER_START, SPAN, Book, kobo_location, map_bookmark,
@@ -84,6 +84,7 @@ TIMEOUT = 10                   # seconds, wall clock, per request (name lookup i
 RUN_BUDGET = 20                # seconds: no PUT starts later than this into a run; the rest go next run
 BACKOFF = 300                  # seconds (ui.py): after Calibre-Web failed, automatic runs do not send
 PERCENT_MARGIN = 0.5           # % points: a %-place must beat the Kobo's own % by more than this
+FINISHED_PERCENT = 99.5        # re-review R1-N1: a Kobo at or past this % has the book as finished
 _KOBO_SPAN = re.compile(r'^\s*kobo\.(\d+)\.(\d+)\s*$')
 
 
@@ -304,6 +305,15 @@ def span_key(value):
     return (int(m.group(1)), int(m.group(2))) if m else None
 
 
+def same_file(loc, row, book):
+    '''Are our bookmark and the Kobo's in the same content file of `book`?'''
+    src = (row.get('location_source') or '').strip()
+    if not src:
+        return False
+    theirs = book.chapter_for_source(src)
+    return theirs is not None and theirs == book.chapter_for_source(loc['source'])
+
+
 def ahead_in_kobo_terms(loc, row, book):
     '''The last check before a PUT (review round 1 B1/B2): is the bookmark we are
     about to send strictly ahead of the Kobo's place AS THE KOBO SEES IT?
@@ -481,14 +491,24 @@ def _precision_lines(precisions, had_kepub):
 
 
 def push_positions(library_path, app_db, lookup, base_url=DEFAULT_CALIBRE_WEB, memory=None, user=None, log=None,
-                   max_books=MAX_BOOKS, now=None, timeout=TIMEOUT, since=None, budget=RUN_BUDGET):
+                   max_books=MAX_BOOKS, now=None, timeout=TIMEOUT, since=None, budget=RUN_BUDGET, persist=None,
+                   still_on=None):
     '''One push run. `lookup(book_id)` -> (uuid, EPUB path, KEPUB path) or None,
     as for the import. `since`: when sending was turned on (ISO, UTC); only app
     places stamped after it are sent, and without it nothing is. `memory`:
-    {uuid (lower case): what was last sent}, updated in place (the caller saves
-    it). `budget`: seconds after which no further PUT starts (the rest: `more`).'''
+    {uuid (lower case): what was last sent}, updated in place. `persist(memory)`:
+    writes it to disk; called with the record (unconfirmed) BEFORE each PUT and
+    again after it (confirmed, or dropped), so a calibre that closes mid-send
+    still knows its own push (re-review R1-S2). `still_on()`: the consent,
+    asked again before EVERY PUT; False stops the batch at once (R1-S3).
+    `budget`: seconds after which no further PUT starts (the rest: `more`).'''
     res = KoboPushResult()
     memory = {} if memory is None else memory
+    dirty = False
+
+    def save():
+        if persist is not None:
+            persist(memory)
     if not getattr(lookup, 'kepub_beside', False):
         lookup = with_kepub_beside(lookup)
     base_url, cut = clean_address(base_url or DEFAULT_CALIBRE_WEB)
@@ -549,8 +569,16 @@ def push_positions(library_path, app_db, lookup, base_url=DEFAULT_CALIBRE_WEB, m
         row, (book_uuid, epub_path, kepub_path) = on_kobo[uuid]
         sent = memory.get(uuid)
         if isinstance(sent, dict) and sent.get('app_updated_at') == entry['updated_at']:
-            res.skipped[uuid] = 'already sent'
-            continue
+            if sent.get('confirmed') is not False:
+                res.skipped[uuid] = 'already sent'
+                continue
+            if is_echo(row, sent):          # R1-S2: it did land before calibre stopped
+                sent['confirmed'] = True
+                dirty = True
+                res.skipped[uuid] = 'already sent'
+                continue
+            memory.pop(uuid, None)          # saved before a PUT that never landed: send again
+            dirty = True
         fkey = _failure_key(library_path, app_db, uuid)
         if _FAILED.get(fkey) == entry['updated_at']:
             res.skipped[uuid] = 'Calibre-Web refused it before; tried again when the place changes'
@@ -566,6 +594,14 @@ def push_positions(library_path, app_db, lookup, base_url=DEFAULT_CALIBRE_WEB, m
         if not has_place and row.get('read_status') == 1:
             # N2: Calibre-Web says Finished (the Kobo marked it, or a reset) and keeps no place.
             res.skipped[uuid] = 'marked Finished in Calibre-Web, with no Kobo place: not sent'
+            continue
+        try:
+            kobo_pct = float(row.get('progress_percent'))
+        except (TypeError, ValueError):
+            kobo_pct = None
+        if has_place and (row.get('read_status') == 1 or (kobo_pct is not None and kobo_pct >= FINISHED_PERCENT)):
+            # R1-N1: the Kobo has the book as finished (its % may sit next to an old Location).
+            res.skipped[uuid] = 'the Kobo has this book as finished: not sent'
             continue
         if library_state != 'same' and not (row.get('location_source') or '').strip():
             # Book ids unproven: only the Kobo's own Source in this book (checked by
@@ -639,6 +675,8 @@ def push_positions(library_path, app_db, lookup, base_url=DEFAULT_CALIBRE_WEB, m
         res.notes.append('Calibre-Web\'s library folder ({}) is not visible on this computer, so CalibReader '
                          'cannot confirm it is this library: only books the Kobo has already opened are sent '
                          '({} held back).'.format(served or 'unknown', unproven))
+    if dirty:
+        save()
     if no_token:
         res.notes.append('Calibre-Web has no Kobo sync token for {}: set up Kobo sync for that user in '
                          'Calibre-Web. Nothing sent to the Kobo.'.format(res.user))
@@ -648,6 +686,10 @@ def push_positions(library_path, app_db, lookup, base_url=DEFAULT_CALIBRE_WEB, m
     for uuid, book_uuid, entry, loc, fkey, row, book, settled in to_send:
         if time.monotonic() - started >= budget:
             res.more = True                 # S4: the rest go with the next run
+            break
+        if still_on is not None and not still_on():
+            res.notes.append('Sending to the Kobo was turned off; nothing more sent.')
+            res.more = False                # R1-S3: unticking stops the batch at once
             break
         # S3: the Kobo's row as it is now; a Kobo sync since the run began wins this run.
         fresh = read_kobo_row(app_db, row['user_id'], row['book_id'])
@@ -661,33 +703,54 @@ def push_positions(library_path, app_db, lookup, base_url=DEFAULT_CALIBRE_WEB, m
             continue
         loc = dict(loc)
         if loc['type'] == 'KoboSpan' and span_key(fresh.get('location_value')) is not None:
-            # Ruling (round 1): a span ahead of the Kobo's never comes with a % below the Kobo's own.
+            # Ruling (round 1): a span ahead of the Kobo's never comes with a % below the Kobo's
+            # own (the guard above refused a Kobo at FINISHED_PERCENT or more: R1-N1); in the
+            # same file, its chapter % neither (R1-N1).
             try:
                 loc['progressPercent'] = max(float(loc['progressPercent']), float(fresh.get('progress_percent')))
             except (TypeError, ValueError):
                 pass
+            if same_file(loc, fresh, book):
+                try:
+                    loc['contentSourceProgressPercent'] = max(float(loc['contentSourceProgressPercent']),
+                                                              float(fresh.get('content_source_progress_percent')))
+                except (TypeError, ValueError):
+                    pass
         previous = memory.get(uuid)
-        memory[uuid] = {                    # before the PUT: an import meanwhile knows it is ours
+        memory[uuid] = {                    # before the PUT, on disk too (R1-S2): ours, unconfirmed
             'type': loc['type'], 'value': loc['value'], 'source': loc['source'],
             'progressPercent': loc['progressPercent'],
             'contentSourceProgressPercent': loc['contentSourceProgressPercent'],
             'precision': loc['precision'], 'chapter': loc['chapter'], 'textAnchor': loc['anchor'],
             'app_chapter': entry['chapter'], 'app_textAnchor': entry['textAnchor'],
-            'app_updated_at': entry['updated_at'], 'pushed_at': _kobo_now(),
+            'app_updated_at': entry['updated_at'], 'pushed_at': _kobo_now(), 'confirmed': False,
         }
+        try:
+            save()
+        except Exception as exc:            # not on disk: do not send
+            if previous is None:
+                memory.pop(uuid, None)
+            else:
+                memory[uuid] = previous
+            res.notes.append('Could not save what is about to be sent to the Kobo ({}); nothing sent.'.format(exc))
+            res.more = False
+            break
         ok, kind, note = put_state(base_url, token, book_uuid, loc, res.user, timeout)
         if not ok:
             res.notes.append(scrub(note, token))
             res.failure = kind
-            if kind != 'timeout':           # a PUT that timed out may still land: keep it as ours
+            if kind != 'timeout':           # a PUT that timed out may still land: keep it (unconfirmed)
                 if previous is None:
                     memory.pop(uuid, None)
                 else:
                     memory[uuid] = previous
+                _save_quietly(save)
             if kind == 'book':
                 _FAILED[fkey] = entry['updated_at']
             res.more = False                # a failing run never asks for another
             break
+        memory[uuid]['confirmed'] = True
+        _save_quietly(save)
         res.sent.append(book_uuid)
         res.precisions[book_uuid] = loc['precision']
         if log:
@@ -698,8 +761,16 @@ def push_positions(library_path, app_db, lookup, base_url=DEFAULT_CALIBRE_WEB, m
     return res
 
 
+def _save_quietly(save):
+    try:
+        save()
+    except Exception:                       # the in-memory record still guards this session
+        pass
+
+
 def sync_kobo(library_path, app_db, lookup, user=None, push=False, base_url=DEFAULT_CALIBRE_WEB, memory=None,
-              log=None, max_books=MAX_BOOKS, now=None, timeout=TIMEOUT, since=None, budget=RUN_BUDGET):
+              log=None, max_books=MAX_BOOKS, now=None, timeout=TIMEOUT, since=None, budget=RUN_BUDGET,
+              persist=None, still_on=None):
     '''One Kobo run: step 1's import (with the echo guard), then, only when
     `push` is True, this module's push (places stamped after `since` only).
     -> (import result, push result or None). The lookup finds a KEPUB beside
@@ -711,7 +782,8 @@ def sync_kobo(library_path, app_db, lookup, user=None, push=False, base_url=DEFA
     if not push:
         return kres, None
     pres = push_positions(library_path, app_db, lookup, base_url=base_url, memory=memory, user=user, log=log,
-                          max_books=max_books, now=now, timeout=timeout, since=since, budget=budget)
+                          max_books=max_books, now=now, timeout=timeout, since=since, budget=budget,
+                          persist=persist, still_on=still_on)
     pres.notes = [n for n in pres.notes if n not in kres.notes]
     return kres, pres
 
@@ -739,19 +811,36 @@ class StateFile(object):
         self.since = since if isinstance(since, str) and since else None
         self.memory = mine
 
-    def save(self):
-        mine = dict(self.memory)
-        if self.since:
-            mine['push_since'] = self.since
-        self.table[self.key] = mine
-        folder = os.path.dirname(self.path)
-        if folder:
-            os.makedirs(folder, exist_ok=True)
-        tmp = self.path + '.tmp'
-        with open(tmp, 'w', encoding='utf-8', newline='\n') as f:
-            json.dump(self.table, f, indent=2, ensure_ascii=False)
-            f.write('\n')
-        os.replace(tmp, self.path)
+    def save(self, *ignored):
+        '''Write this library's part; the other libraries' parts are re-read from disk
+        first and kept (re-review R1-S2: one file, several libraries, a worker thread).'''
+        with _STATE_LOCK:
+            mine = dict(self.memory)
+            if self.since:
+                mine['push_since'] = self.since
+            table = {}
+            try:
+                with open(self.path, 'rb') as f:
+                    loaded = json.loads(f.read().decode('utf-8'))
+                if isinstance(loaded, dict):
+                    table = loaded
+            except (OSError, ValueError):
+                table = dict(self.table)
+            table[self.key] = mine
+            self.table = table
+            folder = os.path.dirname(self.path)
+            if folder:
+                os.makedirs(folder, exist_ok=True)
+            tmp = '{}.{}.tmp'.format(self.path, threading.get_ident())
+            with open(tmp, 'w', encoding='utf-8', newline='\n') as f:
+                json.dump(table, f, indent=2, ensure_ascii=False)
+                f.write('\n')
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.path)
+
+
+_STATE_LOCK = threading.Lock()
 
 
 def load_state(path, library_path):
