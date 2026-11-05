@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0358
+# Last modified: 2026-11-05--0414
 #
 # run_tests.py — runs every CalibReader Sync test and REFUSES a run that executed nothing.
 #
@@ -92,9 +92,11 @@ def main(argv=None):
         under_calibre = True
     except ImportError:
         under_calibre = False
+    # Under calibre the real-calibre tests must run (none skipped). A platform skip
+    # elsewhere (the POSIX file-mode tests on Windows) does not void the run.
     if under_calibre and code == 0 and any(skipped for label, _, skipped, _ in rows
-                                           if label in MODULES):
-        code = 2                                    # under calibre the real-calibre tests must run
+                                           if label == 'test_real_calibre.py'):
+        code = 2
     total = sum(executed for _, executed, _, _ in rows)
     print('TOTAL executed {}: {}'.format(total, {0: 'PASS', 1: 'FAIL', 2: 'VOID (nothing, or not '
                                                  'everything, was executed)'}[code]))
