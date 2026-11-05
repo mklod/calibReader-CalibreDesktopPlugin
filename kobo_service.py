@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0711
+# Last modified: 2026-11-05--0734
 #
 # kobo_service.py — the Kobo sync without calibre running (plugin 1.6.0, tester preview).
 #
@@ -446,15 +446,19 @@ def run_once(library, config_dir=None, now=None, hold=0, lookup=None, timeout=No
     head = '{} [{}]'.format(_iso(now)[:19] + 'Z', library_key(library))
     lines = []
 
-    def finish(status, summary, clean=False):
+    def finish(status, summary, clean=False, held=False):
+        # Only a run that held the lock writes its whole state (N1 memories, back-off, stamps);
+        # any other run re-reads the file and sets just its own line, so it never overwrites
+        # what a lock holder saved meanwhile.
         out.status, out.summary = status, summary
-        state.update({'library': library, 'last_run_at': _iso(now), 'status': status, 'summary': summary,
-                      'note': out.notes[0] if out.notes else '', 'clean': bool(clean), 'version': VERSION})
+        target = state if held else load_state(library)
+        target.update({'library': library, 'last_run_at': _iso(now), 'status': status, 'summary': summary,
+                       'note': out.notes[0] if out.notes else '', 'clean': bool(clean), 'version': VERSION})
         log.write(['{} {} ({:.1f} s)'.format(head, summary, time.monotonic() - started)]
                   + ['  note: ' + n for n in out.notes]
                   + [line if line.startswith(' ') else '  ' + line for line in lines])
         try:
-            save_state(library, state)
+            save_state(library, target)
         except OSError:
             pass
         return out
@@ -542,11 +546,11 @@ def run_once(library, config_dir=None, now=None, hold=0, lookup=None, timeout=No
             len(pres.sent) if pres is not None else 0,
             '' if pres is not None else ' (sending to the Kobo is off)',
             '; more next run' if more else '')
-        return finish('done', summary, clean=clean)
+        return finish('done', summary, clean=clean, held=True)
     except Exception as exc:
         out.notes.append('The Kobo sync failed ({}).'.format(exc))
         lines.extend('  ' + line for line in traceback.format_exc().splitlines()[-6:])
-        return finish('error', 'failed')
+        return finish('error', 'failed', held=True)
     finally:
         lock.release()
 
