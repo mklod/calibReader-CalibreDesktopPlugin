@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0413
+# Last modified: 2026-11-05--0426
 #
 # kobo_position.py — a Kobo reading position -> a CalibReader position.
 #
@@ -645,6 +645,14 @@ def resolve_span(epub, kepub, chapter, span_id):
 
 def _char_index(s, u16off):
     '''UTF-16 offset -> Python str index.'''
+    if u16off <= 0:
+        return 0
+    head = s[:u16off]
+    if len(head.encode('utf-16-le')) == 2 * len(head):
+        # No character outside the BMP before it: the offsets are the indexes
+        # (same answer as the loop below, without a Python step per character;
+        # step 2 resolves every span of a chapter).
+        return min(u16off, len(s))
     pos = 0
     for i, ch in enumerate(s):
         if pos >= u16off:

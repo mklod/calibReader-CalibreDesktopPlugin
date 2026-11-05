@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0358
+# Last modified: 2026-11-05--0426
 #
 # Kobo position -> CalibReader position (kobo_position.map_bookmark), on a real
 # public-domain book from the SAFE library: Kafka, The Metamorphosis (Project
@@ -333,6 +333,20 @@ class ReverseMappingTests(unittest.TestCase):
         loc = kobo_position.kobo_location(self.epub, 3, anchor, self.kepub, kobo_source='not-in-this-book.xhtml')
         self.assertEqual(loc['source'], CH.format(2))
         self.assertEqual(self.back(loc)['chapter'], 3)
+
+    def test_char_index_fast_path_matches_the_loop(self):
+        # kobo_position._char_index (UTF-16 offset -> str index) got a fast path for text
+        # without astral characters; it must answer exactly as the per-character loop.
+        def loop(s, off):
+            pos = 0
+            for i, ch in enumerate(s):
+                if pos >= off:
+                    return i
+                pos += len(ch.encode('utf-16-le')) // 2
+            return len(s)
+        for s in ('plain text, no astral', 'a\U0001F600b\U0001F4D6cd', '\U0001F600', '', 'ab\u00e9\u2014c'):
+            for off in range(-1, 2 * len(s) + 3):
+                self.assertEqual(kobo_position._char_index(s, off), loop(s, off), (s, off))
 
     def test_a_chapter_out_of_range_is_none(self):
         self.assertIsNone(kobo_position.kobo_location(self.epub, 6, 0, self.kepub))
