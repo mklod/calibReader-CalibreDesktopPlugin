@@ -163,9 +163,10 @@ _SUGGEST = {
 }
 
 
-def suggest_column(custom_columns, kind):
-    '''The eligible column that most likely already means `kind`, or "".'''
-    cols = eligible_columns(custom_columns, kind)
+def suggest_column(custom_columns, kind, exclude=()):
+    '''The eligible column that most likely already means `kind`, or "". Never one in
+    `exclude` (1.7.0: Kobo Utilities' columns, which feed its restore to the Kobo).'''
+    cols = [(lookup, heading) for lookup, heading in eligible_columns(custom_columns, kind) if lookup not in exclude]
     for pattern in _SUGGEST[kind]:
         rx = re.compile(pattern, re.I)
         for lookup, heading in cols:

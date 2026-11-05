@@ -139,11 +139,16 @@ class ConfigWidget(QWidget):
             'goes one way, from the app to calibre.'.format(POSITIONS_FILE)))
 
         grid = QGridLayout()
+        # 1.7.0: never suggest a Kobo Utilities column (#kobo_… or the ones picked below) as
+        # CalibReader's own: the plugin would write the app's progress into what KU restores.
+        ku_columns = {c for c in self.custom if c.startswith('#kobo_')}
+        ku_columns |= {v for k, v in (kobo_ku.source_from_prefs(
+            self._ku_prefs().get(self.gui.library_path)) or {}).items() if k in ('location', 'percent', 'last_read') and v}
         for row, (kind, label) in enumerate((('percent', '% read column:'),
                                              ('last_read', 'Last read column:'))):
             stored = settings['percent_column' if kind == 'percent' else 'last_read_column']
             if never_saved and not stored:
-                stored = suggest_column(self.custom, kind)
+                stored = suggest_column(self.custom, kind, exclude=ku_columns)
             self._picker(grid, row, kind, label, stored)
 
         self.threshold = QSpinBox(self)
@@ -351,8 +356,10 @@ class ConfigWidget(QWidget):
             mine = {self.combos[k].currentData() for k in ('read', 'percent', 'last_read')} - {'', None}
             clash = sorted(mine & {location, percent, last_read})
             if clash:
-                problem = ('{} is one of CalibReader\'s own columns (the plugin writes it): pick Kobo Utilities\' '
-                           'columns instead.'.format(', '.join(clash)))
+                problem = ('{} {} also picked above as CalibReader\'s own column (the plugin writes into {}). Pick '
+                           'Kobo Utilities\' own columns here, or other columns for CalibReader above.'.format(
+                               ' and '.join(clash), 'is' if len(clash) == 1 else 'are',
+                               'it' if len(clash) == 1 else 'them'))
             if problem:
                 self._show_ku_error(problem + ' Kobo Utilities places are not imported with this column; the '
                                     'Kobo Utilities settings were not changed.')
