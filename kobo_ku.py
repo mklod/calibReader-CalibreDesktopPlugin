@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--1300
+# Last modified: 2026-11-05--1315
 #
 # kobo_ku.py — Kobo reading places stored by the Kobo Utilities calibre plugin (USB sync)
 # into CalibReader_positions.json (plugin 1.7.0, tester preview). Kobo -> CalibReader only.
@@ -834,13 +834,16 @@ def kobo_copy_times(booklists):
     return out or None
 
 
-def reset_numbering(memory):
+def reset_numbering(memory, now=None):
     '''Re-review S1-R2: "Re-check numbering" in Settings: forget the library's verdict on the Kobo's
     numbering (foreign or calibre-numbered); the next places decide again from scratch (at their
     chapter start until FOREIGN_MIN are checked). Re-review round 3 (S1-R2, NIT-R3-2): the books'
     "edited" flags and first-seen EPUB states go too (after sending edited books to the Kobo again).'''
     meta = dict(memory.get('.') or {})
     meta.update({'spans': 0, 'missing': 0, 'foreign': False, 'decided': False})
+    # re-review round 5: when Re-check was clicked. A Kobo probably keeps a replaced book's original
+    # DateCreated, so after a Re-check (b) flags a book only if its EPUB is newer than this time too.
+    meta['rechecked_at'] = _iso(now or _dt.datetime.now(_dt.timezone.utc))
     memory['.'] = meta
     for key, record in list(memory.items()):
         if key != '.' and isinstance(record, dict) and ('edited' in record or 'epub_seen' in record):
@@ -951,6 +954,8 @@ def import_ku(library_path, source, values, lookup, memory, kepub_for=None, now=
         return res
     first_run = '.' not in memory
     copies_flagged = False
+    rechecked = _parse_iso((memory.get('.') or {}).get('rechecked_at'))
+    rechecked = rechecked.timestamp() if rechecked is not None else None
     if kobo_copies:
         # residual (b): a book whose EPUB is newer than its copy on the connected Kobo was edited after it
         # was sent: flagged (until "Re-check numbering"), before any of its places is mapped
@@ -963,7 +968,7 @@ def import_ku(library_path, source, values, lookup, memory, kepub_for=None, now=
                 st = os.stat(info[1])
             except OSError:
                 continue
-            if st.st_mtime > copy_time + KOBO_COPY_SLACK:
+            if st.st_mtime > copy_time + KOBO_COPY_SLACK and (rechecked is None or st.st_mtime > rechecked):
                 u = info[0].lower()
                 before = memory.get(u) if isinstance(memory.get(u), dict) else {}
                 if not before.get('edited'):
