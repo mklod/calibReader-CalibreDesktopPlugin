@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--1033
+# Last modified: 2026-11-05--1118
 #
 # sync_core.py — one sync run, without the GUI.
 #
@@ -610,7 +610,11 @@ def write_back_flags(library_path, writebacks):
     return written, note
 
 
-def run_sync(db, library_path, settings, flag_blobs, pos_blob, approved=()):
+BLOCKED_NOTE = ('{} is CalibReader\'s {} column and also one of Kobo Utilities\' columns (Kobo Utilities restores '
+                'it to the Kobo), so it is not written. Pick another column for CalibReader in Settings.')
+
+
+def run_sync(db, library_path, settings, flag_blobs, pos_blob, approved=(), blocked=()):
     # `approved` = the read columns the user has said Yes to (sync_library keeps them
     # per library as 'confirmed').
     '''One sync. Returns (SyncResult, new_flag_blobs, new_pos_blob); these are the
@@ -626,7 +630,10 @@ def run_sync(db, library_path, settings, flag_blobs, pos_blob, approved=()):
     only, never "the column already has memory" (re-review: a first run with nothing
     to write stored memory, and the next run filled cells without asking). The
     #read_status default of a library where no read column was ever chosen works as
-    in 1.2.x.'''
+    in 1.2.x.
+
+    1.7.0 (review step 4, S3): `blocked` = progress columns that are also Kobo Utilities'
+    columns: not written this run, one note each.'''
     settings = normalise_settings(settings)
     flag_blobs = {c: dict(b) for c, b in (flag_blobs or {}).items() if isinstance(b, dict)}
     flag_blob = {}
@@ -656,12 +663,16 @@ def run_sync(db, library_path, settings, flag_blobs, pos_blob, approved=()):
 
     pct_col = last_col = None
     if pos_data is not None:
-        if settings['percent_column']:
+        if settings['percent_column'] in blocked:
+            res.notes.append(BLOCKED_NOTE.format(settings['percent_column'], '% read'))
+        elif settings['percent_column']:
             ok, note = _column_check(custom, settings['percent_column'], PERCENT_TYPES, '% read')
             pct_col = settings['percent_column'] if ok else None
             if note:
                 res.notes.append(note)
-        if settings['last_read_column']:
+        if settings['last_read_column'] in blocked:
+            res.notes.append(BLOCKED_NOTE.format(settings['last_read_column'], 'last read'))
+        elif settings['last_read_column']:
             ok, note = _column_check(custom, settings['last_read_column'], DATE_TYPES, 'last read')
             last_col = settings['last_read_column'] if ok else None
             if note:
@@ -911,7 +922,7 @@ def _store_library_state(prefs, key, state, now, from_legacy):
         prefs['legacy_done'] = done[-MAX_LEGACY_DONE:]
 
 
-def sync_library(db, library_path, prefs, log_dir=None, approve=None, now=None):
+def sync_library(db, library_path, prefs, log_dir=None, approve=None, now=None, blocked=()):
     '''(1.3.1) One run as the plugin's GUI makes it (the button and the automatic sync,
     ui.py): the library's settings, this library's memory from `prefs` (the plugin's
     JSONConfig, or any dict), run_sync, the memory stored back, and the change log
@@ -930,7 +941,7 @@ def sync_library(db, library_path, prefs, log_dir=None, approve=None, now=None):
     res, flag_blobs, pos_blob = run_sync(
         db, library_path, settings,
         flag_blobs_from_prefs(state.get('applied'), state.get('applied_cols')),
-        state.get('applied_pos'), approved=approved)
+        state.get('applied_pos'), approved=approved, blocked=blocked)
     if res.found_any_file:
         # Stored even when nothing was written: a RECORD verdict must persist so a
         # retired entry is never reconsidered.
@@ -1096,6 +1107,15 @@ if __name__ == '__main__':  # pragma: no cover
                              datetime.datetime(2026, 10, 5, 12, 0, 0, tzinfo=UTC))
             self.assertIsNone(self.v('#read_percent', 2))       # a peek, under 1%
             self.assertEqual((res.progress_updated, res.below_threshold), (1, 1))
+
+        def test_a_blocked_column_is_not_written(self):
+            # 1.7.0 (review step 4, S3): CalibReader's own column that is also a Kobo Utilities column
+            self.positions(**{'uuid-a': {'progress': 0.5, 'updated_at': stamp(5)}})
+            res, self.flag_blobs, self.pos_blob = run_sync(self.db, self.dir, SETTINGS, self.flag_blobs,
+                                                           self.pos_blob, blocked=('#read_percent',))
+            self.assertIsNone(self.v('#read_percent', 1))
+            self.assertIsNotNone(self.v('#last_read', 1))
+            self.assertTrue(any('#read_percent' in n and 'not written' in n for n in res.notes), res.notes)
 
         def test_second_run_is_a_no_op(self):
             self.positions(**{'uuid-a': {'progress': 0.5, 'updated_at': stamp(5)}})

@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--1033
+# Last modified: 2026-11-05--1118
 #
 # CalibReader Sync — the toolbar action (GUI only).
 # calibre imports this module only in its main window, through
@@ -152,6 +152,7 @@ PREFS.defaults['kobo_ku'] = {}
 PREFS.defaults['kobo_ku_device_seen'] = ''
 KU_MEMORY = kobo_ku.memory_path(config_dir)
 KU_DEVICE_DELAY_MS = 60 * 1000          # Kobo Utilities' auto-store runs when a Kobo's books are read
+KU_MORE_DELAY_MS = 20 * 1000            # review step 4 NIT 1: a KU catch-up chunk every 20 s, not every 4 s
 
 
 def kobo_settings(library_path):
@@ -468,10 +469,13 @@ class CalibReaderSyncAction(InterfaceAction):
         lock = kobo_service.LibraryLock(library, 'calibre')
         if not lock.acquire():
             res.busy = self._ku_busy = True
-            res.notes.append(kobo_service.busy_note(lock.holder()))
             worker = getattr(self, '_kobo_worker', None)
             if worker is not None and worker.is_alive():
                 self._push_rerun = True         # our own push holds it: run again when it is done
+                res.notes.append('Kobo Utilities: waits for calibre\'s own send to Calibre-Web to finish and runs '
+                                 'right after it (no need to click again).')
+            else:
+                res.notes.append(kobo_service.busy_note(lock.holder()))
             return res
         try:
             try:
@@ -517,6 +521,8 @@ class CalibReaderSyncAction(InterfaceAction):
             lines.append('Kobo Utilities (USB), not imported: {}: {}.'.format(ku.titles.get(uuid, uuid), why))
         if len(problems) > 8:
             lines.append('Kobo Utilities (USB): {} more not imported.'.format(len(problems) - 8))
+        if ku.uncertain:
+            lines.append('Kobo Utilities (USB): ' + ku.uncertain + '.')
         if not ku.busy:
             lines.append('Kobo Utilities (USB): ' + kobo_ku.store_line(ku.last_store))
             hint = kobo_ku.staleness_hint(ku.last_store, PREFS.get('kobo_ku_device_seen') or None)
@@ -537,7 +543,15 @@ class CalibReaderSyncAction(InterfaceAction):
         # A refused or failing run never sets `more` (N1), so this never loops.
         if kres is not None and kres.more:
             self._kick.start(AUTO_DELAY_MS)
-        res = sync_library(api, self.gui.library_path, PREFS, log_dir=CHANGE_LOGS, approve=approve)
+        # 1.7.0 (review step 4, S3): CalibReader's own progress column that is also one of the saved
+        # Kobo Utilities columns is not written (its writes would go to the Kobo through KU's restore).
+        blocked = ()
+        source = ku_source(self.gui.library_path)
+        if source:
+            own = normalise_settings(api.pref(SETTINGS_KEY, None))
+            blocked = tuple(c for c in kobo_ku.own_column_clash(source, own)
+                            if c in (own['percent_column'], own['last_read_column']))
+        res = sync_library(api, self.gui.library_path, PREFS, log_dir=CHANGE_LOGS, approve=approve, blocked=blocked)
         if res.columns_written:
             self.gui.library_view.model().refresh()
         # 1.7.0: Kobo Utilities (USB), after the read-status sync; a failure never stops it.
@@ -546,8 +560,8 @@ class CalibReaderSyncAction(InterfaceAction):
         except Exception as exc:
             ku, ku_error = None, 'Kobo Utilities sync failed ({}); read status and progress still synced.'.format(exc)
         if ku is not None:
-            if ku.more:
-                self._kick.start(AUTO_DELAY_MS)  # L1: the rest of the books soon
+            if ku.more and not (kres is not None and kres.more):
+                self._kick.start(KU_MORE_DELAY_MS)  # L1 / NIT 1: the rest of the books, calibre left breathing
             res.notes.extend(ku.notes)
             res.kobo_ku_imported = len(ku.written)
             res.kobo_ku_lines = self._ku_lines(ku)
@@ -606,7 +620,7 @@ class CalibReaderSyncAction(InterfaceAction):
             res = self._run(db, settings, approve=res.confirm['column'], manual=True)
         self._seen = self._file_stamps()
 
-        if not res.found_any_file:
+        if not res.found_any_file and not res.kobo_ku_lines:   # NIT 10: the KU lines are always shown
             error_dialog(
                 self.gui,
                 'CalibReader Sync',

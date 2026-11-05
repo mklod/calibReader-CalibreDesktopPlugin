@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--1033
+# Last modified: 2026-11-05--1118
 #
 # test_real_calibre.py — CalibReader Sync against REAL calibre (LibraryDatabase, set_field,
 # metadata.db, JSONConfig, the Settings widget), not the in-memory FakeDB of sync_core.py.
@@ -1223,16 +1223,28 @@ class RealKoboUtilitiesTests(RealCalibreBase):
         self.lib.reopen()
         self.assertEqual(self.metadata_hash(), before)       # never a write into metadata.db
 
-    def test_a_stored_kepub_is_the_one_the_driver_sends(self):
+    def test_a_stored_kepub_and_calibres_own_both_count_and_the_earlier_place_wins(self):
+        # review step 4 S1 (supersedes "the stored KEPUB is the one the driver sends"): the KEPUB
+        # format may have been added after the book was sent, so both numberings are tried and the
+        # place is never after either landing
+        from kobo_position import Book, resolve_span
         (b1, u1), = self.books[:1]
-        self.lib.api.add_format(b1, 'KEPUB', os.path.join(TESTS, 'fixtures', 'metamorphosis.kepub'))
+        stored = os.path.join(TESTS, 'fixtures', 'metamorphosis.kepub')
+        self.lib.api.add_format(b1, 'KEPUB', stored)
         self.fill(b1, KU_CH.format(1) + '#kobo.10.2', 4, datetime.datetime(2026, 11, 1, 10, 0, tzinfo=UTC))
         self.set_ku()
         res = self.run_ui()
         self.assertEqual(res.kobo_ku_imported, 1, res.notes)
         entry = self.entries()[u1]
-        self.assertEqual((entry['kobo']['kepub'], entry['kobo']['precision']), ('stored KEPUB', 'span'))
-        self.assertEqual(os.listdir(self.cache), [])          # nothing regenerated for it
+        self.assertEqual(entry['kobo']['kepub'], 'stored KEPUB + calibre kepubify')
+        self.assertIn(entry['kobo']['precision'], ('span', 'span~'))
+        epub, kepub = Book(os.path.join(TESTS, 'fixtures', 'metamorphosis.epub')), Book(stored)
+        try:
+            self.assertLessEqual(entry['textAnchor'], resolve_span(epub, kepub, 2, 'kobo.10.2')[0])
+        finally:
+            epub.close()
+            kepub.close()
+        self.assertEqual(len([n for n in os.listdir(self.cache) if n.endswith('.kepub')]), 1)   # calibre's own
 
     def test_the_lock_held_elsewhere_means_no_ku_work_this_run(self):
         import kobo_service
@@ -1386,7 +1398,8 @@ class RealKoboUtilitiesSettingsTests(RealCalibreBase):
         self.assertNotIn('#kobo_percent_read', locs)
         self.assertEqual(w.ku_percent.currentData(), '')
         self.assertIn('#kobo_percent_read', self.items(w.ku_percent))
-        self.assertNotIn('#read_percent', self.items(w.ku_percent))        # CalibReader's own % column
+        # review step 4 S3: CalibReader's own % column is offered too, so a clash shows and is refused
+        self.assertIn('#read_percent', self.items(w.ku_percent))
         self.assertIn('#kobo_last_read', self.items(w.ku_last_read))
         from qt.core import QLabel
         text = ' '.join(label.text() for label in w.findChildren(QLabel))
