@@ -443,6 +443,30 @@ class ForwardOnlyTests(PushBase):
         res = self.push(max_books=2)
         self.assertEqual((len(res.sent), res.more), (1, False))
 
+    def test_N1_books_behind_the_kobo_are_not_mapped_again_and_again(self):
+        # 30 books where the app is behind the Kobo, 25 mapped per run: the second run maps
+        # the other 5 and stops asking for more; a third maps nothing until a place moves.
+        for i in range(30):
+            bid = 300 + i
+            self.books[bid] = ('44444444-0000-0000-0000-%012d' % bid, EPUB, KEPUB)
+            self.kobo(bid, '2026-10-30 21:03:48', CH.format(2), 'KoboSpan', 'kobo.5.1', 40.0, 3.0)
+            self.app('44444444-0000-0000-0000-%012d' % bid, 2, 641)
+        with mock.patch('kobo_push.map_bookmark', wraps=kobo_position.map_bookmark) as m:
+            res = self.push()
+        self.assertEqual((m.call_count, res.more, res.sent), (25, True, []))
+        with mock.patch('kobo_push.map_bookmark', wraps=kobo_position.map_bookmark) as m:
+            res = self.push()
+        self.assertEqual((m.call_count, res.more), (5, False))
+        with mock.patch('kobo_push.map_bookmark', wraps=kobo_position.map_bookmark) as m:
+            res = self.push()
+        self.assertEqual((m.call_count, res.more), (0, False))
+        self.assertEqual(len([u for u, why in res.skipped.items() if 'behind' in why]), 30)
+        # the app reads past the Kobo in one of them: that one is mapped again, and sent
+        self.app('44444444-0000-0000-0000-000000000300', 4, 10, stamp='2026-10-31T11:00:00.000Z')
+        with mock.patch('kobo_push.map_bookmark', wraps=kobo_position.map_bookmark) as m:
+            res = self.push()
+        self.assertEqual((m.call_count, res.sent), (1, ['44444444-0000-0000-0000-000000000300']))
+
     def test_app_db_is_never_written_by_the_plugin(self):
         self.cw.store = False
         self.kobo(60, '2026-10-30 21:03:48')
