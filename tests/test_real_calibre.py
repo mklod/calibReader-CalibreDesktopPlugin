@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--1141
+# Last modified: 2026-11-05--1220
 #
 # test_real_calibre.py — CalibReader Sync against REAL calibre (LibraryDatabase, set_field,
 # metadata.db, JSONConfig, the Settings widget), not the in-memory FakeDB of sync_core.py.
@@ -1583,6 +1583,25 @@ class RealKuReviewRound1Tests(RealCalibreBase):
         self.assertNotIn('#percent_read', w.ku_clash_note.text())
         self.pick(w.ku_percent, '#percent_read')                   # offered, so the clash is visible
         self.assertIn('#percent_read', w.ku_clash_note.text())
+
+    def test_S1R2_recheck_numbering_clears_the_foreign_flag(self):
+        import kobo_ku
+        import ui
+        self.columns(('kobo_reading_location', 'Kobo location', 'text'))
+        source = kobo_ku.source_from_prefs(kobo_ku.prefs_entry('#kobo_reading_location', '', ''))
+        ui.PREFS['kobo_ku'] = {self.lib.path: kobo_ku.prefs_entry('#kobo_reading_location', '', '')}
+        mem = kobo_ku.MemoryFile(ui.KU_MEMORY)
+        sig = kobo_ku.source_signature(source)
+        mem.save(self.lib.path, sig, {'.': {'since': '2026-11-01T00:00:00.000Z', 'spans': 9, 'missing': 7,
+                                            'foreign': True, 'decided': False},
+                                      'u1': {'h': 'x', 'status': 'written', 'span': True, 'edited': '2026-11-01T00:00:00.000Z'}})
+        w = self.widget()
+        self.assertIn('another tool', w.ku_status.text())
+        self.assertTrue(w.ku_recheck.isEnabled())
+        w._recheck_numbering()
+        meta = mem.load(self.lib.path, sig)['.']
+        self.assertEqual((meta['foreign'], meta['spans'], meta['missing']), (False, 0, 0))
+        self.assertNotIn('another tool', w.ku_status.text())
 
     # -- S1 (Kobo Touch Extended) -----------------------------------------------------------
 

@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--1141
+# Last modified: 2026-11-05--1220
 #
 # test_kobo_ku.py — the Kobo Utilities (USB) route, Kobo -> CalibReader (plugin 1.7.0, tester
 # preview): kobo_ku.py. Design: docs/handoffs/104-kobo-sync/KOBO-UTILITIES.md section 8.
@@ -87,6 +87,25 @@ def make_book(path, chapters):
 
 def span(sid, text):
     return '<span class="koboSpan" id="{}">{}</span>'.format(sid, text)
+
+
+def drop_paragraph(src, dst):
+    """The reviewer's hand edit (p_r2_edits.py): in every chapter, delete the 3rd <p>."""
+    b = Book(src)
+    chapters = set(c.lower() for c in b.chapters)
+    b.close()
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dst, 'w', zipfile.ZIP_DEFLATED) as zout:
+        for info in zin.infolist():
+            data = zin.read(info.filename)
+            if info.filename.lower() in chapters:
+                text = data.decode('utf-8')
+                ps = [m.start() for m in re.finditer(r'<p[\s>]', text)]
+                if len(ps) > 3:
+                    end = text.find('</p>', ps[2]) + 4
+                    text = text[:ps[2]] + text[end:]
+                data = text.encode('utf-8')
+            zout.writestr(info, data)
+    return dst
 
 
 # --------------------------------------------------------------------------- 8.3 parser table
@@ -923,6 +942,9 @@ class KoboTouchExtendedImportTests(ImportBase):
             self.assertIn('Kobo Touch Extended', e['kobo']['note'])
         self.assertIn('Kobo Touch Extended', res.uncertain)
         self.assertIn('start of its chapter', res.uncertain)     # NIT-R1-2: the wording says what happened
+        # NIT-R2-3: the sentence calibre's numbering gives is kept for the testers' reports (the app ignores it)
+        self.assertGreater(self.positions()[self.uuids[1]]['kobo']['spanAnchor'], 0)
+        self.assertNotIn('spanAnchor', self.positions()[self.uuids[2]]['kobo'])
 
 
 @unittest.skipUnless(kobo_ku.calibre_kepubify() is not None, 'needs calibre\'s kepubify (calibre-debug)')
@@ -1022,6 +1044,114 @@ class CalibreNumberingTests(unittest.TestCase):
         self.assertTrue(memory['.']['foreign'])
         self.assertEqual(after, 0)
         self.assertTrue(res.foreign)
+
+    def kte_library_places(self, books, work):
+        import ku_kte_port
+        cache = kobo_ku.KepubCache(os.path.join(work, 'cache'))
+        out = {}
+        for i, src in enumerate(books, 1):
+            ep = os.path.join(work, 'b{}.epub'.format(i))
+            shutil.copy(src, ep)
+            kp = ku_kte_port.kte_kepub(ep, os.path.join(work, 'b{}.kte.kepub'.format(i)))
+            e, d = Book(ep), Book(kp)
+            places = []
+            for ch in range(len(e.chapters)):
+                kch = [q.lower() for q in d.chapters].index(e.chapters[ch].lower())
+                for sid in d.text(kch).ids:
+                    if re.match(r'^kobo\.\d+\.\d+$', sid):
+                        t = kobo_ku.resolve_span(e, d, ch, sid)
+                        if t is not None:
+                            places.append((e.chapters[ch] + '#' + sid, ch, t[0]))
+            e.close()
+            d.close()
+            out[i] = {'epub': ep, 'uuid': '{:08d}-aaaa-bbbb-cccc-dddddddddddd'.format(i), 'places': places}
+        return out, cache
+
+    def test_B1R2_one_book_per_connect_never_lands_after_the_kobo(self):
+        # the reviewer's p_r2_trickle.py part 3, smaller: Kobo Touch Extended copies (uninstalled),
+        # one changed value per run, random places; 27 % of such libraries wrote a late place at c7d1dc4
+        import random
+        work = tempfile.mkdtemp(prefix='cr-ku-trickle-')
+        try:
+            books, cache = self.kte_library_places([EPUB], work)
+            kepub_for = kobo_ku.make_kepub_for(lambda b: {'EPUB'}, cache, ['kepub', 'epub'], True, kte=False)
+            lookup = lambda b: (books[b]['uuid'], books[b]['epub'], None)  # noqa: E731
+            rng = random.Random(4)
+            late = libraries = 0
+            for trial in range(40):
+                lib = os.path.join(work, 'lib{}'.format(trial))
+                os.makedirs(lib)
+                memory, values = {}, {}
+                for k in range(1, 9):
+                    loc, ch, true = rng.choice(books[1]['places'])
+                    values[1] = (loc, None, '2026-11-05T11:{:02d}:00Z'.format(k))
+                    kobo_ku.import_ku(lib, SOURCE, dict(values), lookup, memory, kepub_for=kepub_for,
+                                      now=datetime.datetime(2026, 11, 5, 12, k, tzinfo=UTC), max_books=10 ** 6,
+                                      budget=1e9)
+                    path = os.path.join(lib, 'CalibReader_positions.json')
+                    if os.path.exists(path):
+                        e = json.load(open(path, encoding='utf-8'))['positions'].get(books[1]['uuid'])
+                        if e and e['kobo']['location'] == loc and (e['chapter'], e['textAnchor']) > (ch, true):
+                            late += 1
+                libraries += 1
+            self.assertEqual(late, 0)
+            self.assertEqual(libraries, 40)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+    def test_S1R2_an_edited_book_never_lands_after_once_a_missing_id_flagged_it(self):
+        # the reviewer's p_r2_editdir.py: the Kobo has calibre's KEPUB of the ORIGINAL book; the library's
+        # EPUB had one <p> deleted per chapter, later than the Kobo's reading
+        work = tempfile.mkdtemp(prefix='cr-ku-edited-')
+        try:
+            orig = os.path.join(work, 'orig.epub')
+            shutil.copy(EPUB, orig)
+            dev_path, _ = kobo_ku.KepubCache(os.path.join(work, 'dev')).path_for(1, orig)
+            edited = drop_paragraph(orig, os.path.join(work, 'edited.epub'))
+            t = datetime.datetime(2026, 11, 4, tzinfo=UTC).timestamp()
+            os.utime(edited, (t, t))
+            cache = kobo_ku.KepubCache(os.path.join(work, 'plug'))
+            kepub_for = kobo_ku.make_kepub_for(lambda b: {'EPUB'}, cache, ['kepub', 'epub'], True, kte=False)
+            plug_path, _ = cache.path_for(1, edited)
+            epub, dev, plug = Book(edited), Book(dev_path), Book(plug_path)
+            missing, found = None, []
+            for ch in range(len(epub.chapters)):
+                kch = [q.lower() for q in dev.chapters].index(epub.chapters[ch].lower())
+                for sid in dev.text(kch).ids:
+                    if not re.match(r'^kobo\.\d+\.\d+$', sid):
+                        continue
+                    if len(' '.join((dev.text(kch).id_text.get(sid) or '').split())) < 24:
+                        continue
+                    true = kobo_ku.resolve_span(epub, dev, ch, sid)
+                    got = kobo_ku.resolve_span(epub, plug, ch, sid)
+                    if true is None or true[1] != kobo_ku.SPAN:
+                        continue
+                    if got is None and missing is None:
+                        missing = epub.chapters[ch] + '#' + sid
+                    elif got is not None and got[0] > true[0]:
+                        found.append((epub.chapters[ch] + '#' + sid, ch, true[0]))
+            for b in (epub, dev, plug):
+                b.close()
+            self.assertTrue(missing and len(found) > 20)
+            lib = os.path.join(work, 'lib')
+            os.makedirs(lib)
+            memory = {'.': {'since': '2026-10-01T00:00:00.000Z', 'spans': 10, 'missing': 0, 'foreign': False,
+                            'decided': True}}
+            lookup = lambda b: ('00000001-aaaa-bbbb-cccc-dddddddddddd', edited, None)  # noqa: E731
+
+            def run(loc, k):
+                kobo_ku.import_ku(lib, SOURCE, {1: (loc, None, '2026-11-03T10:{:02d}:00Z'.format(k))}, lookup, memory,
+                                  kepub_for=kepub_for, now=NOW, max_books=10 ** 6, budget=1e9)
+                return json.load(open(os.path.join(lib, 'CalibReader_positions.json'), encoding='utf-8'))[
+                    'positions']['00000001-aaaa-bbbb-cccc-dddddddddddd']
+            run(missing, 0)
+            late = 0
+            for k, (loc, ch, true) in enumerate(found[::max(1, len(found) // 25)][:25], 1):
+                e = run(loc, k)
+                late += (e['chapter'], e['textAnchor']) > (ch, true)
+            self.assertEqual(late, 0)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
 
     def test_S2_a_conversion_leaves_no_temp_folder_behind(self):
         from calibre.ptempfile import base_dir
@@ -1152,13 +1282,20 @@ class ForeignNumberingTests(ImportBase):
         self.assertFalse(self.memory['.'].get('foreign'))
         self.assertTrue(res.foreign)
 
+    def stamp(self, i, day=1):
+        return '2026-11-{:02d}T10:00:{:02d}Z'.format(day, i)
+
+    def decided_library(self):
+        """Five sentence places, all in calibre's numbering: judged calibre-numbered (exact)."""
+        values = {i: (self.PRESENT[i % 2], None, self.stamp(i)) for i in range(1, 6)}
+        self.run_import(values)
+        self.assertEqual({self.entry(i)['kobo']['precision'] for i in range(1, 6)}, {kobo_ku.SPAN})
+        return values
+
     def test_once_foreign_our_earlier_span_entries_go_back_to_their_chapter_start(self):
-        self.run_import({1: (self.PRESENT[0], None, '2026-11-01T10:00:01Z')})
-        self.assertEqual(self.entry(1)['kobo']['precision'], kobo_ku.SPAN)   # one value, nothing missing yet
-        values = {1: (self.PRESENT[0], None, '2026-11-01T10:00:01Z')}
-        values.update({i: (self.missing(i), None, '2026-11-01T10:00:{:02d}Z'.format(i)) for i in range(2, 6)})
-        values[6] = (self.PRESENT[1], None, '2026-11-01T10:00:06Z')
-        res = self.run_import(values)
+        values = self.decided_library()
+        values.update({6: (self.missing(6), None, self.stamp(6)), 7: (self.missing(7), None, self.stamp(7))})
+        res = self.run_import(values)                       # 2 of 7 missing: 28 % >= 20 %
         self.assertTrue(self.memory['.']['foreign'])
         e = self.entry(1)
         self.assertEqual((e['textAnchor'], e['kobo']['precision'], e['updated_at']),
@@ -1166,17 +1303,116 @@ class ForeignNumberingTests(ImportBase):
         self.assertIn(self.uuids[1], res.written)
 
     def test_an_app_place_after_our_entry_is_not_touched_by_the_correction(self):
-        self.run_import({1: (self.PRESENT[0], None, '2026-11-01T10:00:01Z')})
+        values = self.decided_library()
         app = {'chapter': 4, 'textAnchor': 5, 'progress': 0.6, 'page': 0, 'scrollY': 0,
                'updated_at': '2026-11-03T10:00:00.000Z', 'deviceId': 'phone-1'}
         data = json.load(open(self.path, encoding='utf-8'))
         data['positions'][self.uuids[1]] = app
         with open(self.path, 'w', encoding='utf-8') as f:
             json.dump(data, f)
-        values = {1: (self.PRESENT[0], None, '2026-11-01T10:00:01Z')}
-        values.update({i: (self.missing(i), None, '2026-11-01T10:00:{:02d}Z'.format(i)) for i in range(2, 7)})
+        values.update({6: (self.missing(6), None, self.stamp(6)), 7: (self.missing(7), None, self.stamp(7))})
         self.run_import(values)
         self.assertEqual(self.entry(1), app)
+
+    # -- re-review round 2, B1-R2 --------------------------------------------------------------------
+
+    def test_B1R2_undecided_runs_write_chapter_starts_even_with_nothing_missing(self):
+        values = {}
+        for i in range(1, 5):                                # one book per USB connect, all found
+            values[i] = (self.PRESENT[i % 2], None, self.stamp(i))
+            res = self.run_import(dict(values))
+            e = self.entry(i)
+            self.assertEqual((e['textAnchor'], e['kobo']['precision']), (0, kobo_ku.CHAPTER), i)
+            self.assertFalse(self.memory['.'].get('foreign'))
+            self.assertTrue(res.foreign or res.undecided)
+
+    def test_B1R2_once_judged_calibre_numbered_our_chapter_starts_are_upgraded_to_their_sentence(self):
+        values = {}
+        for i in range(1, 5):
+            values[i] = (self.PRESENT[i % 2], None, self.stamp(i))
+            self.run_import(dict(values))
+        values[5] = (self.PRESENT[1], None, self.stamp(5))
+        res = self.run_import(dict(values))                  # 5 places, none missing: calibre-numbered
+        self.assertTrue(self.memory['.'].get('decided'))
+        exact = self.positions()
+        for i in range(1, 6):
+            e = self.entry(i)
+            self.assertEqual(e['kobo']['precision'], kobo_ku.SPAN, i)
+            self.assertGreater(e['textAnchor'], 0, i)
+        # the upgrade keeps the Kobo's own date, one millisecond on, so an app that already took the
+        # chapter start (same stamp) takes the sentence; a place read in the app after it stays newer
+        self.assertEqual(self.entry(1)['updated_at'], '2026-11-01T10:00:01.001Z')
+        self.assertEqual(self.entry(1)['kobo']['lastRead'], '2026-11-01T10:00:01.000Z')
+        self.assertEqual(self.entry(5)['updated_at'], '2026-11-01T10:00:05.000Z')
+        for i in range(1, 5):
+            self.assertIn(self.uuids[i], res.written)
+
+    def test_B1R2_the_upgrade_leaves_entries_that_are_not_ours(self):
+        values = {}
+        for i in range(1, 5):
+            values[i] = (self.PRESENT[i % 2], None, self.stamp(i))
+            self.run_import(dict(values))
+        app = {'chapter': 2, 'textAnchor': 0, 'progress': 0.01, 'page': 0, 'scrollY': 0,
+               'updated_at': '2026-11-01T10:00:01.000Z', 'deviceId': 'phone-1'}     # the app's, same stamp
+        data = json.load(open(self.path, encoding='utf-8'))
+        data['positions'][self.uuids[1]] = app
+        with open(self.path, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+        values[5] = (self.PRESENT[1], None, self.stamp(5))
+        self.run_import(dict(values))
+        self.assertEqual(self.entry(1), app)
+        self.assertEqual(self.entry(2)['kobo']['precision'], kobo_ku.SPAN)
+
+    def test_B1R2_twenty_percent_missing_is_foreign(self):
+        values = {i: (self.PRESENT[i % 2], None, self.stamp(i)) for i in range(1, 5)}
+        values[5] = (self.missing(5), None, self.stamp(5))
+        self.run_import(values)                             # 1 of 5 = 20 %
+        self.assertTrue(self.memory['.']['foreign'])
+
+
+class EditedBookTests(ImportBase):
+    """Re-review S1-R2: a book edited after it was sent (a paragraph removed) maps its found ids late.
+    Once one of its span ids is missing AND its EPUB file is newer than the Kobo's last-read date, its
+    places go to the chapter start until the Kobo stores a place dated after the EPUB."""
+
+    PRESENT = 'OEBPS/7446794606207039498_5200-h-1.htm.xhtml#kobo.10.2'
+    MISSING = 'OEBPS/7446794606207039498_5200-h-1.htm.xhtml#kobo.950.1'
+
+    def setUp(self):
+        ImportBase.setUp(self)
+        self.epub = os.path.join(self.lib, 'book.epub')
+        shutil.copy2(EPUB, self.epub)
+        self.memory['.'] = {'since': '2026-10-01T00:00:00.000Z', 'spans': 10, 'missing': 0, 'foreign': False,
+                            'decided': True}
+
+    def lookup(self, book_id):
+        return self.uuids[book_id], self.epub, None
+
+    def edited(self, iso_day):
+        t = datetime.datetime.strptime(iso_day, '%Y-%m-%d').replace(tzinfo=UTC).timestamp()
+        os.utime(self.epub, (t, t))
+
+    def test_S1R2_an_edited_book_goes_to_its_chapter_start_until_the_kobo_reads_after_the_edit(self):
+        self.edited('2026-11-03')
+        res = self.run_import({1: (self.MISSING, None, '2026-11-01T10:00:00Z')})
+        e = self.positions()[self.uuids[1]]
+        self.assertEqual((e['chapter'], e['textAnchor'], e['kobo']['precision']), (2, 0, kobo_ku.CHAPTER))
+        self.assertIn('edited', e['kobo']['note'])
+        res = self.run_import({1: (self.PRESENT, None, '2026-11-02T10:00:00Z')})   # read before the edit
+        e = self.positions()[self.uuids[1]]
+        self.assertEqual((e['textAnchor'], e['kobo']['precision']), (0, kobo_ku.CHAPTER))
+        res = self.run_import({1: (self.PRESENT, None, '2026-11-04T10:00:00Z')})   # read after the edit
+        e = self.positions()[self.uuids[1]]
+        self.assertEqual(e['kobo']['precision'], kobo_ku.SPAN)
+        self.assertGreater(e['textAnchor'], 0)
+
+    def test_S1R2_a_missing_id_in_a_book_not_edited_since_is_skipped_as_before(self):
+        self.edited('2026-10-01')
+        res = self.run_import({1: (self.MISSING, None, '2026-11-01T10:00:00Z')})
+        self.assertEqual(res.written, [])
+        self.assertIn('not in the KEPUB', res.skipped[self.uuids[1]])
+        res = self.run_import({1: (self.PRESENT, None, '2026-11-02T10:00:00Z')})
+        self.assertEqual(self.positions()[self.uuids[1]]['kobo']['precision'], kobo_ku.SPAN)
 
 
 if __name__ == '__main__':
