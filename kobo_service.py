@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0854
+# Last modified: 2026-11-05--1000
 #
 # kobo_service.py — the Kobo sync without calibre running (plugin 1.6.0, tester preview).
 #
@@ -58,7 +58,7 @@ import traceback
 import unicodedata
 import zipfile
 
-VERSION = '1.6.0'
+VERSION = '1.7.0'
 MIN_PLUGIN = (1, 6, 0)         # S5: the job runs only for calibre's CalibReader Sync at least this new
 LABEL_PREFIX = 'com.calibreader.sync.kobo'
 INTERVAL = 300                 # seconds between runs (launchd StartInterval)
@@ -379,6 +379,25 @@ def library_entry(prefs, library):
         want = _nfc(library)
         entry = next((v for k, v in table.items() if _nfc(k) == want), None)
     return entry if isinstance(entry, dict) and entry.get('app_db') else None
+
+
+def ku_configured(prefs, library):
+    '''1.7.0: is the Kobo Utilities (USB) route set up for this library in calibre's Settings
+    (PREFS['kobo_ku'][library] with a location column)? The job does not run it: KU's columns
+    change only while calibre runs, and calibre's plugin imports them then (DESIGN.md step 4).'''
+    table = (prefs or {}).get('kobo_ku') or {}
+    if not isinstance(table, dict):
+        return False
+    entry = table.get(library)
+    if entry is None:
+        want = _nfc(library)
+        entry = next((v for k, v in table.items() if _nfc(k) == want), None)
+    sources = entry.get('sources') if isinstance(entry, dict) else None
+    return any(isinstance(s, dict) and s.get('location') for s in (sources or []))
+
+
+KU_SKIPPED = ("not read by this job: Kobo Utilities fills its columns only while calibre runs, and calibre's "
+              "CalibReader Sync imports them then")
 
 
 def plugin_installed(config_dir):
@@ -788,6 +807,8 @@ def run_once(library, config_dir=None, now=None, hold=0, lookup=None, timeout=No
             reasons['import ' + str(k)] = why
         for k, why in (pres.skipped.items() if pres is not None else ()):
             reasons['send ' + str(k)] = why
+        if ku_configured(prefs, library):
+            reasons['Kobo Utilities (USB)'] = KU_SKIPPED       # 1.7.0: logged once (only when it changes)
         before = state.get('reasons') or {}
         for k in sorted(reasons):
             if before.get(k) != reasons[k]:

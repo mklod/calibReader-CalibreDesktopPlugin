@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0714
+# Last modified: 2026-11-05--1000
 #
 # CalibReader Sync — Calibre plugin
 # Reads the sidecars the CalibReader apps keep in the Calibre library folder
@@ -86,9 +86,17 @@
 # library (the job, calibre and the CLI), one push journal (calibre's), one set of
 # Settings (calibre's). A push without a span leaves Calibre-Web no Location (R2-N1).
 #
+# v1.7.0 (tester preview): Kobo Utilities (USB) -> CalibReader (kobo_ku.py). For Kobo owners who
+# sync over USB with the Kobo Utilities calibre plugin instead of Calibre-Web: Settings -> Kobo
+# "Kobo Utilities (USB)", pick the column Kobo Utilities stores the reading location in (off until
+# then). The plugin reads those columns (never the Kobo, never KoboReader.sqlite, nothing written
+# to metadata.db), maps the Kobo's span on the KEPUB calibre's Kobo driver sends (calibre's own
+# kepubify, cached up to 200 MB in calibre's cache folder) and writes the place into
+# CalibReader_positions.json (deviceId "kobo-utilities", with its precision). Only while calibre runs.
+#
 # Installation:
 #   1. Zip __init__.py, ui.py, config.py, sync_core.py, sidecar_merge.py,
-#      kobo_position.py, kobo_import.py, kobo_push.py, kobo_service.py,
+#      kobo_position.py, kobo_import.py, kobo_push.py, kobo_service.py, kobo_ku.py,
 #      plugin-import-name-calibreader_sync.txt, images/icon.png and LICENSE
 #      → CalibReaderSync.zip (files at the zip root, not inside a subfolder)
 #   2. Calibre → Preferences → Plugins → Load plugin from file → select zip
@@ -121,7 +129,7 @@ class CalibReaderSyncPlugin(InterfaceActionBase):
                              'app for iPhone and iPad')
     supported_platforms   = ['windows', 'osx', 'linux']
     author                = 'CalibReader'
-    version               = (1, 6, 0)
+    version               = (1, 7, 0)
     minimum_calibre_version = (9, 0, 0)
 
     #: Points Calibre at the InterfaceAction class, in ui.py so that only the GUI imports it.
@@ -157,8 +165,8 @@ class CalibReaderSyncPlugin(InterfaceActionBase):
 import importlib
 import sys
 
-for _name in ('sidecar_merge', 'sync_core', 'kobo_position', 'kobo_import', 'kobo_push', 'kobo_service', 'config',
-              'ui'):
+for _name in ('sidecar_merge', 'sync_core', 'kobo_position', 'kobo_import', 'kobo_push', 'kobo_service', 'kobo_ku',
+              'config', 'ui'):
     _module = sys.modules.get('calibre_plugins.calibreader_sync.' + _name)
     if _module is not None:
         importlib.reload(_module)

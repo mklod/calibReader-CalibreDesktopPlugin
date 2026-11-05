@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0854
+# Last modified: 2026-11-05--1000
 #
 # config.py — the plugin's settings dialog (Preferences > Plugins > CalibReader
 # Sync > Customize, or the "Settings…" item in the toolbar button's menu).
@@ -28,6 +28,13 @@
 # Review round 1 (S5): every background job on this Mac is listed with a Remove button,
 # also one for a library calibre no longer shows.
 #
+# 1.7.0 (tester preview): "Kobo Utilities (USB)": the column Kobo Utilities stores the Kobo's
+# reading location in (a chooser of text / long-text columns, never pre-selected, with a live
+# preview of three values; a column where fewer than half of the values read as Kobo locations is
+# refused), and optionally its % read and last-read columns (never CalibReader's own columns).
+# Stored in the plugin's prefs per library folder (ui.PREFS['kobo_ku'], kobo_ku.prefs_entry): a
+# list of sources, one today. Off while no location column is picked.
+#
 # 1.3.1: no read column is pre-selected or saved unless the user picks one (H1);
 # a chosen column that can't be used means read status is not synced (M1); OK
 # kicks a sync (L4); the wording says Android uses #read_status only (L3).
@@ -45,7 +52,7 @@ __copyright__ = '2026, CalibReader'
 import os
 
 from qt.core import (
-    QCheckBox, QComboBox, QFrame, QGridLayout, QLabel, QLineEdit, QPushButton, QSpinBox, QTimer,
+    QCheckBox, QComboBox, QFrame, QGridLayout, QLabel, QLineEdit, QPushButton, QSpinBox, Qt, QTimer,
     QVBoxLayout, QWidget,
 )
 
@@ -65,6 +72,10 @@ try:
 except ImportError:  # pragma: no cover - standalone / test import
     from kobo_push import DEFAULT_CALIBRE_WEB, clean_address, now_iso
     import kobo_service
+try:
+    from calibre_plugins.calibreader_sync import kobo_ku
+except ImportError:  # pragma: no cover - standalone / test import
+    import kobo_ku
 
 # What "Create column…" proposes. The user can rename them in calibre's dialog.
 NEW_COLUMNS = {
@@ -222,8 +233,134 @@ class ConfigWidget(QWidget):
         v.addWidget(self.kobo_service_status)
         if mac:
             self._job_rows(v)
+        self._ku_group(v, settings)
         v.addWidget(self._text('Saved on this computer only, for this library.'))
         v.addStretch(1)
+
+    # -- Kobo Utilities (USB), 1.7.0 tester preview -------------------------------------------
+
+    def _ku_group(self, v, settings):
+        v.addWidget(self._line())
+        v.addWidget(self._heading('Kobo Utilities (USB) (tester preview)'))
+        v.addWidget(self._text(
+            'TESTER PREVIEW: use it only with the CalibReader test build on every iPhone or iPad you read on. '
+            'If you connect your Kobo to calibre by USB and the Kobo Utilities plugin stores its reading '
+            'positions in calibre columns ("Store current reading position", or its auto-store on connect), '
+            'CalibReader can open your books where you stopped on the Kobo. Pick the column Kobo Utilities keeps '
+            'the reading location in: it is only read, never changed. Off until you pick one. To the sentence '
+            'when the Kobo stored its span, otherwise the chapter. The % read and last-read columns are optional; '
+            'pick the last-read one for the right order between the Kobo and the app. Tested with calibre 9.6 '
+            'and 9.14.'))
+        # Never one of CalibReader's own columns (the plugin writes those).
+        mine = {settings['read_column'], settings['percent_column'], settings['last_read_column']} - {''}
+        stored = kobo_ku.source_from_prefs(self._ku_prefs().get(self.gui.library_path)) or {}
+        grid = QGridLayout()
+        self.ku_location = self._ku_combo(kobo_ku.LOCATION_TYPES, mine, stored.get('location'), 'Don\'t use (off)')
+        self.ku_percent = self._ku_combo(kobo_ku.PERCENT_TYPES, mine, stored.get('percent'), 'None')
+        self.ku_last_read = self._ku_combo(kobo_ku.DATE_TYPES, mine, stored.get('last_read'), 'None')
+        for row, (label, combo) in enumerate((('Kobo Utilities location column:', self.ku_location),
+                                              ('Kobo % read column:', self.ku_percent),
+                                              ('Kobo last read column:', self.ku_last_read))):
+            grid.addWidget(QLabel(label, self), row, 0)
+            grid.addWidget(combo, row, 1)
+        grid.setColumnStretch(1, 1)
+        v.addLayout(grid)
+        self.ku_preview = self._text('')
+        self.ku_preview.setTextFormat(Qt.TextFormat.PlainText)
+        v.addWidget(self.ku_preview)
+        self.ku_status = self._text('')
+        self.ku_status.setTextFormat(Qt.TextFormat.PlainText)
+        v.addWidget(self.ku_status)
+        self._ku_check = None
+        self.ku_location.currentIndexChanged.connect(self._update_ku_preview)
+        self._update_ku_preview()
+        self._update_ku_status(stored)
+
+    def _ku_prefs(self):
+        prefs = self._prefs()
+        return dict(prefs.get('kobo_ku', {}) or {}) if prefs is not None else {}
+
+    def _ku_combo(self, types, exclude, selected, none_text):
+        combo = QComboBox(self)
+        combo.addItem(none_text, '')
+        for lookup, heading in kobo_ku.eligible(self.custom, types, exclude):
+            combo.addItem('{} ({})'.format(heading, lookup), lookup)
+        if selected:
+            index = combo.findData(selected)
+            if index < 0:
+                combo.addItem('{} (not usable for this here)'.format(selected), selected)
+                index = combo.count() - 1
+            combo.setCurrentIndex(index)
+        return combo
+
+    def _update_ku_preview(self, *args):
+        '''8.2: three values of the picked column as they read, and the < 50 % refusal.'''
+        lookup = self.ku_location.currentData()
+        self._ku_check = None
+        if not lookup:
+            self.ku_preview.setText('Off: no Kobo Utilities location column picked.')
+            return
+        try:
+            ids = sorted(self.db.all_book_ids())
+            values = self.db.all_field_for(lookup, ids)
+        except Exception as exc:
+            self.ku_preview.setText('{} cannot be read ({}).'.format(lookup, exc))
+            self._ku_check = {'ok': False, 'message': '{} cannot be read.'.format(lookup)}
+            return
+        filled = [values[i] for i in ids if isinstance(values.get(i), str) and values[i].strip()]
+        self._ku_check = kobo_ku.column_check(filled)
+        lines = [kobo_ku.describe(value) for value in filled[:3]]
+        self.ku_preview.setText('\n'.join(lines + [self._ku_check['message']]))
+
+    def _update_ku_status(self, source):
+        '''8.6: when Kobo Utilities last stored positions, and a hint when that is long ago.'''
+        if not source:
+            self.ku_status.setText('')
+            self.ku_status.setVisible(False)
+            return
+        try:
+            values = kobo_ku.read_columns_db(self.db, source)
+        except Exception as exc:
+            self.ku_status.setText(str(exc))
+            return
+        from calibre.constants import config_dir
+        memory = kobo_ku.MemoryFile(kobo_ku.memory_path(config_dir)).load(
+            self.gui.library_path, kobo_ku.source_signature(source))
+        last = kobo_ku.last_store_seen(values, memory)
+        prefs = self._prefs()
+        hint = kobo_ku.staleness_hint(last, (prefs.get('kobo_ku_device_seen') if prefs is not None else None) or None)
+        self.ku_status.setText(kobo_ku.store_line(last) + ((' ' + hint) if hint else ''))
+
+    def _show_ku_error(self, message):
+        from calibre.gui2 import error_dialog
+        error_dialog(self, 'CalibReader Sync: Kobo Utilities', message, show=True)
+
+    def save_ku(self):
+        PREFS = self._prefs()
+        if PREFS is None:  # pragma: no cover
+            return
+        library = self.gui.library_path
+        location = self.ku_location.currentData() or ''
+        percent = self.ku_percent.currentData() or ''
+        last_read = self.ku_last_read.currentData() or ''
+        table = dict(PREFS.get('kobo_ku', {}) or {})
+        if location:
+            problem = None
+            if self._ku_check is not None and not self._ku_check.get('ok'):
+                problem = self._ku_check.get('message')
+            mine = {self.combos[k].currentData() for k in ('read', 'percent', 'last_read')} - {'', None}
+            clash = sorted(mine & {location, percent, last_read})
+            if clash:
+                problem = ('{} is one of CalibReader\'s own columns (the plugin writes it): pick Kobo Utilities\' '
+                           'columns instead.'.format(', '.join(clash)))
+            if problem:
+                self._show_ku_error(problem + ' Kobo Utilities places are not imported with this column; the '
+                                    'Kobo Utilities settings were not changed.')
+                return
+            table[library] = kobo_ku.prefs_entry(location, percent, last_read)
+        else:
+            table.pop(library, None)
+        PREFS['kobo_ku'] = table                # assignment commits a JSONConfig
 
     def _job_rows(self, v):
         '''1.6.0 (review S5): every CalibReader background job on this Mac, for any library,
@@ -460,6 +597,7 @@ class ConfigWidget(QWidget):
 
     def save_settings(self):
         self.save_kobo()
+        self.save_ku()
         before = normalise_settings(self.db.pref(SETTINGS_KEY, None))
         after = self.settings()
         self.db.set_pref(SETTINGS_KEY, after)
