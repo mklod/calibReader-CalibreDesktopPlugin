@@ -17,13 +17,13 @@ them and updates `metadata.db`.
 | | |
 |---|---|
 | **Name** | CalibReader Sync |
-| **Version** | 1.4.0 (tester preview) |
+| **Version** | 1.5.0 (tester preview) |
 | **Author** | CalibReader |
 | **Platforms** | Windows, macOS, Linux |
 | **Minimum Calibre** | 9.0.0 |
 | **License** | GPL v3 (see `LICENSE`) |
 | **Dependencies** | None beyond Calibre itself (stdlib `json` / `os` / `datetime` / `re` / `math` / `hashlib` only) |
-| **Network access** | None. It reads local files only. |
+| **Network access** | None by default: it reads local files only. With the Kobo tester preview's "Also send CalibReader's place to the Kobo" ticked (1.5.0), requests go to your own Calibre-Web only (the address in Settings). |
 
 ---
 
@@ -67,7 +67,8 @@ status column and the progress columns you chose. It writes to
   so the app can tell a later Calibre edit from the plugin's own write.
 
 `CalibReader_positions.json` is written only by the Kobo import (1.4.0 tester
-preview, off until you set it up).
+preview, off until you set it up). Sending CalibReader's place to the Kobo
+(1.5.0) only reads it.
 
 ### File formats
 
@@ -317,7 +318,39 @@ Kobo's place in each book to CalibReader:
   status-only updates (0 % / 100 %), a location far from the Kobo's own %.
 - With several Calibre-Web users, name whose Kobo to follow.
 - At most 25 books are mapped per run; the rest follow a few seconds later.
-- CalibReader to the Kobo is not in this version.
+- CalibReader to the Kobo: see the next section (1.5.0, off by default).
+
+### CalibReader's place to the Kobo (1.5.0, TESTER PREVIEW)
+
+**Off by default.** Tick **Also send CalibReader's place to the Kobo (tester
+preview)** in **Settings → Kobo via Calibre-Web** (the `app.db` path must be
+set too). Nothing is ever sent while it is unticked.
+
+- When you have read further in CalibReader than on the Kobo, the plugin sends
+  that place to **Calibre-Web**, the way a Kobo does (`PUT
+  /kobo/<token>/v1/library/<book uuid>/state`); Calibre-Web hands it to the
+  Kobo at the Kobo's next sync. The address is **Calibre-Web address** in
+  Settings (default `http://127.0.0.1:8083`, Calibre-Web on the same
+  computer). The Kobo token is read from `app.db` (still read-only) and never
+  shown or logged.
+- **Forward only.** A place is sent only when CalibReader's entry is newer
+  than the Kobo's AND ahead of it (chapter, then position in the chapter; the
+  % when the Kobo's place is % only). Never a place behind the Kobo's: the
+  Kobo cannot ask before moving you back.
+- **Precision.** With the book's KEPUB in the library (Calibre-Web with
+  kepubify): the Kobo's sentence-span (`kobo.P.S`) the app's place is in.
+  Without: the chapter and the percentages (Calibre-Web passes only the % to
+  the Kobo then).
+- Only books Calibre-Web has synced to that user's Kobo; read status and
+  reading statistics in Calibre-Web are left alone.
+- The plugin remembers what it sent (calibre's config folder, this computer),
+  so the Kobo import does not read its own push back as a Kobo move.
+- Calibre-Web not running, a wrong address or a refused token: one note, nothing
+  retried; the next sync tries again.
+- **Open question:** whether a real Kobo moves to a place sent from the server.
+  That is what this tester preview finds out.
+- Outside calibre: `python3 kobo_import.py --library … --app-db … --user …
+  --push [--calibre-web http://…] [--state file]`.
 
 ### Testing
 
@@ -335,6 +368,7 @@ All tests, with a count per source:
 python3 tests/run_tests.py    # both modules; the real-Calibre tests are skipped
 tests/run_calibre.sh          # the same under Calibre's own python, real-Calibre tests included
 # run_tests.py also runs tests/test_kobo_position.py + tests/test_kobo_import.py (1.4.0)
+# and tests/test_kobo_push.py (1.5.0; a stand-in Calibre-Web on 127.0.0.1)
 ```
 
 `tests/test_real_calibre.py` runs against real Calibre (`LibraryDatabase`,
@@ -365,6 +399,7 @@ in the `__main__` block, which `unittest.main()` can't find under
    - `sidecar_merge.py`
    - `kobo_position.py`
    - `kobo_import.py`
+   - `kobo_push.py`
    - `plugin-import-name-calibreader_sync.txt`
    - `images/icon.png`
    - `LICENSE`
@@ -453,7 +488,8 @@ changed. A library with neither file is left alone. Turn it off in **Settings**
 | `sync_core.py` | One sync run (`run_sync`), the settings schema and the column suggestions. No Calibre imports; `python3 sync_core.py` runs its tests. |
 | `sidecar_merge.py` | Parsing both files, timestamps, the per-book conflict rules and the bookkeeping. No Calibre imports; `python3 sidecar_merge.py` runs its tests. |
 | `kobo_position.py` | (1.4.0, tester preview) A Kobo place (KoboSpan / EPUB CFI / percentages) to CalibReader's chapter + text position. No Calibre imports. |
-| `kobo_import.py` | (1.4.0, tester preview) Reads Calibre-Web's app.db read-only and merges Kobo places into `CalibReader_positions.json`; `python3 kobo_import.py --library … --app-db … --user …` runs one import. |
+| `kobo_import.py` | (1.4.0, tester preview) Reads Calibre-Web's app.db read-only and merges Kobo places into `CalibReader_positions.json`; `python3 kobo_import.py --library … --app-db … --user …` runs one import (`--push` also sends CalibReader's places, 1.5.0). |
+| `kobo_push.py` | (1.5.0, tester preview) CalibReader's place to the Kobo through Calibre-Web's Kobo API, forward only, off by default. No Calibre imports. |
 | `plugin-import-name-calibreader_sync.txt` | Required by Calibre's loader; declares the import name `calibreader_sync`. |
 | `images/icon.png` | Toolbar icon (blue circular sync arrows), loaded at runtime via `get_icons('images/icon.png')`. |
 | `LICENSE` | GPL v3. |
@@ -532,6 +568,19 @@ column (1.3.0).
 ---
 
 ## Changelog
+
+### 1.5.0 — 2026-11-05 (tester preview, not published)
+
+- **CalibReader → Kobo** (off by default: Settings → Kobo, "Also send
+  CalibReader's place to the Kobo"; the CLI's `--push`): the app's place goes
+  to Calibre-Web's own Kobo API, only when newer than and ahead of the Kobo's
+  place. The KoboSpan of the app's sentence when the library holds the KEPUB,
+  else the chapter and %. app.db stays read-only; the token is never shown.
+  The Kobo import skips the plugin's own push coming back. A Calibre-Web that
+  is down or refuses: one note, no retry.
+- New setting: Calibre-Web address (default `http://127.0.0.1:8083`).
+- Tests: `tests/test_kobo_push.py`; `tests/e2e/` (a Kobo simulator for a local
+  Calibre-Web). The two POSIX file-mode tests are skipped on Windows.
 
 ### 1.4.0 — 2026-11-02 (tester preview, not published)
 
