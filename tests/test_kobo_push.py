@@ -1287,5 +1287,55 @@ class ReReviewNitTests(PushBase):
         self.assertGreaterEqual(bm['ContentSourceProgressPercent'], 9.0)
 
 
+
+# -- re-review round 2 (REVIEW-STEP2.md "Re-review round 2") ----------------------------------
+
+def stamp_ago(seconds):
+    t = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=seconds)
+    return t.strftime('%Y-%m-%dT%H:%M:%S.') + '{:03d}Z'.format(t.microsecond // 1000)
+
+
+class ReReview2Tests(PushBase):
+    '''R2-S1: the app uploads its place ~30 s after the last page turn, so an app place
+    stamped BEFORE our PUT can land in the sidecar after it. That is not "the app moved on":
+    our own push must still not come back as a Kobo place (a "go there?" card).'''
+
+    def push_span(self, stamp):
+        self.kobo(60, '2026-10-30 21:03:48', CH.format(1), 'KoboSpan', 'kobo.3.5', 12.0, 3.0)
+        self.app_anchor = self.anchor_of(3, 'kobo.5.1', plus=7)
+        self.app(UUID, 3, self.app_anchor, stamp=stamp)
+        _, pres = self.sync()
+        self.assertEqual(pres.sent, [UUID])
+
+    def assert_nothing_written(self):
+        before = open(self.positions_path, 'rb').read()
+        kres, _ = self.sync(push=False)
+        self.assertEqual(kres.written, [])
+        self.assertEqual(open(self.positions_path, 'rb').read(), before)
+
+    def test_R2S1_an_app_place_uploaded_after_the_push_does_not_bring_it_back(self):
+        # r2_reprobe: A1 stamped 90 s ago is pushed; A2 (one more page, 30 s ago, before the
+        # PUT) lands after it; the Kobo row is exactly our push.
+        self.push_span(stamp_ago(90))
+        self.app(UUID, 3, self.app_anchor + 900, stamp=stamp_ago(30))
+        self.assert_nothing_written()
+
+    def test_R2S1_the_kobo_page_top_with_such_an_app_place_is_ours_too(self):
+        self.push_span(stamp_ago(90))
+        self.app(UUID, 3, self.app_anchor + 900, stamp=stamp_ago(30))
+        self.kobo_moves(60, 'KoboSpan', 'kobo.4.7', CH.format(2), 34.0, 7.0)     # the page before ours
+        self.assert_nothing_written()
+
+    def test_R2S1_an_app_place_written_after_the_push_still_lets_a_page_back_through(self):
+        # R1-S1 kept: the app moved on AFTER the push, then the Kobo pages back: the card shows.
+        self.push_span(stamp_ago(90))
+        time.sleep(0.01)
+        self.app(UUID, 4, 9000, stamp=stamp_ago(0))
+        time.sleep(0.01)
+        self.kobo_moves(60, 'KoboSpan', 'kobo.4.7', CH.format(2), 30.0, 7.0)
+        kres, _ = self.sync(push=False)
+        self.assertEqual(kres.written, [UUID])
+
+
 if __name__ == '__main__':
     unittest.main()
