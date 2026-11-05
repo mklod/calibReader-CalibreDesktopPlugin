@@ -170,8 +170,9 @@ def parse_location(value):
 
 
 def _short(value, n=60):
+    '''Long values keep their end (the chapter and the span), not the device path.'''
     s = ' '.join((value or '').split()) if isinstance(value, str) else str(value)
-    return s if len(s) <= n else s[:n - 3] + '...'
+    return s if len(s) <= n else '...' + s[-(n - 3):]
 
 
 def describe(value):
