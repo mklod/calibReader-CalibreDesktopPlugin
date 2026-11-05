@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0543
+# Last modified: 2026-11-05--0556
 #
 # Step 2, CalibReader -> Kobo (kobo_push): the app's place in
 # CalibReader_positions.json is PUT to Calibre-Web's Kobo API, forward-only,

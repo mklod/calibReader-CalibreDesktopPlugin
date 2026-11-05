@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0543
+# Last modified: 2026-11-05--0556
 #
 # kobo_push.py — CalibReader's reading place to the Kobo, through Calibre-Web
 # (step 2 of the Kobo sync, plugin 1.5.0, tester preview).
@@ -723,7 +723,7 @@ def push_positions(library_path, app_db, lookup, base_url=DEFAULT_CALIBRE_WEB, m
             'contentSourceProgressPercent': loc['contentSourceProgressPercent'],
             'precision': loc['precision'], 'chapter': loc['chapter'], 'textAnchor': loc['anchor'],
             'app_chapter': entry['chapter'], 'app_textAnchor': entry['textAnchor'],
-            'app_updated_at': entry['updated_at'], 'pushed_at': _kobo_now(), 'confirmed': False,
+            'app_updated_at': entry['updated_at'], 'pushed_at': now_iso(), 'confirmed': False,
         }
         try:
             save()

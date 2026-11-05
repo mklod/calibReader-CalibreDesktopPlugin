@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0543
+# Last modified: 2026-11-05--0556
 #
 # kobo_import.py — Kobo reading positions (Calibre-Web's app.db) into
 # CalibReader_positions.json, the sidecar the CalibReader apps already read.
@@ -342,13 +342,19 @@ ECHO_PERCENT_WINDOW = 2.0                  # step 2 (S1): book-% points BEHIND w
 ECHO_PERCENT_AHEAD = 0.5                   # re-review R1-S1: and only rounding ahead of it
 
 
-def record_is_current(record, current):
-    """Re-review R1-S1: an echo record speaks only for the very app entry that was
-    pushed. Once the sidecar holds another entry (the app read on, or a real Kobo
-    move was imported), the record no longer hides anything."""
-    return (isinstance(record, dict) and isinstance(current, dict)
-            and current.get('deviceId') != KOBO_DEVICE_ID
-            and current.get('updated_at') == record.get('app_updated_at'))
+def record_is_current(record, current, app_too=True):
+    """Re-review R1-S1, corrected in R2-S1: an echo record speaks for our push until
+    something has moved on SINCE it: the sidecar holds an entry stamped after the
+    push (`pushed_at`): the app read on (app_too), or a real Kobo move was imported.
+    An app place stamped before the push but uploaded after it (the app's ~30 s
+    upload debounce) has not moved on: the record still holds."""
+    if not isinstance(record, dict):
+        return False
+    if not isinstance(current, dict):
+        return True
+    if not app_too and current.get('deviceId') != KOBO_DEVICE_ID:
+        return True
+    return not _is_newer(current.get('updated_at'), record.get('pushed_at'))
 
 
 def _percent_matches(got, sent, behind):
@@ -370,7 +376,7 @@ def echo_by_place(place, row, record, current):
       * a push the Kobo got as % only: the Kobo's ProgressPercent from
         ECHO_PERCENT_WINDOW points below what we sent up to ECHO_PERCENT_AHEAD
         above it (further on is a real move);
-    and only while the sidecar still holds the pushed app entry (record_is_current)."""
+    and only while nothing has moved on since the push (record_is_current)."""
     if place is None or not record_is_current(record, current):
         return False
     if record.get('precision') == SPAN:
@@ -393,10 +399,12 @@ def is_echo(row, record, current=_ANY):
     % within ECHO_POINTS below and ECHO_PERCENT_AHEAD above what we sent,
     because Calibre-Web keeps our Location when a later Kobo PUT has none, and a
     Kobo that moved on by % only must still be imported. With `current` (the
-    sidecar's entry for the book), only while it is the pushed app entry (R1-S1)."""
+    sidecar's entry for the book): not once a real Kobo move newer than the push
+    has been imported (R2-S1: an app entry never retires the exact echo; one
+    written after the push is newer than the Kobo row and never reaches it)."""
     if not isinstance(record, dict):
         return False
-    if current is not _ANY and not record_is_current(record, current):
+    if current is not _ANY and not record_is_current(record, current, app_too=False):
         return False
     if ((row.get('location_type') or ''), (row.get('location_value') or ''), (row.get('location_source') or '')) != (
             (record.get('type') or ''), (record.get('value') or ''), (record.get('source') or '')):
