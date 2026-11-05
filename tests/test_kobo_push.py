@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0425
+# Last modified: 2026-11-05--0516
 #
 # Step 2, CalibReader -> Kobo (kobo_push): the app's place in
 # CalibReader_positions.json is PUT to Calibre-Web's Kobo API, forward-only,
@@ -280,10 +280,12 @@ class PushBase(unittest.TestCase):
 
     # -- runs ---------------------------------------------------------------------
     def push(self, url=None, user='admin', **kw):
+        kw.setdefault('since', SINCE)                  # round 1 (B3): sending turned on before these places
         return kobo_push.push_positions(self.lib, self.app_db, self.lookup, base_url=url or self.cw.url,
                                         memory=self.memory, user=user, **kw)
 
     def sync(self, push=True, url=None, user='admin', memory='mine', **kw):
+        kw.setdefault('since', SINCE)
         return kobo_push.sync_kobo(self.lib, self.app_db, self.lookup, user=user, push=push,
                                    base_url=url or self.cw.url,
                                    memory=self.memory if memory == 'mine' else memory, **kw)
@@ -373,12 +375,16 @@ class ForwardOnlyTests(PushBase):
         self.app(UUID, 4, 100, progress=0.55, stamp='2026-10-31T10:05:00.000Z')
         self.assertEqual(self.push().sent, [UUID])
 
-    def test_a_source_only_kobo_place_needs_a_later_chapter(self):
+    def test_a_source_only_kobo_place_is_never_pushed_over(self):
+        # Round 1 (B1/B2 ruling): what cannot be compared in the Kobo's own terms is not sent. A
+        # Source with no span and no % gives nothing to compare with, even from a later chapter.
         self.kobo(60, '2026-10-30 21:03:48', CH.format(2), None, None, None, None)
         self.app(UUID, 3, 30000)                                # same chapter: the Kobo could be anywhere in it
         self.assertEqual(self.push().sent, [])
         self.app(UUID, 4, 10, stamp='2026-10-31T10:05:00.000Z')
-        self.assertEqual(self.push().sent, [UUID])
+        res = self.push()
+        self.assertEqual((res.sent, self.puts()), ([], []))
+        self.assertIn('no %', res.skipped[UUID])
 
     def test_a_kobo_place_not_in_this_book_is_not_pushed_over(self):
         self.kobo(60, '2026-10-30 21:03:48', 'OEBPS/not-in-this-book.xhtml', 'KoboSpan', 'kobo.1.1', 10.0, 3.0)
@@ -611,7 +617,7 @@ class ConsentTests(PushBase):
         self.app(UUID, 3, 500)
         state = os.path.join(self.dir, 'state.json')
         base = ['--library', self.lib, '--app-db', self.app_db, '--user', 'admin', '--calibre-web', self.cw.url,
-                '--state', state]
+                '--state', state, '--since', SINCE]
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(kobo_import.main(base), 0)
         self.assertEqual(self.puts(), [])
@@ -656,7 +662,7 @@ class TokenTests(PushBase):
         err = io.StringIO()
         with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(err):
             kobo_import.main(['--library', self.lib, '--app-db', self.app_db, '--user', 'admin', '--push',
-                              '--calibre-web', self.cw.url, '--state', state])
+                              '--calibre-web', self.cw.url, '--state', state, '--since', SINCE])
         with open(state, encoding='utf-8') as f:
             state_text = f.read()
         everything = ' '.join([self.outputs(res), self.outputs(res2), self.outputs(res3), ' '.join(logged),

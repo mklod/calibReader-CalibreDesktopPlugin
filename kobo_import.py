@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0413
+# Last modified: 2026-11-05--0516
 #
 # kobo_import.py — Kobo reading positions (Calibre-Web's app.db) into
 # CalibReader_positions.json, the sidecar the CalibReader apps already read.
@@ -50,9 +50,9 @@ import uuid as _uuid
 import sqlite3
 
 try:
-    from calibre_plugins.calibreader_sync.kobo_position import Book, map_bookmark
+    from calibre_plugins.calibreader_sync.kobo_position import SPAN, Book, map_bookmark
 except ImportError:  # pragma: no cover - standalone / test import
-    from kobo_position import Book, map_bookmark
+    from kobo_position import SPAN, Book, map_bookmark
 
 POSITIONS_FILE = 'CalibReader_positions.json'
 KOBO_DEVICE_ID = 'kobo-calibre-web'
@@ -317,10 +317,14 @@ def other_library(app_db, library_path):
 # not parsed again until the Kobo moves (a new stamp), so a failing set never
 # re-parses EPUBs on calibre's GUI thread run after run.
 _FAILED = {}
+# Step 2 (S1): Kobo bookmarks recognised as our own push in the Kobo's terms, by
+# the same key -> the Kobo stamp: not mapped again until the Kobo moves.
+_ECHOED = {}
 
 
 def forget_failures():
     _FAILED.clear()
+    _ECHOED.clear()
 
 
 def _failure_key(library_path, app_db, uuid):
@@ -333,6 +337,38 @@ DISTRUST_POINTS = 25.0                     # M5: location vs ProgressPercent, in
 
 
 ECHO_POINTS = 1.0                          # step 2: % tolerance of a no-KEPUB echo
+ECHO_WINDOW = 2000                         # step 2 (S1): characters, about a Kobo page and a half
+ECHO_PERCENT_WINDOW = 2.0                  # step 2 (S1): book-% points, either way, after a %-only push
+
+
+def echo_by_place(place, row, record, current):
+    """Review round 1 (S1): our push reported back by the Kobo in its OWN terms
+    (the first span of its page, its own spelling of Source, its own measure
+    after a %-only push) is still our echo, not a Kobo move: no "go there?" card
+    and no silent jump in the app.
+      * a span push: the Kobo's mapped place is in the chapter we sent, from
+        ECHO_WINDOW characters before where our span lands up to the app's own
+        place when we sent it;
+      * a push the Kobo got as % only: the Kobo's ProgressPercent within
+        ECHO_PERCENT_WINDOW points of what we sent, either way.
+    Once a real Kobo move has been imported after our push (the sidecar holds a
+    newer Kobo entry), the window no longer applies."""
+    if not isinstance(record, dict) or place is None:
+        return False
+    if isinstance(current, dict) and current.get('deviceId') == KOBO_DEVICE_ID \
+            and _is_newer(current.get('updated_at'), record.get('pushed_at')):
+        return False
+    if record.get('precision') == SPAN:
+        try:
+            chapter, landed = int(record['chapter']), int(record['textAnchor'])
+            upto = max(landed, int(record.get('app_textAnchor', landed)))
+        except (KeyError, TypeError, ValueError):
+            return False
+        return place['chapter'] == chapter and landed - ECHO_WINDOW <= place['textAnchor'] <= upto
+    try:
+        return abs(float(row.get('progress_percent')) - float(record.get('progressPercent'))) <= ECHO_PERCENT_WINDOW
+    except (TypeError, ValueError):
+        return False
 
 
 def is_echo(row, record):
@@ -437,6 +473,9 @@ def import_positions(library_path, app_db, lookup, user=None, log=None, max_book
         if _FAILED.get(fkey) == row['updated_at']:
             res.skipped[uuid] = 'failed before; tried again when the Kobo moves'
             continue
+        if _ECHOED.get(fkey) == row['updated_at']:
+            res.skipped[uuid] = 'our own push to the Kobo, reported in the Kobo\'s terms (echo)'
+            continue
         candidates.append((fkey, row['updated_at']))
         if attempted >= max_books:
             res.more = True
@@ -455,6 +494,10 @@ def import_positions(library_path, app_db, lookup, user=None, log=None, max_book
                 with_source += 1
                 if place is None:
                     unresolved += 1
+            if pushed and echo_by_place(place, row, pushed.get(uuid.lower()), current):
+                res.skipped[uuid] = 'our own push to the Kobo, reported in the Kobo\'s terms (echo)'
+                _ECHOED[fkey] = row['updated_at']
+                continue
             if place is not None and has_loc and pct is not None and 0 < pct < 100:
                 lengths = epub.lengths()
                 total = float(sum(lengths)) or 1.0
@@ -577,10 +620,20 @@ def main(argv=None):  # pragma: no cover - CLI
                     help='Calibre-Web address (default %(default)s)')
     ap.add_argument('--state', default=kobo_push.DEFAULT_STATE_FILE,
                     help='where the places sent to the Kobo are remembered (default %(default)s)')
+    ap.add_argument('--since',
+                    help='send only places read after this time (ISO 8601, UTC); default: the time of the first '
+                         '--push run for this library, kept in --state')
     a = ap.parse_args(argv)
     state = kobo_push.load_state(a.state, a.library)
+    since = a.since
+    if a.push and not since:
+        if not state.since:                 # B3: the first --push run is when sending was turned on
+            state.since = kobo_push.now_iso()
+            state.save()
+            print('sending to the Kobo starts now ({}): places read before are not sent'.format(state.since))
+        since = state.since
     res, pres = kobo_push.sync_kobo(a.library, a.app_db, metadata_lookup(a.library), user=a.user, push=a.push,
-                                    base_url=a.calibre_web, memory=state.memory, log=print)
+                                    base_url=a.calibre_web, memory=state.memory, log=print, since=since)
     for n in res.notes:
         print('note:', n)
     for k, why in res.skipped.items():
@@ -596,7 +649,7 @@ def main(argv=None):  # pragma: no cover - CLI
         for line in pres.lines:
             print(line)
         print('sent={}'.format(pres.sent))
-        if pres.sent:
+        if pres.sent or pres.failure == 'timeout':
             state.save()
     return 0
 
