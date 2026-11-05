@@ -1,4 +1,4 @@
-# Last modified: 2026-11-02--1415
+# Last modified: 2026-11-05--0415
 #
 # Calibre-Web app.db (kobo_bookmark) -> CalibReader_positions.json
 # (kobo_import.import_positions). app.db here is a throwaway sqlite file with
@@ -257,6 +257,7 @@ class ImportTests(unittest.TestCase):
         self.assertEqual(self.run_import().written, [UUID])
 
     # -- review round (REVIEW-STEP1.md) ---------------------------------------------
+    @unittest.skipIf(os.name == 'nt', 'POSIX file modes (Windows has none: 0o666 / read-only only)')
     def test_H1_the_files_mode_is_kept(self):
         self.write_positions({OTHER: {'chapter': 1, 'progress': 0.1, 'updated_at': '2026-10-01T00:00:00Z'}})
         os.chmod(self.positions_path(), 0o644)
@@ -268,6 +269,7 @@ class ImportTests(unittest.TestCase):
         self.run_import()
         self.assertEqual(stat.S_IMODE(os.stat(self.positions_path()).st_mode), 0o664)
 
+    @unittest.skipIf(os.name == 'nt', 'POSIX file modes (Windows has none: 0o666 / read-only only)')
     def test_H1_a_new_file_follows_the_umask_not_0600(self):
         self.add(1, 60, '2026-10-30 21:03:48', CH1, None, None, 12.0, 50.0)
         old = os.umask(0o022)
