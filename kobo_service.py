@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--1000
+# Last modified: 2026-11-05--1033
 #
 # kobo_service.py — the Kobo sync without calibre running (plugin 1.6.0, tester preview).
 #
@@ -30,6 +30,10 @@
 # share (R2-N2). A failed import or push is a failed run (S2); macOS privacy blocks get
 # one message naming the folder (S3). The Kobo token stays where it was: read from app.db
 # read-only by kobo_push, never logged (every log line is scrubbed of /kobo/<...> paths).
+#
+# 1.7.0 (step 4): the job does not run the Kobo Utilities (USB) route: KU fills its calibre columns
+# only while calibre runs, where calibre's plugin imports them; a library with that route set
+# up gets one log line saying so (KU_SKIPPED).
 #
 # Standard library only; see docs/handoffs/104-kobo-sync/DESIGN.md, "Step 3".
 #

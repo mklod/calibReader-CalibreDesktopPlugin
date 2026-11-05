@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--1000
+# Last modified: 2026-11-05--1033
 #
 # config.py — the plugin's settings dialog (Preferences > Plugins > CalibReader
 # Sync > Customize, or the "Settings…" item in the toolbar button's menu).

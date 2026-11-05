@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--1000
+# Last modified: 2026-11-05--1033
 #
 # kobo_ku.py — Kobo reading places stored by the Kobo Utilities calibre plugin (USB sync)
 # into CalibReader_positions.json (plugin 1.7.0, tester preview). Kobo -> CalibReader only.

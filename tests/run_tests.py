@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--1000
+# Last modified: 2026-11-05--1033
 #
 # run_tests.py — runs every CalibReader Sync test and REFUSES a run that executed nothing.
 #

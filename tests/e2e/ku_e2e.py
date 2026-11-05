@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--1000
+# Last modified: 2026-11-05--1033
 #
 # ku_e2e.py — the Kobo Utilities (USB) route end to end through the PLUGIN path, under
 # calibre-debug with the plugin INSTALLED (from the 1.7.0 zip) in an isolated calibre config

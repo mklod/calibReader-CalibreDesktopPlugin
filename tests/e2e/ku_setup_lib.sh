@@ -1,5 +1,5 @@
 #!/bin/sh
-# Last modified: 2026-11-05--1000
+# Last modified: 2026-11-05--1033
 # Win10 Git Bash, paths of this e2e (C:/dev/cr-kobo-reverse/e2e-ku). Not shipped.
 # Fresh scratch library (copies of SAFE books) + KU-style columns filled by hand, and a fresh
 # isolated calibre config with the 1.7.0 zip installed. Never touches the SAFE library or K:\.

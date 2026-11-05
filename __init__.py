@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--1000
+# Last modified: 2026-11-05--1033
 #
 # CalibReader Sync — Calibre plugin
 # Reads the sidecars the CalibReader apps keep in the Calibre library folder

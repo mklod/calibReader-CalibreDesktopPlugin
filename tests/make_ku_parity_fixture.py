@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--1000
+# Last modified: 2026-11-05--1033
 #
 # make_ku_parity_fixture.py — the span parity run of KOBO-UTILITIES.md 8.4 (plugin 1.7.0):
 # calibre's OWN kepubify (what calibre's Kobo driver sends) against the EPUB CalibReader opens.
