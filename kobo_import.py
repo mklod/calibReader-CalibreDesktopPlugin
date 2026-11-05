@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0516
+# Last modified: 2026-11-05--0543
 #
 # kobo_import.py — Kobo reading positions (Calibre-Web's app.db) into
 # CalibReader_positions.json, the sidecar the CalibReader apps already read.
@@ -338,47 +338,65 @@ DISTRUST_POINTS = 25.0                     # M5: location vs ProgressPercent, in
 
 ECHO_POINTS = 1.0                          # step 2: % tolerance of a no-KEPUB echo
 ECHO_WINDOW = 2000                         # step 2 (S1): characters, about a Kobo page and a half
-ECHO_PERCENT_WINDOW = 2.0                  # step 2 (S1): book-% points, either way, after a %-only push
+ECHO_PERCENT_WINDOW = 2.0                  # step 2 (S1): book-% points BEHIND what we sent, after a %-only push
+ECHO_PERCENT_AHEAD = 0.5                   # re-review R1-S1: and only rounding ahead of it
+
+
+def record_is_current(record, current):
+    """Re-review R1-S1: an echo record speaks only for the very app entry that was
+    pushed. Once the sidecar holds another entry (the app read on, or a real Kobo
+    move was imported), the record no longer hides anything."""
+    return (isinstance(record, dict) and isinstance(current, dict)
+            and current.get('deviceId') != KOBO_DEVICE_ID
+            and current.get('updated_at') == record.get('app_updated_at'))
+
+
+def _percent_matches(got, sent, behind):
+    try:
+        diff = float(got) - float(sent)
+    except (TypeError, ValueError):
+        return False
+    return -behind <= diff <= ECHO_PERCENT_AHEAD
 
 
 def echo_by_place(place, row, record, current):
-    """Review round 1 (S1): our push reported back by the Kobo in its OWN terms
-    (the first span of its page, its own spelling of Source, its own measure
-    after a %-only push) is still our echo, not a Kobo move: no "go there?" card
-    and no silent jump in the app.
-      * a span push: the Kobo's mapped place is in the chapter we sent, from
-        ECHO_WINDOW characters before where our span lands up to the app's own
-        place when we sent it;
-      * a push the Kobo got as % only: the Kobo's ProgressPercent within
-        ECHO_PERCENT_WINDOW points of what we sent, either way.
-    Once a real Kobo move has been imported after our push (the sidecar holds a
-    newer Kobo entry), the window no longer applies."""
-    if not isinstance(record, dict) or place is None:
-        return False
-    if isinstance(current, dict) and current.get('deviceId') == KOBO_DEVICE_ID \
-            and _is_newer(current.get('updated_at'), record.get('pushed_at')):
+    """Review round 1 (S1), narrowed in re-review R1-S1: the Kobo's report OF OUR
+    PUSH in its own terms (the first span of its page, its own spelling of Source,
+    its own measure after a %-only push) is our echo, not a Kobo move: no "go
+    there?" card and no silent jump. Only while the Kobo's place still matches
+    what we sent:
+      * a span push: in the chapter we sent, from ECHO_WINDOW characters before
+        where our span lands up to it (a later span is a real move);
+      * a push the Kobo got as % only: the Kobo's ProgressPercent from
+        ECHO_PERCENT_WINDOW points below what we sent up to ECHO_PERCENT_AHEAD
+        above it (further on is a real move);
+    and only while the sidecar still holds the pushed app entry (record_is_current)."""
+    if place is None or not record_is_current(record, current):
         return False
     if record.get('precision') == SPAN:
         try:
             chapter, landed = int(record['chapter']), int(record['textAnchor'])
-            upto = max(landed, int(record.get('app_textAnchor', landed)))
         except (KeyError, TypeError, ValueError):
             return False
-        return place['chapter'] == chapter and landed - ECHO_WINDOW <= place['textAnchor'] <= upto
-    try:
-        return abs(float(row.get('progress_percent')) - float(record.get('progressPercent'))) <= ECHO_PERCENT_WINDOW
-    except (TypeError, ValueError):
-        return False
+        return place['chapter'] == chapter and landed - ECHO_WINDOW <= place['textAnchor'] <= landed
+    return _percent_matches(row.get('progress_percent'), record.get('progressPercent'), ECHO_PERCENT_WINDOW)
 
 
-def is_echo(row, record):
+_ANY = object()
+
+
+def is_echo(row, record, current=_ANY):
     """Step 2's echo guard: is this Kobo bookmark (app.db row) our own push
     (`record`, kept per book by kobo_push) coming back? A KoboSpan push: the
     same Type, Value and Source (the span is the place; a Kobo may send its own
     % with it). A push without a KEPUB (Value empty): the same Location AND both
-    % within ECHO_POINTS, because Calibre-Web keeps our Location when a later
-    Kobo PUT has none, and a Kobo that moved by % only must still be imported."""
+    % within ECHO_POINTS below and ECHO_PERCENT_AHEAD above what we sent,
+    because Calibre-Web keeps our Location when a later Kobo PUT has none, and a
+    Kobo that moved on by % only must still be imported. With `current` (the
+    sidecar's entry for the book), only while it is the pushed app entry (R1-S1)."""
     if not isinstance(record, dict):
+        return False
+    if current is not _ANY and not record_is_current(record, current):
         return False
     if ((row.get('location_type') or ''), (row.get('location_value') or ''), (row.get('location_source') or '')) != (
             (record.get('type') or ''), (record.get('value') or ''), (record.get('source') or '')):
@@ -387,10 +405,7 @@ def is_echo(row, record):
         return True
     for got, sent in ((row.get('progress_percent'), record.get('progressPercent')),
                       (row.get('content_source_progress_percent'), record.get('contentSourceProgressPercent'))):
-        try:
-            if abs(float(got) - float(sent)) > ECHO_POINTS:
-                return False
-        except (TypeError, ValueError):
+        if not _percent_matches(got, sent, ECHO_POINTS):
             return False
     return True
 
@@ -453,7 +468,7 @@ def import_positions(library_path, app_db, lookup, user=None, log=None, max_book
         current = data['positions'].get(keys.get(uuid.lower(), uuid))
         if isinstance(current, dict) and not _is_newer(row['updated_at'], current.get('updated_at')):
             continue                      # the sidecar's place is as new or newer
-        if pushed and is_echo(row, pushed.get(uuid.lower())):
+        if pushed and is_echo(row, pushed.get(uuid.lower()), current):
             res.skipped[uuid] = 'our own push to the Kobo coming back (echo), not a Kobo move'
             continue
         has_loc = _row_has_location(row)
@@ -633,7 +648,8 @@ def main(argv=None):  # pragma: no cover - CLI
             print('sending to the Kobo starts now ({}): places read before are not sent'.format(state.since))
         since = state.since
     res, pres = kobo_push.sync_kobo(a.library, a.app_db, metadata_lookup(a.library), user=a.user, push=a.push,
-                                    base_url=a.calibre_web, memory=state.memory, log=print, since=since)
+                                    base_url=a.calibre_web, memory=state.memory, log=print, since=since,
+                                    persist=lambda memory: state.save())
     for n in res.notes:
         print('note:', n)
     for k, why in res.skipped.items():
