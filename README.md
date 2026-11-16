@@ -465,6 +465,7 @@ in the `__main__` block, which `unittest.main()` can't find under
    - `kobo_position.py`
    - `kobo_import.py`
    - `kobo_push.py`
+   - `kobo_service.py`
    - `plugin-import-name-calibreader_sync.txt`
    - `images/icon.png`
    - `LICENSE`
