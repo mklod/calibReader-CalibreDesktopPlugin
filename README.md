@@ -703,6 +703,10 @@ column (1.3.0).
 
 ### 1.7.0 — 2026-11-05 (tester preview, not published)
 
+- 2026-11-17: integration check against plugin `main` (1.3.1) and the 1.6.0 line
+  (`feat/kobo-service`): both are already ancestors of this branch, so nothing
+  was missing and no code changed. Release-staging build for the beta zip that
+  goes out once CalibReader 1.0.6 is live.
 - **Kobo Utilities (USB) → CalibReader** (off until a location column is picked:
   Settings → Kobo Utilities (USB)): the Kobo place Kobo Utilities stores in
   calibre columns goes into `CalibReader_positions.json` (`deviceId`
