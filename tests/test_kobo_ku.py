@@ -1333,7 +1333,7 @@ class CalibreNumberingTests(unittest.TestCase):
             path, why = cache.path_for(1, EPUB)
             self.assertTrue(path, why)
             self.assertEqual(set(os.listdir(base_dir())) - before, set())
-            self.assertEqual(sorted(os.listdir(cache.folder)), [os.path.basename(path)])
+            self.assertEqual(sorted(set(os.listdir(cache.folder)) - {kobo_ku.CACHE_MARKER}), [os.path.basename(path)])
         finally:
             shutil.rmtree(work, ignore_errors=True)
 
@@ -1693,6 +1693,92 @@ class KoboCopyTimesTests(unittest.TestCase):
             application_id = 4
             datetime = 'not a date'
         self.assertIsNone(kobo_ku.kobo_copy_times(([Odd()], [], [])))
+
+
+class ReadOnlyOpenTests(unittest.TestCase):
+    """Review LOW 1: _connect_ro URI-escapes the path ('%', '?', '#', space); a path holding
+    them still opens read-only and reads a row."""
+
+    def test_odd_path_opens_read_only(self):
+        import kobo_import
+        d = tempfile.mkdtemp()
+        try:
+            for name in ('100% lib', 'a#b', 'what?', 'p%41q', 'mix %3f #? x'):
+                folder = os.path.join(d, name)
+                os.makedirs(folder)
+                db = os.path.join(folder, 'metadata.db')
+                con = sqlite3.connect(db)
+                con.execute('CREATE TABLE t (v TEXT)')
+                con.execute("INSERT INTO t VALUES ('row')")
+                con.commit()
+                con.close()
+                ro = kobo_import._connect_ro(db)
+                try:
+                    self.assertEqual(ro.execute('SELECT v FROM t').fetchall(), [('row',)], name)
+                    with self.assertRaises(sqlite3.OperationalError):
+                        ro.execute('INSERT INTO t VALUES (1)')
+                finally:
+                    ro.close()
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class CacheFolderCheckTests(unittest.TestCase):
+    """Review LOW 2: the CLI --cache accepts only a folder fit to be the KEPUB cache."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def mk(self, *parts):
+        p = os.path.join(self.d, *parts)
+        os.makedirs(p, exist_ok=True)
+        return p
+
+    def test_accepts(self):
+        marked = self.mk('m')
+        open(os.path.join(marked, kobo_ku.CACHE_MARKER), 'w').close()
+        open(os.path.join(marked, 'notes.txt'), 'w').close()
+        for ok in (None, '', marked, self.mk('x', 'CalibReaderSync', 'kepub'), self.mk('empty'),
+                   os.path.join(self.d, 'not-yet')):
+            self.assertIsNone(kobo_ku.check_cache_folder(ok), ok)
+
+    def test_refuses(self):
+        lib = self.mk('lib')
+        open(os.path.join(lib, 'metadata.db'), 'w').close()
+        marked_lib = self.mk('lib2')
+        open(os.path.join(marked_lib, 'metadata.db'), 'w').close()
+        open(os.path.join(marked_lib, kobo_ku.CACHE_MARKER), 'w').close()
+        other = self.mk('docs')
+        open(os.path.join(other, 'a.txt'), 'w').close()
+        for bad in (lib, marked_lib, other):
+            self.assertTrue(kobo_ku.check_cache_folder(bad), bad)
+
+    def test_cache_writes_marker_so_it_is_accepted_again(self):
+        folder = os.path.join(self.d, 'custom')
+        src = os.path.join(self.d, 'b.epub')
+        with zipfile.ZipFile(src, 'w') as z:
+            z.writestr('a', 'a')
+        c = kobo_ku.KepubCache(folder, regenerate=lambda s, o: shutil.copy(s, o), version='1', options={})
+        c.path_for(1, src)
+        self.assertTrue(os.path.isfile(os.path.join(folder, kobo_ku.CACHE_MARKER)))
+        self.assertIsNone(kobo_ku.check_cache_folder(folder))
+
+    def test_cli_refuses_a_library_folder(self):
+        lib = self.mk('lib')
+        open(os.path.join(lib, 'metadata.db'), 'w').close()
+        out = tempfile.TemporaryFile('w+')
+        old = sys.stdout
+        sys.stdout = out
+        try:
+            code = kobo_ku.main(['--library', lib, '--location', '#x', '--cache', lib])
+        finally:
+            sys.stdout = old
+        out.seek(0)
+        self.assertEqual(code, 2)
+        self.assertIn('--cache refused', out.read())
 
 
 if __name__ == '__main__':

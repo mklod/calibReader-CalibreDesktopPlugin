@@ -425,6 +425,33 @@ def cache_folder():
     return os.path.join(base, 'CalibReaderSync', 'kepub')
 
 
+CACHE_MARKER = '.calibreader-kepub-cache'   # KepubCache writes it into the folder it makes
+
+
+def check_cache_folder(path):
+    '''-> None when `path` is fit to be the KEPUB cache, else why not. Fit: it is calibre's
+    CalibReaderSync/kepub folder, or carries the marker, or does not exist / is empty. Never a
+    calibre library (metadata.db inside) and never a folder holding other things.'''
+    if not path:
+        return None
+    path = os.path.abspath(path)
+    if os.path.exists(os.path.join(path, 'metadata.db')):
+        return '{} is a calibre library (metadata.db inside), not a KEPUB cache folder'.format(path)
+    if os.path.isfile(path):
+        return '{} is a file, not a folder'.format(path)
+    if not os.path.isdir(path) or os.path.isfile(os.path.join(path, CACHE_MARKER)):
+        return None
+    if tuple(os.path.normpath(path).split(os.sep)[-2:]) == ('CalibReaderSync', 'kepub'):
+        return None
+    try:
+        if not os.listdir(path):
+            return None
+    except OSError as exc:
+        return '{} could not be read ({})'.format(path, exc)
+    return ('{} does not look like a KEPUB cache folder (no {} marker, not .../CalibReaderSync/kepub, '
+            'not empty)'.format(path, CACHE_MARKER))
+
+
 class KepubCache(object):
     '''Ruling 6: calibre's kepubify of a book's EPUB, cached in calibre's cache folder; 200 MB
     in all, least recently used out first; keyed by book + EPUB mtime/size + calibre version +
@@ -466,6 +493,10 @@ class KepubCache(object):
                     pass
         try:
             os.makedirs(self.folder, exist_ok=True)
+            marker = os.path.join(self.folder, CACHE_MARKER)
+            if not os.path.exists(marker):
+                with open(marker, 'w') as fh:
+                    fh.write('CalibReader Sync KEPUB cache; safe to delete\n')
         except OSError as exc:
             return None, 'the KEPUB cache folder could not be made ({})'.format(exc)
         tmp = os.path.join(self.folder, '{}.{}.{}.tmp'.format(key, os.getpid(), threading.get_ident()))
@@ -1343,6 +1374,10 @@ def main(argv=None):  # pragma: no cover - CLI
                     help='where the values seen are remembered (default %(default)s)')
     ap.add_argument('--cache', default=None, help='KEPUB cache folder (default: calibre\'s cache folder)')
     a = ap.parse_args(argv)
+    bad = check_cache_folder(a.cache)
+    if bad:
+        print('error: --cache refused:', bad)
+        return 2
     source = {'id': 'ku', 'label': 'Kobo Utilities', 'location': a.location, 'percent': a.percent,
               'last_read': a.last_read, 'boundReader': None}
     lock = kobo_service.LibraryLock(a.library, 'the command line')

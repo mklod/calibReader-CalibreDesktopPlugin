@@ -707,6 +707,8 @@ column (1.3.0).
   (`feat/kobo-service`): both are already ancestors of this branch, so nothing
   was missing and no code changed. Release-staging build for the beta zip that
   goes out once CalibReader 1.0.6 is live.
+- Review LOWs fixed: library paths holding `%`, `#`, `?` or spaces open read-only (URI-escaped);
+  the command-line `--cache` refuses a calibre library or a folder holding other things.
 - **Kobo Utilities (USB) → CalibReader** (off until a location column is picked:
   Settings → Kobo Utilities (USB)): the Kobo place Kobo Utilities stores in
   calibre columns goes into `CalibReader_positions.json` (`deviceId`

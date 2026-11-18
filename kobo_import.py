@@ -52,6 +52,7 @@ import stat
 import time as _time
 import uuid as _uuid
 import sqlite3
+import urllib.parse
 
 try:
     from calibre_plugins.calibreader_sync.kobo_position import SPAN, Book, map_bookmark
@@ -136,7 +137,8 @@ def _is_newer(candidate, incumbent):
 
 
 def _connect_ro(path):
-    uri = 'file:{}?mode=ro'.format(path.replace('?', '%3f').replace('#', '%23'))
+    # URI-escape everything but '/' ('%', '?', '#', spaces...): sqlite decodes %XX in a file: URI.
+    uri = 'file:{}?mode=ro'.format(urllib.parse.quote(path, safe='/'))
     return sqlite3.connect(uri, uri=True, timeout=5)
 
 
