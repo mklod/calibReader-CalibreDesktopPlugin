@@ -17,13 +17,13 @@ them and updates `metadata.db`.
 | | |
 |---|---|
 | **Name** | CalibReader Sync |
-| **Version** | 1.3.1 |
+| **Version** | 1.6.0 (tester preview) |
 | **Author** | CalibReader |
 | **Platforms** | Windows, macOS, Linux |
 | **Minimum Calibre** | 9.0.0 |
 | **License** | GPL v3 (see `LICENSE`) |
 | **Dependencies** | None beyond Calibre itself (stdlib `json` / `os` / `datetime` / `re` / `math` / `hashlib` only) |
-| **Network access** | None. It reads local files only. |
+| **Network access** | None by default: it reads local files only. With the Kobo tester preview's "Also send CalibReader's place to the Kobo" ticked (1.5.0), requests go to your own Calibre-Web only (the address in Settings), from calibre or, when ticked, from the background job (1.6.0). |
 
 ---
 
@@ -66,7 +66,9 @@ status column and the progress columns you chose. It writes to
   it writes into Calibre, and once to each entry Calibre already agrees with,
   so the app can tell a later Calibre edit from the plugin's own write.
 
-`CalibReader_positions.json` is never written.
+`CalibReader_positions.json` is written only by the Kobo import (1.4.0 tester
+preview, off until you set it up). Sending CalibReader's place to the Kobo
+(1.5.0) only reads it.
 
 ### File formats
 
@@ -289,6 +291,131 @@ metadata edit in Calibre can make a same-vintage position lose. Reading on
 produces a newer stamp and syncs normally. Read status no longer has this
 limitation (1.2.3, see rule 3).
 
+### Kobo reading places from Calibre-Web (1.4.0, TESTER PREVIEW)
+
+**Tester preview only, until the CalibReader app 1.0.4 is on the App Store.**
+Do not publish this build. The feature is off unless you set Calibre-Web's
+`app.db` path in **Settings → Kobo via Calibre-Web**. Use it only with the
+CalibReader test build on every iPhone or iPad you read on: that build asks
+before a Kobo place moves you back; older apps do not.
+
+If your Kobo syncs with **Calibre-Web** (its Kobo sync), the plugin hands the
+Kobo's place in each book to CalibReader:
+
+- `app.db` is opened **read-only**; nothing is written to it or to `metadata.db`.
+- Each Kobo place is mapped to CalibReader's chapter + text position (the text
+  counted as the app counts it) and written into `CalibReader_positions.json`
+  (`deviceId` `kobo-calibre-web`, plus a `kobo` block with the raw location
+  and the precision). The file keeps its permissions; the plugin re-reads it
+  just before writing, so an app upload meanwhile is kept.
+- **Newer wins**, as between devices; the app 1.0.4 never moves you BACK to a
+  Kobo place without asking. The Kobo's stamp is Calibre-Web's server time;
+  stamps more than 10 minutes in the future are refused (wrong clock).
+- **Precision.** With KEPUBs (Calibre-Web with kepubify) the place is the
+  Kobo's sentence; otherwise the same chapter, within a page or two.
+- Not imported: a Kobo location not found in the book (wrong library: if
+  most are, nothing is imported), an unchanged location under a new stamp,
+  status-only updates (0 % / 100 %), a location far from the Kobo's own %.
+- With several Calibre-Web users, name whose Kobo to follow.
+- At most 25 books are mapped per run; the rest follow a few seconds later.
+- CalibReader to the Kobo: see the next section (1.5.0, off by default).
+
+### CalibReader's place to the Kobo (1.5.0, TESTER PREVIEW)
+
+**Off by default.** Tick **Also send CalibReader's place to the Kobo (tester
+preview)** in **Settings → Kobo via Calibre-Web** (the `app.db` path must be
+set too). Nothing is ever sent while it is unticked, and only places you read
+**after ticking it** are sent (ticking it sends nothing old).
+
+- When you have read further in CalibReader than on the Kobo, the plugin sends
+  that place to **Calibre-Web**, the way a Kobo does (`PUT
+  /kobo/<token>/v1/library/<book uuid>/state`); Calibre-Web hands it to the
+  Kobo at the Kobo's next sync. The address is **Calibre-Web address** in
+  Settings (default `http://127.0.0.1:8083`, Calibre-Web on the same
+  computer). The Kobo token is read from `app.db` (still read-only) and never
+  shown or logged.
+- **Forward only.** A place is sent only when CalibReader's entry is newer
+  than the Kobo's AND ahead of it, and then once more just before sending, in
+  the Kobo's own terms: its sentence-span against ours (`kobo.P.S`, or a later
+  chapter), otherwise the % the Kobo will get against the Kobo's own %. What
+  cannot be compared is not sent. Never a place behind the Kobo's: the Kobo
+  cannot ask before moving you back. If the Kobo syncs while calibre is
+  sending, that book waits for the next sync.
+- **Precision.** With the book's KEPUB (Calibre-Web with kepubify; found next
+  to the EPUB even before calibre lists it): the Kobo's sentence-span the app's
+  place is in. Without: the percentages only (Calibre-Web passes no chapter to
+  the Kobo then).
+- Only books Calibre-Web has synced to that user's Kobo; read status and
+  reading statistics in Calibre-Web are left alone.
+- The plugin remembers what it sent (calibre's config folder, this computer),
+  so the Kobo import does not read its own push back as a Kobo move.
+- Sending runs in the background: calibre never waits for Calibre-Web, and the
+  status bar shows the result. Calibre-Web not running, a wrong address or a
+  refused token: one note, nothing retried; automatic sends pause for 5
+  minutes, the Sync Read Status button tries at once.
+- **Open question:** whether a real Kobo moves to a place sent from the server.
+  That is what this tester preview finds out.
+- Outside calibre: `python3 kobo_import.py --library … --app-db … --user …
+  --push [--calibre-web http://…] [--state file] [--since ISO-time]` (sending
+  starts at the first `--push` run unless `--since` says otherwise).
+
+### Keep syncing when calibre is closed (1.6.0, macOS, TESTER PREVIEW)
+
+**Off by default.** Tick **Keep syncing when calibre is closed (macOS, tester
+preview)** in **Settings → Kobo via Calibre-Web** and click OK. A small
+background job then does exactly the Kobo work above (the Kobo's place into
+`CalibReader_positions.json`, and CalibReader's place to the Kobo if that box
+is ticked too) with calibre closed: every 5 minutes, and within about a minute
+of Calibre-Web recording a Kobo sync (its `app.db` changing). Calibre-Web must
+keep running; calibre need not.
+
+- **What OK does.** Copies the plugin's four Kobo modules to
+  `~/Library/Application Support/CalibReaderSync/service/`, writes
+  `~/Library/LaunchAgents/com.calibreader.sync.kobo.<12 letters>.plist` (one
+  per library) and loads it with `launchctl bootstrap gui/<your user id>`. No
+  password, no admin rights. It also creates the job's log and support folders
+  first. It runs calibre's own Python (`calibre-debug -e`), so nothing else
+  needs installing; it refuses (with "Move calibre to Applications first …")
+  when calibre runs from its disk image or from a temporary copy macOS made of
+  a downloaded app. Unticking it (or clearing the app.db path) unloads the job
+  and removes the plist. OK with it ticked after a plugin update refreshes the
+  copy (calibre also refreshes it when it starts).
+- **The same settings.** The job reads this library's Kobo settings from
+  calibre's own settings file at every run, and again before every send:
+  untick "Also send…" and it stops sending from the next request on. It never
+  changes calibre's settings, and it never runs while that box is unticked, the
+  plugin is removed from calibre, or calibre's CalibReader Sync is older than
+  1.6.0 (untick before installing an older build).
+- **One at a time.** The job, calibre and `kobo_import.py` share one lock per
+  library: whoever finds it taken skips that run (one line says so) and never
+  waits. While the job is set up and healthy (a good run in the last 15
+  minutes), calibre's own automatic Kobo runs leave the Kobo to it; if it
+  cannot start or keeps failing, calibre does the Kobo work itself again.
+  **Sync Read Status** always does the Kobo part (under the same lock). The
+  lock is per computer: a second computer's calibre on the same library is not
+  kept apart from this one's job.
+  They share one memory of what was sent (calibre's
+  `plugins/calibreader_sync_kobo_pushed.json`), so neither reads the other's
+  send back as a Kobo move.
+- **Status and log.** Settings shows whether the job is on, starting or not
+  running (and why: launchd's exit code, or the last run's error, which stays
+  until a run succeeds), and its last run. Below it, every CalibReader
+  background job on this Mac, with Remove, including jobs for libraries calibre
+  no longer shows. The log is `~/Library/Logs/CalibReaderSync/kobo.log`: one
+  line per run (what was imported and sent, "no change", "failed: …",
+  "nothing done: …"), notes, and a book's reason for not sending only when it
+  changes; rotated at 256 KB (3 old files kept); never the Kobo token; the home
+  folder shown as `~`.
+- After Calibre-Web failed, the job waits 5 minutes before sending again (the
+  import goes on).
+- macOS only for now (Windows Task Scheduler and Linux systemd timers are
+  sketched in the design notes). Not yet checked on a real protected folder:
+  a library or app.db in a folder macOS guards (Documents, Desktop, Downloads,
+  iCloud Drive, an external drive or a network share) may need macOS's
+  permission for the job. The job then says "macOS did not let the background
+  job read <folder>. In System Settings > Privacy & Security > Full Disk
+  Access, turn on calibre …".
+
 ### Testing
 
 The rules live in two modules that import nothing from Calibre, each with its
@@ -304,6 +431,9 @@ All tests, with a count per source:
 ```bash
 python3 tests/run_tests.py    # both modules; the real-Calibre tests are skipped
 tests/run_calibre.sh          # the same under Calibre's own python, real-Calibre tests included
+# run_tests.py also runs tests/test_kobo_position.py + tests/test_kobo_import.py (1.4.0)
+# and tests/test_kobo_push.py (1.5.0; a stand-in Calibre-Web on 127.0.0.1)
+# and tests/test_kobo_service.py (1.6.0; the background job, its lock, log and launchd set-up)
 ```
 
 `tests/test_real_calibre.py` runs against real Calibre (`LibraryDatabase`,
@@ -332,6 +462,10 @@ in the `__main__` block, which `unittest.main()` can't find under
    - `config.py`
    - `sync_core.py`
    - `sidecar_merge.py`
+   - `kobo_position.py`
+   - `kobo_import.py`
+   - `kobo_push.py`
+   - `kobo_service.py`
    - `plugin-import-name-calibreader_sync.txt`
    - `images/icon.png`
    - `LICENSE`
@@ -419,12 +553,16 @@ changed. A library with neither file is left alone. Turn it off in **Settings**
 | `config.py` | The settings dialog: column pickers with suggestions, **Create column…** through Calibre's API, the threshold. Saves to the library's preferences. |
 | `sync_core.py` | One sync run (`run_sync`), the settings schema and the column suggestions. No Calibre imports; `python3 sync_core.py` runs its tests. |
 | `sidecar_merge.py` | Parsing both files, timestamps, the per-book conflict rules and the bookkeeping. No Calibre imports; `python3 sidecar_merge.py` runs its tests. |
+| `kobo_position.py` | (1.4.0, tester preview) A Kobo place (KoboSpan / EPUB CFI / percentages) to CalibReader's chapter + text position. No Calibre imports. |
+| `kobo_import.py` | (1.4.0, tester preview) Reads Calibre-Web's app.db read-only and merges Kobo places into `CalibReader_positions.json`; `python3 kobo_import.py --library … --app-db … --user …` runs one import (`--push` also sends CalibReader's places, 1.5.0). |
+| `kobo_push.py` | (1.5.0, tester preview) CalibReader's place to the Kobo through Calibre-Web's Kobo API, forward only, off by default. No Calibre imports. |
+| `kobo_service.py` | (1.6.0, tester preview) The Kobo sync without calibre running: the background job's run (`calibre-debug -e kobo_service.py -- run --library …`), the per-library lock shared with calibre and the CLI, and the macOS launchd set-up. No Calibre imports. |
 | `plugin-import-name-calibreader_sync.txt` | Required by Calibre's loader; declares the import name `calibreader_sync`. |
 | `images/icon.png` | Toolbar icon (blue circular sync arrows), loaded at runtime via `get_icons('images/icon.png')`. |
 | `LICENSE` | GPL v3. |
 | `make_icon.py` | Standalone script that generates `images/icon.png`. Not part of the shipped plugin. |
 | `sync.png`, `sync.svg` | Reference icon source art. Not shipped. |
-| `CalibReaderSync.zip` | The packaged, installable plugin. |
+| `CalibReaderSync.zip` | The packaged, installable plugin (12 files at the zip root). |
 | `tests/` | `run_tests.py` (all tests, counts per source, VOID on 0), `run_calibre.sh` (the same under Calibre's python), `test_real_calibre.py`, and the 1.2.5 code for the upgrade test. Not shipped. |
 
 ---
@@ -497,6 +635,53 @@ column (1.3.0).
 ---
 
 ## Changelog
+
+### 1.6.0 — 2026-11-05 (tester preview, not published)
+
+- **Keep syncing when calibre is closed** (macOS, off by default: Settings →
+  Kobo): a launchd job runs the Kobo import and, when ticked, the send to the
+  Kobo with calibre closed, every 5 minutes and when Calibre-Web's app.db
+  changes, using calibre's own Python. Status line in Settings; log in
+  `~/Library/Logs/CalibReaderSync/kobo.log`.
+- One lock per library for the job, calibre and the command line; calibre's
+  automatic Kobo runs stand down while the job is set up and healthy (the
+  button still works).
+- Review round 1: the log and support folders are created before launchd
+  starts the job; no set-up from a disk image or a translocated calibre; a
+  failed run keeps its error in the status line; one plain message for macOS
+  privacy blocks; the push memory is locked across processes; the job stops
+  for an older calibre plugin; Settings lists every job with Remove.
+- One memory of what was sent, shared by calibre, the job and the command line
+  (calibre's journal, re-read at every run; the command line's default
+  `--state`), so none of them reads another's send back as a Kobo move.
+- A place sent without a sentence (no KEPUB) leaves Calibre-Web no chapter
+  path, so later Kobo moves by % only still come back to CalibReader.
+- Tests: `tests/test_kobo_service.py`, more real-Calibre tests.
+
+### 1.5.0 — 2026-11-05 (tester preview, not published)
+
+- **CalibReader → Kobo** (off by default: Settings → Kobo, "Also send
+  CalibReader's place to the Kobo"; the CLI's `--push`): the app's place goes
+  to Calibre-Web's own Kobo API, only when newer than and ahead of the Kobo's
+  place. The KoboSpan of the app's sentence when the library holds the KEPUB,
+  else the chapter and %. app.db stays read-only; the token is never shown.
+  The Kobo import skips the plugin's own push coming back. A Calibre-Web that
+  is down or refuses: one note, no retry.
+- New setting: Calibre-Web address (default `http://127.0.0.1:8083`).
+- Review round 1: only places read after ticking the box; forward-only checked
+  again in the Kobo's own terms just before each send; the Kobo reporting our
+  place in its own terms is not imported back; a KEPUB Calibre-Web added while
+  calibre runs is found; sends run off calibre's GUI thread with a time limit.
+- Tests: `tests/test_kobo_push.py`; `tests/e2e/` (a Kobo simulator for a local
+  Calibre-Web). The two POSIX file-mode tests are skipped on Windows.
+
+### 1.4.0 — 2026-11-02 (tester preview, not published)
+
+- **Kobo → CalibReader** (off unless set up): Kobo reading places from
+  Calibre-Web's app.db (read-only) go into `CalibReader_positions.json`.
+  KoboSpan via the KEPUB, EPUB CFI, or the chapter/book percentage. Automatic
+  sync also runs when app.db changes. A Kobo failure never stops the
+  read-status sync. Built on 1.3.1.
 
 ### 1.3.1 — 2026-11-02
 

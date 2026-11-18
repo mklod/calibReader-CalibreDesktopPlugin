@@ -1,4 +1,4 @@
-# Last modified: 2026-11-02--1441
+# Last modified: 2026-11-05--0845
 #
 # test_real_calibre.py — CalibReader Sync against REAL calibre (LibraryDatabase, set_field,
 # metadata.db, JSONConfig, the Settings widget), not the in-memory FakeDB of sync_core.py.
@@ -25,7 +25,10 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from unittest import mock
 
 TESTS = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(TESTS)
@@ -165,9 +168,11 @@ class RealCalibreBase(unittest.TestCase):
     def v(self, column, book_id):
         return self.lib.api.field_for(column, book_id)
 
-    def run_ui(self, approve=None):
-        '''The main sync path: ui.CalibReaderSyncAction._run, as the button and the
-        automatic sync call it, with the plugin's real JSONConfig.'''
+    def action(self):
+        '''A stand-in for the toolbar action: the plugin's own methods on a plain object
+        (kept for the whole test: the Kobo push memory, worker and back-off live on it).'''
+        if getattr(self, '_action', None) is not None:
+            return self._action
         import ui
 
         class Model(object):
@@ -180,18 +185,467 @@ class RealCalibreBase(unittest.TestCase):
             def model(self):
                 return Model()
 
+        class StatusBar(object):
+            messages = []
+
+            def show_message(self, text, ms=0):
+                StatusBar.messages.append(text)
+
         class Gui(object):
             library_path = self.lib.path
             library_view = View()
             current_db = self.lib.legacy
+            status_bar = StatusBar()
+
+        class Kick(object):
+            starts = 0
+
+            def start(self, ms):
+                Kick.starts += 1
 
         class Action(object):
             gui = Gui()
+            _kick = Kick()
+        for name, member in vars(ui.CalibReaderSyncAction).items():
+            if callable(member) and name.startswith('_') and not name.startswith('__'):
+                setattr(Action, name, member)               # the real Kobo step and its helpers
+        self.kicks = Kick
+        self.status_messages = StatusBar.messages
+        self._action = Action()
+        return self._action
+
+    def run_ui(self, approve=None, manual=False):
+        '''The main sync path: ui.CalibReaderSyncAction._run, as the button and the
+        automatic sync call it, with the plugin's real JSONConfig.'''
+        import ui
         from sync_core import SETTINGS_KEY, normalise_settings
         settings = normalise_settings(self.lib.api.pref(SETTINGS_KEY, None))
-        if approve is None:
-            return ui.CalibReaderSyncAction._run(Action(), self.lib.api, settings)
-        return ui.CalibReaderSyncAction._run(Action(), self.lib.api, settings, approve=approve)
+        kwargs = {}
+        if approve is not None:
+            kwargs['approve'] = approve
+        if manual:
+            kwargs['manual'] = True
+        return ui.CalibReaderSyncAction._run(self.action(), self.lib.api, settings, **kwargs)
+
+    def wait_push(self, timeout=20):
+        '''1.5.0 round 1 (S4): the Kobo push runs on a worker thread and reports back on the
+        GUI thread. Process Qt events until it has (or there was none).'''
+        app = qt_app()
+        action = self.action()
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            app.processEvents()
+            if not getattr(action, '_push_pending', False):
+                break
+            time.sleep(0.02)
+        app.processEvents()
+        return getattr(action, '_last_push', None)
+
+
+@unittest.skipUnless(HAVE_CALIBRE, 'needs calibre (run tests/run_calibre.sh)')
+class RealKoboRunTests(RealCalibreBase):
+    '''1.5.0: the Kobo step of a real run (ui._run -> _run_kobo -> kobo_push.sync_kobo), with
+    calibre's own lookup (format_abspath EPUB/KEPUB), the plugin's real JSONConfig and a
+    stand-in Calibre-Web on 127.0.0.1 (tests/test_kobo_push.FakeCalibreWeb).'''
+
+    def setUp(self):
+        RealCalibreBase.setUp(self)
+        if TESTS not in sys.path:
+            sys.path.insert(0, TESTS)
+        import test_kobo_push as tkp
+        self.tkp = tkp
+        (self.book, self.uuid), = self.lib.books(1)
+        fixtures = os.path.join(TESTS, 'fixtures')
+        self.lib.api.add_format(self.book, 'EPUB', os.path.join(fixtures, 'metamorphosis.epub'))
+        self.lib.api.add_format(self.book, 'KEPUB', os.path.join(fixtures, 'metamorphosis.kepub'))
+        self.app_db = os.path.join(self.lib.path, '..', os.path.basename(self.lib.path) + '-app.db')
+        con = sqlite3.connect(self.app_db)
+        con.executescript(tkp.SCHEMA)
+        con.execute("INSERT INTO user VALUES (1, 'admin', 'a@x', 1)")
+        con.execute('INSERT INTO remote_auth_token (auth_token, user_id, token_type) VALUES (?, 1, 1)', (tkp.TOKEN,))
+        con.execute('INSERT INTO settings VALUES (1, ?)', (self.lib.path,))
+        cur = con.execute("INSERT INTO kobo_reading_state (user_id, book_id, last_modified, priority_timestamp) "
+                          "VALUES (1, ?, '2026-10-30 21:03:48', '2026-10-30 21:03:48')", (self.book,))
+        con.execute("INSERT INTO kobo_bookmark (kobo_reading_state_id, last_modified, location_source, location_type, "
+                    "location_value, progress_percent, content_source_progress_percent) "
+                    "VALUES (?, '2026-10-30 21:03:48', ?, 'KoboSpan', 'kobo.3.5', 12.0, 3.0)",
+                    (cur.lastrowid, tkp.CH.format(1)))
+        con.commit()
+        con.close()
+        self.cw = tkp.FakeCalibreWeb(self.app_db, {self.uuid: self.book})
+        with open(os.path.join(self.lib.path, 'CalibReader_positions.json'), 'w', encoding='utf-8') as f:
+            json.dump({'schema': 1, 'positions': {self.uuid: {
+                'chapter': 3, 'page': 1, 'scrollY': 0, 'progress': 0.4, 'textAnchor': 2900,
+                'updated_at': '2026-10-31T10:00:00.000Z', 'deviceId': tkp.PHONE}}}, f)
+
+    def tearDown(self):
+        self.cw.stop()
+        try:
+            os.remove(self.app_db)
+        except OSError:
+            pass
+        RealCalibreBase.tearDown(self)
+
+    SINCE = '2026-10-01T00:00:00.000Z'                       # the box ticked before the app's place
+
+    def set_kobo(self, **extra):
+        import ui
+        entry = {'app_db': self.app_db, 'user': 'admin', 'cw_url': self.cw.url}
+        entry.update(extra)
+        ui.PREFS['kobo'] = {self.lib.path: entry}
+
+    def test_nothing_is_sent_until_the_box_is_ticked(self):
+        self.set_kobo()                                     # Settings saved, box never ticked
+        res = self.run_ui()
+        self.wait_push()
+        self.assertEqual((self.cw.requests, res.kobo_pushed), ([], 0))
+        self.set_kobo(push=False)
+        res = self.run_ui()                                  # N9: the second run's own result
+        self.wait_push()
+        self.assertEqual(self.cw.requests, [])
+        self.assertFalse([n for n in res.notes if 'Kobo' in n], res.notes)
+        self.assertIsNone(getattr(self.action(), '_last_push', None))
+
+    def test_ticked_it_sends_the_span_once_and_the_import_skips_the_echo(self):
+        import ui
+        self.set_kobo(push=True, push_since=self.SINCE)
+        res = self.run_ui()
+        self.assertTrue(res.kobo_push_started, res.notes)
+        pres = self.wait_push()
+        self.assertEqual(len(pres.sent), 1, pres.notes)
+        (_, path, body, user, _), = self.cw.requests
+        self.assertNotIn(self.tkp.TOKEN, ' '.join(pres.notes + pres.lines + self.status_messages))
+        loc = body['ReadingStates'][0]['CurrentBookmark']['Location']
+        self.assertEqual((loc['Type'], loc['Source']), ('KoboSpan', self.tkp.CH.format(2)))
+        self.assertTrue(any('sentence' in line for line in pres.lines), pres.lines)
+        self.assertTrue(any('sent to the Kobo' in m for m in self.status_messages), self.status_messages)
+        memory = ui.PREFS['kobo_pushed'][self.lib.path]
+        self.assertEqual(memory[self.uuid.lower()]['value'], loc['Value'])
+        before = open(os.path.join(self.lib.path, 'CalibReader_positions.json'), 'rb').read()
+        res = self.run_ui()                                  # Calibre-Web stamped our push: newer than the app's
+        pres = self.wait_push()
+        self.assertEqual((res.kobo_imported, pres.sent, len(self.cw.requests)), (0, [], 1), res.notes)
+        self.assertEqual(open(os.path.join(self.lib.path, 'CalibReader_positions.json'), 'rb').read(), before)
+
+    def test_calibre_web_down_is_one_note_and_no_follow_up_run(self):
+        self.set_kobo(push=True, push_since=self.SINCE, cw_url=self.tkp.closed_port())
+        self.run_ui()
+        pres = self.wait_push()
+        self.assertEqual(pres.sent, [])
+        self.assertEqual(len([n for n in pres.notes if 'did not answer' in n]), 1, pres.notes)
+        self.assertEqual(self.kicks.starts, 0)
+        self.assertTrue(any('did not answer' in m for m in self.status_messages), self.status_messages)
+
+    def test_S4_the_push_never_blocks_the_gui_thread(self):
+        import kobo_push
+        self.set_kobo(push=True, push_since=self.SINCE)
+        gate = threading.Event()
+        real = kobo_push._send
+
+        def held(*a, **kw):
+            gate.wait(10)
+            return real(*a, **kw)
+        with mock.patch('kobo_push._send', side_effect=held):
+            t = time.monotonic()
+            res = self.run_ui()
+            self.assertLess(time.monotonic() - t, 2.0)        # the run returned while the PUT is held
+            self.assertTrue(res.kobo_push_started)
+            self.assertEqual(self.cw.requests, [])
+            gate.set()
+            pres = self.wait_push()
+        self.assertEqual(len(pres.sent), 1, pres.notes)
+
+    def test_S4_after_a_network_failure_automatic_runs_wait_the_button_does_not(self):
+        import kobo_push
+        self.set_kobo(push=True, push_since=self.SINCE, cw_url=self.tkp.closed_port())
+        with mock.patch('kobo_push._send', wraps=kobo_push._send) as send:
+            self.run_ui()
+            self.wait_push()
+            self.assertEqual(send.call_count, 1)
+            self.run_ui()                                    # automatic: in the back-off, nothing tried
+            self.wait_push()
+            self.assertEqual(send.call_count, 1)
+            self.run_ui(manual=True)                          # the button always tries
+            self.wait_push()
+            self.assertEqual(send.call_count, 2)
+
+    def test_B3_the_first_run_after_ticking_sends_no_old_place(self):
+        import ui
+        self.set_kobo(push=True)                              # ticked, no start time stored yet
+        self.run_ui()
+        pres = self.wait_push()
+        self.assertEqual(self.cw.requests, [])
+        self.assertIn('push_since', ui.PREFS['kobo'][self.lib.path])
+        self.assertTrue(pres is None or not pres.sent)
+
+    # -- re-review round 1 ---------------------------------------------------------------
+    def second_book(self):
+        '''A second book on the Kobo with an app place (for a batch of two PUTs).'''
+        (_, _), (book2, uuid2) = self.lib.books(2)
+        fixtures = os.path.join(TESTS, 'fixtures')
+        self.lib.api.add_format(book2, 'EPUB', os.path.join(fixtures, 'metamorphosis.epub'))
+        self.lib.api.add_format(book2, 'KEPUB', os.path.join(fixtures, 'metamorphosis.kepub'))
+        con = sqlite3.connect(self.app_db)
+        cur = con.execute("INSERT INTO kobo_reading_state (user_id, book_id, last_modified, priority_timestamp) "
+                          "VALUES (1, ?, '2026-10-30 21:03:48', '2026-10-30 21:03:48')", (book2,))
+        con.execute("INSERT INTO kobo_bookmark (kobo_reading_state_id, last_modified) VALUES (?, '2026-10-30 21:03:48')",
+                    (cur.lastrowid,))
+        con.commit()
+        con.close()
+        self.cw.books[uuid2] = book2
+        path = os.path.join(self.lib.path, 'CalibReader_positions.json')
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+        data['positions'][uuid2] = {'chapter': 3, 'page': 1, 'scrollY': 0, 'progress': 0.4, 'textAnchor': 500,
+                                    'updated_at': '2026-10-31T10:00:00.000Z', 'deviceId': self.tkp.PHONE}
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+        return uuid2
+
+    def test_R1S3_unticking_stops_a_running_batch(self):
+        import kobo_push
+        self.second_book()
+        self.set_kobo(push=True, push_since=self.SINCE)
+        gate, entered = threading.Event(), threading.Event()
+        real = kobo_push._send
+
+        def held(*a, **kw):
+            entered.set()
+            gate.wait(10)
+            return real(*a, **kw)
+        with mock.patch('kobo_push._send', side_effect=held):
+            self.run_ui()
+            self.assertTrue(entered.wait(10))                  # the first PUT is in flight
+            self.set_kobo(push=False)                         # the tester unticks the box
+            gate.set()
+            pres = self.wait_push()
+        self.assertEqual(len(self.cw.requests), 1)
+        self.assertTrue(any('turned off' in n for n in pres.notes), pres.notes)
+
+    def test_R1S2_a_push_in_flight_is_already_on_disk(self):
+        import kobo_push
+        import ui
+        self.set_kobo(push=True, push_since=self.SINCE)
+        gate, entered = threading.Event(), threading.Event()
+        real = kobo_push._send
+
+        def held(*a, **kw):
+            entered.set()
+            gate.wait(10)
+            return real(*a, **kw)
+        try:
+            with mock.patch('kobo_push._send', side_effect=held):
+                self.run_ui()
+                self.assertTrue(entered.wait(10))              # the PUT is in flight
+                # calibre closes now: a new session reads what the old one had on disk
+                fresh = kobo_push.load_state(ui.KOBO_JOURNAL, self.lib.path).memory
+                self.assertIn(self.uuid.lower(), fresh)
+                self.assertIs(fresh[self.uuid.lower()]['confirmed'], False)
+                gate.set()
+                pres = self.wait_push()
+            self.assertEqual(len(pres.sent), 1)
+            confirmed = kobo_push.load_state(ui.KOBO_JOURNAL, self.lib.path).memory[self.uuid.lower()]
+            self.assertIs(confirmed['confirmed'], True)
+        finally:
+            gate.set()
+            if os.path.exists(ui.KOBO_JOURNAL):
+                os.remove(ui.KOBO_JOURNAL)
+
+    def test_R1N3_a_run_that_found_the_worker_busy_is_run_again_after_it(self):
+        import kobo_push
+        self.set_kobo(push=True, push_since=self.SINCE)
+        gate, entered = threading.Event(), threading.Event()
+        real = kobo_push._send
+
+        def held(*a, **kw):
+            entered.set()
+            gate.wait(10)
+            return real(*a, **kw)
+        with mock.patch('kobo_push._send', side_effect=held):
+            self.run_ui()
+            res = self.run_ui()                                # the worker is still sending
+            self.assertFalse(res.kobo_push_started)
+            gate.set()
+            self.wait_push()
+        self.assertEqual(self.kicks.starts, 1)
+
+
+@unittest.skipUnless(HAVE_CALIBRE, 'needs calibre (run tests/run_calibre.sh)')
+class RealServiceTests(RealKoboRunTests):
+    '''1.6.0 (step 3): calibre and the background job (kobo_service) on one library: the
+    plugin stands down when the job is installed, takes the same lock (held until its push
+    worker ends) and shares one echo memory with the job (calibre's journal, re-read at
+    every Kobo run).'''
+
+    def setUp(self):
+        RealKoboRunTests.setUp(self)
+        self.home = tempfile.mkdtemp(prefix='cr-svc-')
+        self.env = mock.patch.dict(os.environ, {
+            'CALIBREADER_SYNC_HOME': os.path.join(self.home, 'home'),
+            'CALIBREADER_SYNC_LOGS': os.path.join(self.home, 'logs'),
+            'CALIBREADER_SYNC_AGENTS': os.path.join(self.home, 'LaunchAgents'),
+        })
+        self.env.start()
+        os.environ.pop('CALIBREADER_SYNC_LABEL', None)
+        self.zip = os.path.join(config_dir, 'plugins', 'CalibReader Sync.zip')
+
+    def tearDown(self):
+        import ui
+        self.env.stop()
+        shutil.rmtree(self.home, ignore_errors=True)
+        for path in (ui.KOBO_JOURNAL, self.zip):
+            if os.path.exists(path):
+                os.remove(path)
+        RealKoboRunTests.tearDown(self)
+
+    def plist_present(self):
+        import kobo_service
+        path = kobo_service.plist_path(kobo_service.label_for(self.lib.path))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, 'wb').close()
+
+    def plugin_installed(self):
+        import zipfile
+        os.makedirs(os.path.dirname(self.zip), exist_ok=True)
+        with zipfile.ZipFile(self.zip, 'w') as z:            # S5: the job checks it is >= 1.6.0
+            with open(os.path.join(REPO, '__init__.py'), 'rb') as f:
+                z.writestr('__init__.py', f.read())
+            z.writestr('kobo_service.py', '# the job\n')
+
+    def heartbeat(self, seconds_ago=0):
+        import kobo_service
+        t = datetime.datetime.now(UTC) - datetime.timedelta(seconds=seconds_ago)
+        iso = t.strftime('%Y-%m-%dT%H:%M:%S.') + '{:03d}Z'.format(t.microsecond // 1000)
+        kobo_service.save_state(self.lib.path, {'last_run_at': iso, 'last_ok_at': iso, 'status': 'done',
+                                                'summary': '0 places imported, 0 sent'})
+
+    def positions(self):
+        with open(os.path.join(self.lib.path, 'CalibReader_positions.json'), 'rb') as f:
+            return f.read()
+
+    def test_with_the_job_installed_automatic_runs_leave_the_kobo_to_it(self):
+        self.set_kobo(push=True, push_since=self.SINCE, service=True)
+        self.plist_present()
+        self.heartbeat()                                     # S1: a good job run in the last 15 minutes
+        res = self.run_ui()                                  # start-up / poll / follow-up kick
+        self.wait_push()
+        self.assertFalse(res.kobo_push_started)
+        self.assertEqual(self.cw.requests, [])
+        res = self.run_ui(manual=True)                       # the button still does it
+        pres = self.wait_push()
+        self.assertTrue(res.kobo_push_started, res.notes)
+        self.assertEqual((len(pres.sent), len(self.cw.requests)), (1, 1))
+
+    def test_S1_a_job_that_has_not_run_well_lately_leaves_the_kobo_to_calibre(self):
+        # review S1: launchd could not start it, or it died: calibre's own automatic runs resume.
+        self.set_kobo(push=True, push_since=self.SINCE, service=True)
+        self.plist_present()
+        self.heartbeat(seconds_ago=16 * 60)
+        self.run_ui()
+        self.assertEqual(len(self.wait_push().sent), 1)
+
+    def test_without_the_plist_calibre_keeps_doing_it(self):
+        self.set_kobo(push=True, push_since=self.SINCE, service=True)    # ticked, but not on disk
+        self.run_ui()
+        self.assertEqual(len(self.wait_push().sent), 1)
+
+    def test_the_button_does_no_kobo_work_while_the_job_holds_the_lock(self):
+        import kobo_service
+        self.set_kobo(push=True, push_since=self.SINCE)
+        lock = kobo_service.LibraryLock(self.lib.path, 'the background job')
+        self.assertTrue(lock.acquire())
+        try:
+            res = self.run_ui(manual=True)
+            self.wait_push()
+        finally:
+            lock.release()
+        self.assertEqual(self.cw.requests, [])
+        self.assertFalse(res.kobo_push_started)
+        self.assertTrue(any('the background job' in n for n in res.notes), res.notes)
+        res = self.run_ui(manual=True)                       # free again: it runs
+        self.assertEqual(len(self.wait_push().sent), 1)
+
+    def test_calibres_run_holds_the_lock_until_its_push_worker_is_done(self):
+        import kobo_push
+        import kobo_service
+        self.set_kobo(push=True, push_since=self.SINCE)
+        gate, entered = threading.Event(), threading.Event()
+        real = kobo_push._send
+
+        def held(*a, **kw):
+            entered.set()
+            gate.wait(10)
+            return real(*a, **kw)
+        job = kobo_service.LibraryLock(self.lib.path, 'the background job')
+        try:
+            with mock.patch('kobo_push._send', side_effect=held):
+                self.run_ui()
+                self.assertTrue(entered.wait(10))            # the PUT is in flight on the worker
+                self.assertFalse(job.acquire())
+                self.assertIn('calibre', job.holder())
+                gate.set()
+                self.wait_push()
+        finally:
+            gate.set()
+        self.assertTrue(job.acquire())                       # released when the worker ended
+        job.release()
+
+    def test_a_push_by_the_job_is_not_a_kobo_move_for_calibre(self):
+        import kobo_service
+        self.plugin_installed()
+        self.set_kobo(push=True, push_since=self.SINCE, service=True)    # ui.PREFS: on disk now
+        out = kobo_service.run_once(self.lib.path, config_dir=config_dir)
+        self.assertEqual(out.pres.sent, [self.uuid], out.notes)
+        before = self.positions()
+        res = self.run_ui(manual=True)                       # calibre opened afterwards
+        pres = self.wait_push()
+        self.assertEqual(res.kobo_imported, 0, res.notes)
+        self.assertEqual(self.positions(), before)
+        self.assertEqual((pres.sent, len(self.cw.requests)), ([], 1))
+
+    def test_a_job_push_while_calibre_is_open_is_not_a_kobo_move_either(self):
+        # R2-N2: calibre ran (and read the journal) BEFORE the job pushed; its next run must
+        # see the job's push, not a session copy from before it.
+        import kobo_service
+        self.plugin_installed()
+        self.set_kobo(service=True)                          # sending off: calibre's run sends nothing
+        res = self.run_ui(manual=True)
+        self.wait_push()
+        self.assertEqual((res.kobo_imported, self.cw.requests), (0, []))
+        self.set_kobo(push=True, push_since=self.SINCE, service=True)
+        out = kobo_service.run_once(self.lib.path, config_dir=config_dir)
+        self.assertEqual(out.pres.sent, [self.uuid], out.notes)
+        before = self.positions()
+        res = self.run_ui(manual=True)                       # the same calibre session
+        pres = self.wait_push()
+        self.assertEqual(res.kobo_imported, 0, res.notes)
+        self.assertEqual(self.positions(), before)
+        self.assertEqual(len(self.cw.requests), 1)
+
+    def test_a_push_by_calibre_is_not_a_kobo_move_for_the_job(self):
+        import kobo_service
+        self.plugin_installed()
+        self.set_kobo(push=True, push_since=self.SINCE, service=True)
+        self.run_ui(manual=True)
+        self.assertEqual(len(self.wait_push().sent), 1)
+        before = self.positions()
+        out = kobo_service.run_once(self.lib.path, config_dir=config_dir)    # calibre closed afterwards
+        self.assertEqual(out.status, 'done', out.notes)
+        self.assertEqual((out.kres.written, out.pres.sent, len(self.cw.requests)), ([], [], 1))
+        self.assertEqual(self.positions(), before)
+
+    def test_calibre_starting_refreshes_a_stale_copy(self):
+        import kobo_service
+
+        def stale(name):
+            with open(os.path.join(REPO, name), 'rb') as f:
+                return f.read() + b'\n# 1.5.9\n'
+        kobo_service.install_files(stale)
+        self.action()._refresh_service_copy()
+        for name in kobo_service.MODULES:
+            with open(os.path.join(kobo_service.service_dir(), name), 'rb') as f, \
+                    open(os.path.join(REPO, name), 'rb') as g:
+                self.assertEqual(f.read(), g.read(), name)
 
 
 class RealSyncPathTests(RealCalibreBase):
@@ -517,6 +971,136 @@ class RealSettingsDialogTests(RealCalibreBase):
         self.assertIn('iPhone and iPad', text)
         self.assertIn('Android app uses #read_status only', text)
         self.assertNotIn('The CalibReader app reads the same column', text)
+
+    def test_kobo_push_is_off_until_the_user_ticks_it(self):
+        # 1.5.0: nothing is ever sent to the Kobo unless "Also send CalibReader's place to
+        # the Kobo" is ticked; the address defaults to Calibre-Web on this computer.
+        import kobo_push
+        from ui import PREFS
+        try:
+            w = self.widget()
+            self.assertFalse(w.kobo_push.isChecked())
+            self.assertIn('Also send CalibReader', w.kobo_push.text())
+            self.assertEqual(w.kobo_url.placeholderText(), 'http://127.0.0.1:8083')
+            w.kobo_db.setText(os.path.join(self.lib.path, 'app.db'))
+            w.save_kobo()                                           # OK without touching the box
+            entry = PREFS['kobo'][self.lib.path]
+            self.assertIs(entry['push'], False)
+            self.assertFalse(kobo_push.push_enabled(entry))
+            self.assertNotIn('push_since', entry)
+            self.assertEqual(kobo_push.calibre_web_url(entry), 'http://127.0.0.1:8083')
+            w = self.widget()
+            w.kobo_push.setChecked(True)
+            w.save_kobo()
+            entry = PREFS['kobo'][self.lib.path]
+            self.assertTrue(kobo_push.push_enabled(entry))
+            ticked = entry['push_since']                            # B3: when sending was turned on
+            t = datetime.datetime.strptime(ticked[:19], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=UTC)
+            self.assertLess(abs((datetime.datetime.now(UTC) - t).total_seconds()), 120)
+            self.assertTrue(self.widget().kobo_push.isChecked())     # reopened: still on
+            self.widget().save_kobo()                               # OK again: the start time stays
+            self.assertEqual(PREFS['kobo'][self.lib.path]['push_since'], ticked)
+            w = self.widget()
+            w.kobo_push.setChecked(False)
+            w.save_kobo()
+            self.assertNotIn('push_since', PREFS['kobo'][self.lib.path])   # unticking clears it
+            # N7: a pasted Kobo sync link is cut to the address (its token never stored)
+            w = self.widget()
+            w.kobo_url.setText('http://mini.local:8083/kobo/' + 'ab' * 16)
+            w.save_kobo()
+            self.assertEqual(PREFS['kobo'][self.lib.path]['cw_url'], 'http://mini.local:8083')
+            # N8: without a KEPUB the Kobo gets the percentages only
+            from qt.core import QLabel
+            text = ' '.join(label.text() for label in self.widget().findChildren(QLabel))
+            self.assertIn('percentages only', text)
+        finally:
+            PREFS['kobo'] = {}
+
+    def test_keep_syncing_when_calibre_is_closed_box(self):
+        # 1.6.0: off by default; macOS only; OK with it ticked sets the job up (kobo_service.install
+        # with this library, calibre's config folder, the app.db and the plugin's own files);
+        # unticked, it is taken down. The job is never set up by anything else.
+        import kobo_service
+        from ui import PREFS
+        app_db = os.path.join(self.lib.path, 'app.db')
+        try:
+            w = self.widget()
+            self.assertFalse(w.kobo_service.isChecked())
+            self.assertIn('Keep syncing when calibre is closed', w.kobo_service.text())
+            self.assertEqual(w.kobo_service.isEnabled(), kobo_service.supported())
+            with mock.patch.object(kobo_service, 'supported', return_value=True), \
+                    mock.patch.object(kobo_service, 'install', return_value=(True, 'on')) as install, \
+                    mock.patch.object(kobo_service, 'uninstall', return_value=(True, 'off')) as uninstall, \
+                    mock.patch.object(kobo_service, 'status_text', return_value='Background job: off.'):
+                w = self.widget()
+                self.assertTrue(w.kobo_service.isEnabled())
+                w.kobo_db.setText(app_db)
+                w.save_kobo()                                   # OK without the box: nothing set up
+                self.assertEqual(install.call_count, 0)
+                self.assertIs(PREFS['kobo'][self.lib.path].get('service', False), False)
+                w = self.widget()
+                w.kobo_service.setChecked(True)
+                w.save_kobo()
+                self.assertIs(PREFS['kobo'][self.lib.path]['service'], True)
+                (library, cfg, db, read), _ = install.call_args
+                self.assertEqual((library, cfg, db), (self.lib.path, config_dir, app_db))
+                self.assertTrue(read('kobo_service.py').startswith(b'# Last modified'))
+                self.assertTrue(self.widget().kobo_service.isChecked())     # reopened: still on
+                self.widget().save_kobo()                       # OK again: the copy is refreshed
+                self.assertEqual(install.call_count, 2)
+                w = self.widget()
+                w.kobo_service.setChecked(False)
+                w.save_kobo()                                   # unticked: taken down
+                self.assertEqual(uninstall.call_args[0][0], self.lib.path)
+                self.assertIs(PREFS['kobo'][self.lib.path]['service'], False)
+                install.return_value = (False, 'launchctl could not load the background job (exit 5: x).')
+                w = self.widget()
+                w.kobo_service.setChecked(True)
+                with mock.patch.object(type(w), '_show_error') as shown:
+                    w.save_kobo()                               # ticked, but launchd refuses it
+                self.assertIs(PREFS['kobo'][self.lib.path]['service'], False)
+                self.assertIn('exit 5', shown.call_args[0][0])
+                self.assertFalse(self.widget().kobo_service.isChecked())
+                w = self.widget()
+                w.kobo_service.setChecked(True)
+                install.return_value = (True, 'on')
+                w.save_kobo()
+                calls = uninstall.call_count
+                w = self.widget()
+                w.kobo_db.setText('')                           # Kobo sync switched off: the job too
+                w.save_kobo()
+                self.assertEqual(uninstall.call_count, calls + 1)
+                self.assertNotIn(self.lib.path, PREFS['kobo'])
+        finally:
+            PREFS['kobo'] = {}
+
+    def test_S5_every_background_job_is_listed_with_a_remove_button(self):
+        # review S5: jobs for renamed or removed libraries too, each with Remove (macOS).
+        import kobo_service
+        from qt.core import QLabel, QPushButton
+        from ui import PREFS
+        gone = os.path.join(os.path.dirname(self.lib.path), 'Renamed Library')
+        jobs = [{'label': 'com.calibreader.sync.kobo.aaaaaaaaaaaa', 'library': self.lib.path, 'loaded': True,
+                 'library_exists': True, 'plist': 'a.plist'},
+                {'label': 'com.calibreader.sync.kobo.bbbbbbbbbbbb', 'library': gone, 'loaded': True,
+                 'library_exists': False, 'plist': 'b.plist'}]
+        try:
+            PREFS['kobo'] = {gone: {'app_db': 'x', 'service': True}}
+            with mock.patch.object(kobo_service, 'supported', return_value=True), \
+                    mock.patch.object(kobo_service, 'installed_jobs', return_value=jobs), \
+                    mock.patch.object(kobo_service, 'status_text', return_value='Background job: off.'), \
+                    mock.patch.object(kobo_service, 'remove_job', return_value=(True, 'removed')) as remove:
+                w = self.widget()
+                text = ' '.join(label.text() for label in w.findChildren(QLabel))
+                self.assertIn(gone, text)
+                self.assertIn('folder not found', text)
+                buttons = [b for b in w.findChildren(QPushButton) if b.text() == 'Remove']
+                self.assertEqual(len(buttons), 2)
+                buttons[1].click()
+                remove.assert_called_once_with('com.calibreader.sync.kobo.bbbbbbbbbbbb')
+                self.assertIs(PREFS['kobo'][gone]['service'], False)
+        finally:
+            PREFS['kobo'] = {}
 
     def test_picking_a_read_column_saves_it(self):
         self.lib.add_column('read', 'Read')
