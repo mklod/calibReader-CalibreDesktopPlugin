@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0845
+# Last modified: 2026-11-05--1258
 #
 # test_real_calibre.py — CalibReader Sync against REAL calibre (LibraryDatabase, set_field,
 # metadata.db, JSONConfig, the Settings widget), not the in-memory FakeDB of sync_core.py.
@@ -1112,3 +1112,629 @@ class RealSettingsDialogTests(RealCalibreBase):
         self.assertEqual(w.combos['read'].currentData(), '#read')
         w.save_settings()
         self.assertEqual(self.stored()['read_column'], '#read')
+
+
+# --------------------------------------------------------------------------- 1.7.0: Kobo Utilities
+
+KU_CH = 'OEBPS/7446794606207039498_5200-h-{}.htm.xhtml'          # Metamorphosis: h-1 = chapter 2
+
+
+@unittest.skipUnless(HAVE_CALIBRE, 'needs calibre (run tests/run_calibre.sh)')
+class RealKoboUtilitiesTests(RealCalibreBase):
+    '''1.7.0 (step 4): Kobo Utilities' columns, read through calibre's db API, mapped on calibre's
+    OWN kepubify of the EPUB (the KEPUB its Kobo driver sends), into CalibReader_positions.json
+    by the real run (ui._run). metadata.db is never written by it.'''
+
+    def setUp(self):
+        RealCalibreBase.setUp(self)
+        import ui
+        for label, name, kind in (('kobo_reading_location', 'Kobo location', 'text'),
+                                  ('kobo_percent_read', 'Kobo % read', 'int'),
+                                  ('kobo_last_read', 'Kobo last read', 'datetime')):
+            self.lib.legacy.create_custom_column(label, name, kind, False)
+        self.lib.reopen()
+        self.books = self.lib.books(3)
+        fixtures = os.path.join(TESTS, 'fixtures')
+        for book, _ in self.books[:2]:
+            self.lib.api.add_format(book, 'EPUB', os.path.join(fixtures, 'metamorphosis.epub'))
+        self.cache = tempfile.mkdtemp(prefix='cr-ku-cache-')
+        self.cache_patch = mock.patch('kobo_ku.cache_folder', return_value=self.cache)
+        self.cache_patch.start()
+        if os.path.exists(ui.KU_MEMORY):
+            os.remove(ui.KU_MEMORY)
+
+    def tearDown(self):
+        import ui
+        self.cache_patch.stop()
+        shutil.rmtree(self.cache, ignore_errors=True)
+        ui.PREFS['kobo_ku'] = {}
+        if os.path.exists(ui.KU_MEMORY):
+            os.remove(ui.KU_MEMORY)
+        RealCalibreBase.tearDown(self)
+
+    def set_ku(self, location='#kobo_reading_location', percent='#kobo_percent_read', last_read='#kobo_last_read',
+               decided=False):
+        import kobo_ku
+        import ui
+        ui.PREFS['kobo_ku'] = {self.lib.path: kobo_ku.prefs_entry(location, percent, last_read)}
+        if decided:
+            # a library already judged calibre-numbered (re-review B1-R2: until then, chapter starts)
+            source = kobo_ku.source_from_prefs(ui.PREFS['kobo_ku'][self.lib.path])
+            kobo_ku.MemoryFile(ui.KU_MEMORY).save(self.lib.path, kobo_ku.source_signature(source), {'.': {
+                'since': '2026-10-01T00:00:00.000Z', 'spans': 5, 'missing': 0, 'foreign': False, 'decided': True}})
+
+    def fill(self, book, location, percent=None, last_read=None):
+        api = self.lib.api
+        api.set_field('#kobo_reading_location', {book: location})
+        api.set_field('#kobo_percent_read', {book: percent})
+        api.set_field('#kobo_last_read', {book: last_read})
+
+    def metadata_hash(self):
+        import hashlib
+        with open(os.path.join(self.lib.path, 'metadata.db'), 'rb') as f:
+            return hashlib.sha256(f.read()).hexdigest()
+
+    def positions_raw(self):
+        path = os.path.join(self.lib.path, 'CalibReader_positions.json')
+        if not os.path.exists(path):
+            return None
+        with open(path, 'rb') as f:
+            return f.read()
+
+    def entries(self):
+        raw = self.positions_raw()
+        return json.loads(raw.decode('utf-8'))['positions'] if raw else {}
+
+    def epub_text(self, chapter):
+        from kobo_position import Book
+        b = Book(os.path.join(TESTS, 'fixtures', 'metamorphosis.epub'))
+        try:
+            return b.text(chapter).text
+        finally:
+            b.close()
+
+    def test_off_until_a_location_column_is_picked(self):
+        (b1, u1), = self.books[:1]
+        self.fill(b1, KU_CH.format(1) + '#kobo.3.2', 4, datetime.datetime(2026, 11, 1, 10, 0, tzinfo=UTC))
+        res = self.run_ui()
+        self.assertEqual(getattr(res, 'kobo_ku_imported', 0), 0)
+        self.assertIsNone(self.positions_raw())
+
+    def test_columns_to_positions_with_calibres_own_kepub_and_metadata_untouched(self):
+        (b1, u1), (b2, u2) = self.books[:2]
+        self.fill(b1, KU_CH.format(1) + '#kobo.3.2', 4, datetime.datetime(2026, 11, 1, 10, 0, tzinfo=UTC))
+        # a device-prefixed shape, and calibre's blank paragraph-start span (kobo.3.1, "\n")
+        self.fill(b2, 'file:///mnt/onboard/Kafka/The Metamorphosis - Franz Kafka.kepub.epub!!' + KU_CH.format(1)
+                  + '#kobo.3.1', 4, datetime.datetime(2026, 11, 1, 11, 0, tzinfo=UTC))
+        self.set_ku(decided=True)
+        self.lib.reopen()
+        before = self.metadata_hash()
+        res = self.run_ui()
+        self.assertEqual(res.kobo_ku_imported, 2, res.notes)
+        e = self.entries()
+        text = self.epub_text(2)
+        for uuid in (u1, u2):
+            entry = e[uuid]
+            self.assertEqual((entry['deviceId'], entry['chapter'], entry['kobo']['precision']),
+                             ('kobo-utilities', 2, 'span'), entry)
+            self.assertTrue(text[entry['textAnchor']:].startswith('One morning, when Gregor Samsa'),
+                            text[entry['textAnchor']:][:40])
+            self.assertEqual(entry['kobo']['kepub'], 'calibre kepubify')
+        self.assertEqual(e[u1]['updated_at'], '2026-11-01T10:00:00.000Z')
+        self.assertTrue(any('Kobo Utilities' in line for line in res.kobo_ku_lines), res.kobo_ku_lines)
+        raw = self.positions_raw()
+        res = self.run_ui()                                  # a re-run: nothing new, nothing written
+        self.assertEqual(res.kobo_ku_imported, 0)
+        self.assertEqual(self.positions_raw(), raw)
+        self.lib.reopen()
+        self.assertEqual(self.metadata_hash(), before)       # never a write into metadata.db
+
+    def test_a_stored_kepub_and_calibres_own_both_count_and_the_earlier_place_wins(self):
+        # review step 4 S1 (supersedes "the stored KEPUB is the one the driver sends"): the KEPUB
+        # format may have been added after the book was sent, so both numberings are tried and the
+        # place is never after either landing
+        from kobo_position import Book, resolve_span
+        (b1, u1), = self.books[:1]
+        stored = os.path.join(TESTS, 'fixtures', 'metamorphosis.kepub')
+        self.lib.api.add_format(b1, 'KEPUB', stored)
+        self.fill(b1, KU_CH.format(1) + '#kobo.10.2', 4, datetime.datetime(2026, 11, 1, 10, 0, tzinfo=UTC))
+        self.set_ku(decided=True)
+        res = self.run_ui()
+        self.assertEqual(res.kobo_ku_imported, 1, res.notes)
+        entry = self.entries()[u1]
+        self.assertEqual(entry['kobo']['kepub'], 'stored KEPUB + calibre kepubify')
+        self.assertIn(entry['kobo']['precision'], ('span', 'span~'))
+        epub, kepub = Book(os.path.join(TESTS, 'fixtures', 'metamorphosis.epub')), Book(stored)
+        try:
+            self.assertLessEqual(entry['textAnchor'], resolve_span(epub, kepub, 2, 'kobo.10.2')[0])
+        finally:
+            epub.close()
+            kepub.close()
+        self.assertEqual(len([n for n in os.listdir(self.cache) if n.endswith('.kepub')]), 1)   # calibre's own
+
+    def test_the_lock_held_elsewhere_means_no_ku_work_this_run(self):
+        import kobo_service
+        (b1, u1), = self.books[:1]
+        self.fill(b1, KU_CH.format(1) + '#kobo.3.2', 4, datetime.datetime(2026, 11, 1, 10, 0, tzinfo=UTC))
+        self.set_ku()
+        home = tempfile.mkdtemp(prefix='cr-ku-home-')
+        try:
+            with mock.patch.dict(os.environ, {'CALIBREADER_SYNC_HOME': home}):
+                other = kobo_service.LibraryLock(self.lib.path, 'the background job')
+                self.assertTrue(other.acquire())
+                try:
+                    res = self.run_ui()
+                    self.assertEqual(res.kobo_ku_imported, 0)
+                    self.assertTrue(any('running elsewhere' in n for n in res.notes), res.notes)
+                    self.assertIsNone(self.positions_raw())
+                finally:
+                    other.release()
+                res = self.run_ui()
+                self.assertEqual(res.kobo_ku_imported, 1, res.notes)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_the_poll_sees_a_column_change(self):
+        (b1, u1), = self.books[:1]
+        self.set_ku()
+        action = self.action()
+        first = action._file_stamps()
+        self.fill(b1, KU_CH.format(1) + '#kobo.3.2', 4, datetime.datetime(2026, 11, 1, 10, 0, tzinfo=UTC))
+        self.assertNotEqual(action._file_stamps(), first)
+
+    def test_a_kobo_connecting_is_remembered_and_runs_again_later(self):
+        import ui
+        action = self.action()
+
+        class Timer(object):
+            started = []
+
+            def start(self, ms):
+                Timer.started.append(ms)
+        action._ku_device_timer = Timer()
+        action._kobo_connected()
+        self.assertTrue(ui.PREFS['kobo_ku_device_seen'])
+        self.assertEqual(Timer.started, [ui.KU_DEVICE_DELAY_MS])
+
+    def test_calibreaders_own_columns_never_suggest_kobo_utilities_columns(self):
+        # e2e finding: on a library whose CalibReader settings were never saved, Settings pre-selected
+        # #kobo_percent_read / #kobo_last_read as CalibReader's own % / last-read columns, so OK would
+        # have had the plugin write the app's progress into Kobo Utilities' columns.
+        qt_app()
+        import config
+
+        class Gui(object):
+            current_db = self.lib.legacy
+            library_path = self.lib.path
+            iactions = {}
+        w = config.ConfigWidget(Gui())
+        self.assertNotEqual(w.combos['percent'].currentData(), '#kobo_percent_read')
+        self.assertNotEqual(w.combos['last_read'].currentData(), '#kobo_last_read')
+        # picked by hand they are still there to pick (only never suggested)
+        self.assertGreaterEqual(w.combos['percent'].findData('#kobo_percent_read'), 0)
+
+    def test_a_ku_column_that_calibreader_also_writes_stops_the_ku_route(self):
+        # CalibReader writing the app's % into the column the KU route reads would come back as a
+        # "Kobo" place: the route does not run, one note says why.
+        (b1, u1), = self.books[:1]
+        self.fill(b1, None, 40, datetime.datetime(2026, 11, 1, 10, 0, tzinfo=UTC))
+        self.lib.set_settings({'version': 1, 'percent_column': '#kobo_percent_read', 'last_read_column': '',
+                               'progress_threshold': 1, 'auto_sync': True})
+        self.set_ku()
+        res = self.run_ui()
+        self.assertEqual(res.kobo_ku_imported, 0)
+        self.assertTrue(any('#kobo_percent_read' in n and 'CalibReader' in n for n in res.notes), res.notes)
+        entries = self.entries()
+        self.assertFalse([e for e in entries.values() if e.get('deviceId') == 'kobo-utilities'])
+
+    def test_the_summary_names_a_book_not_imported_and_why(self):
+        # (re-review S1-R1: a span id missing from calibre's numbering now goes to its chapter start,
+        # so the book named here is one whose chapter is not in the book)
+        (b1, u1), = self.books[:1]
+        self.fill(b1, 'text/nowhere.xhtml#kobo.1.1', 4, datetime.datetime(2026, 11, 1, 10, 0, tzinfo=UTC))
+        self.set_ku()
+        res = self.run_ui(manual=True)
+        title = self.lib.api.field_for('title', b1)
+        lines = [line for line in res.kobo_ku_lines if title in line]
+        self.assertTrue(lines and 'text/nowhere.xhtml' in lines[0] and 'not in this book' in lines[0],
+                        res.kobo_ku_lines)
+
+    def test_b_a_connected_kobo_list_flags_a_book_whose_epub_is_newer_than_its_copy(self):
+        # residual (b): calibre's own in-memory list of the connected Kobo's books (Main.booklists());
+        # read-only, no device I/O. Book 1's EPUB (added just now) is newer than its Kobo copy (2026-01-01).
+        import ui
+        (b1, u1), = self.books[:1]
+        self.fill(b1, KU_CH.format(1) + '#kobo.3.2', 4, datetime.datetime(2026, 11, 1, 10, 0, tzinfo=UTC))
+        self.set_ku(decided=True)
+        action = self.action()
+
+        class KOBOTOUCH(object):
+            name = 'Kobo Touch/Glo/Mini/Aura HD/Aura H2O/Glo HD/Touch 2'
+
+        class DeviceManager(object):
+            connected_device = KOBOTOUCH()
+
+        class DeviceBook(object):
+            application_id = b1
+            datetime = time.gmtime(datetime.datetime(2026, 1, 1, tzinfo=UTC).timestamp())
+        action.gui.device_manager = DeviceManager()
+        action.gui.booklists = lambda: ([DeviceBook()], [], [])
+        try:
+            res = self.run_ui()
+        finally:
+            del action.gui.device_manager
+            del action.gui.booklists
+        entry = self.entries()[u1]
+        self.assertEqual((entry['textAnchor'], entry['kobo']['precision']), (0, 'chapter'), res.notes)
+        self.assertIn('edited', entry['kobo']['note'])
+
+    def test_b_without_a_connected_kobo_nothing_changes(self):
+        (b1, u1), = self.books[:1]
+        self.fill(b1, KU_CH.format(1) + '#kobo.3.2', 4, datetime.datetime(2026, 11, 1, 10, 0, tzinfo=UTC))
+        self.set_ku(decided=True)
+        action = self.action()
+
+        class DeviceManager(object):
+            connected_device = None
+        action.gui.device_manager = DeviceManager()
+        action.gui.booklists = lambda: (_ for _ in ()).throw(AssertionError('no device: never read'))
+        try:
+            self.run_ui()
+        finally:
+            del action.gui.device_manager
+            del action.gui.booklists
+        self.assertEqual(self.entries()[u1]['kobo']['precision'], 'span')
+
+    def test_a_newer_calibre_web_place_wins(self):
+        (b1, u1), = self.books[:1]
+        with open(os.path.join(self.lib.path, 'CalibReader_positions.json'), 'w', encoding='utf-8') as f:
+            json.dump({'schema': 1, 'positions': {u1: {
+                'chapter': 3, 'page': 0, 'scrollY': 0, 'progress': 0.3, 'textAnchor': 100,
+                'updated_at': '2026-11-02T10:00:00.000Z', 'deviceId': 'kobo-calibre-web',
+                'kobo': {'precision': 'span'}}}}, f)
+        self.fill(b1, KU_CH.format(1) + '#kobo.3.2', 4, datetime.datetime(2026, 11, 1, 10, 0, tzinfo=UTC))
+        self.set_ku()
+        res = self.run_ui()
+        self.assertEqual(res.kobo_ku_imported, 0)
+        self.assertEqual(self.entries()[u1]['deviceId'], 'kobo-calibre-web')
+
+
+@unittest.skipUnless(HAVE_CALIBRE, 'needs calibre (run tests/run_calibre.sh)')
+class RealKoboUtilitiesSettingsTests(RealCalibreBase):
+    '''1.7.0: Settings -> Kobo, "Kobo Utilities (USB)": the location column is a chooser, never
+    pre-selected; a live preview; a column that does not read as KU locations is refused.'''
+
+    def setUp(self):
+        RealCalibreBase.setUp(self)
+        for label, name, kind in (('kobo_reading_location', 'Kobo location', 'text'),
+                                  ('kobo_percent_read', 'Kobo % read', 'int'),
+                                  ('kobo_last_read', 'Kobo last read', 'datetime'),
+                                  ('genre_note', 'Genre note', 'text'),
+                                  ('read_percent', 'Read %', 'int'),
+                                  ('kobo_loc_notes', 'Kobo loc notes', 'comments')):
+            self.lib.legacy.create_custom_column(label, name, kind, False)
+        self.lib.legacy.create_custom_column('shelves', 'Shelves', 'text', True)
+        self.lib.reopen()
+        books = self.lib.books(3)
+        api = self.lib.api
+        for (book, _), value in zip(books, ('text/titlepage.xhtml#kobo.1.1', 'OEBPS/ch08.xhtml', None)):
+            api.set_field('#kobo_reading_location', {book: value})
+        for (book, _), value in zip(books, ('Fantasy', 'Horror', 'text/a.xhtml')):
+            api.set_field('#genre_note', {book: value})
+        self.lib.set_settings({'version': 1, 'percent_column': '#read_percent', 'last_read_column': '',
+                               'progress_threshold': 1, 'auto_sync': True})
+
+    def tearDown(self):
+        import ui
+        ui.PREFS['kobo_ku'] = {}
+        RealCalibreBase.tearDown(self)
+
+    def widget(self):
+        qt_app()
+        import config
+
+        class Gui(object):
+            current_db = self.lib.legacy
+            library_path = self.lib.path
+            iactions = {}
+        return config.ConfigWidget(Gui())
+
+    def items(self, combo):
+        return [combo.itemData(i) for i in range(combo.count())]
+
+    def test_never_pre_selected_and_only_plausible_columns(self):
+        import ui
+        w = self.widget()
+        self.assertEqual(w.ku_location.currentData(), '')                # "Don't use": off
+        locs = self.items(w.ku_location)
+        self.assertIn('#kobo_reading_location', locs)
+        self.assertIn('#kobo_loc_notes', locs)                           # comments columns too
+        self.assertNotIn('#shelves', locs)                               # not a multiple-value column
+        self.assertNotIn('#kobo_percent_read', locs)
+        self.assertEqual(w.ku_percent.currentData(), '')
+        self.assertIn('#kobo_percent_read', self.items(w.ku_percent))
+        # review step 4 S3: CalibReader's own % column is offered too, so a clash shows and is refused
+        self.assertIn('#read_percent', self.items(w.ku_percent))
+        self.assertIn('#kobo_last_read', self.items(w.ku_last_read))
+        from qt.core import QLabel
+        text = ' '.join(label.text() for label in w.findChildren(QLabel))
+        self.assertIn('Kobo Utilities (USB)', text)
+        self.assertIn('tester preview', text.lower())
+        w.save_ku()
+        self.assertNotIn(self.lib.path, ui.PREFS.get('kobo_ku', {}) or {})  # nothing picked: off
+
+    def test_the_preview_and_saving(self):
+        import kobo_ku
+        import ui
+        w = self.widget()
+        w.ku_location.setCurrentIndex(w.ku_location.findData('#kobo_reading_location'))
+        self.assertIn('text/titlepage.xhtml#kobo.1.1 -> span', w.ku_preview.text())
+        self.assertIn('OEBPS/ch08.xhtml -> chapter', w.ku_preview.text())
+        w.ku_percent.setCurrentIndex(w.ku_percent.findData('#kobo_percent_read'))
+        w.ku_last_read.setCurrentIndex(w.ku_last_read.findData('#kobo_last_read'))
+        w.save_ku()
+        self.assertEqual(ui.PREFS['kobo_ku'][self.lib.path],
+                         kobo_ku.prefs_entry('#kobo_reading_location', '#kobo_percent_read', '#kobo_last_read'))
+        w = self.widget()                                                # reopened: the choice is shown
+        self.assertEqual(w.ku_location.currentData(), '#kobo_reading_location')
+        self.assertIn('Last Kobo Utilities store seen', w.ku_status.text())
+
+    def test_a_column_that_is_not_ku_locations_is_refused(self):
+        import ui
+        w = self.widget()
+        w.ku_location.setCurrentIndex(w.ku_location.findData('#genre_note'))
+        self.assertIn('does not look like a Kobo Utilities location column', w.ku_preview.text())
+        shown = []
+        w._show_ku_error = shown.append
+        w.save_ku()
+        self.assertTrue(shown and '#genre_note' in shown[0], shown)       # NIT-R1-4: which column to change
+        self.assertNotIn(self.lib.path, ui.PREFS.get('kobo_ku', {}) or {})
+
+
+@unittest.skipUnless(HAVE_CALIBRE, 'needs calibre (run tests/run_calibre.sh)')
+class RealKuReviewRound1Tests(RealCalibreBase):
+    '''Review step 4 (REVIEW-STEP4.md), round 1: B1 (Settings never pre-selects CalibReader's own
+    columns; a clash blocks the whole save), S3 (a saved CalibReader column that is a Kobo
+    Utilities column is flagged and not written), S1 (Kobo Touch Extended: approximate), NITs 1,
+    2, 10.'''
+
+    def setUp(self):
+        RealCalibreBase.setUp(self)
+        import ui
+        self.cache = tempfile.mkdtemp(prefix='cr-ku-cache-')
+        self.cache_patch = mock.patch('kobo_ku.cache_folder', return_value=self.cache)
+        self.cache_patch.start()
+        if os.path.exists(ui.KU_MEMORY):
+            os.remove(ui.KU_MEMORY)
+
+    def tearDown(self):
+        import ui
+        self.cache_patch.stop()
+        shutil.rmtree(self.cache, ignore_errors=True)
+        ui.PREFS['kobo_ku'] = {}
+        if os.path.exists(ui.KU_MEMORY):
+            os.remove(ui.KU_MEMORY)
+        RealCalibreBase.tearDown(self)
+
+    def columns(self, *specs):
+        for label, name, kind in specs:
+            self.lib.legacy.create_custom_column(label, name, kind, False)
+        self.lib.reopen()
+
+    def widget(self):
+        qt_app()
+        import config
+
+        class Gui(object):
+            current_db = self.lib.legacy
+            library_path = self.lib.path
+            iactions = {}
+        return config.ConfigWidget(Gui())
+
+    def pick(self, combo, lookup):
+        index = combo.findData(lookup)
+        self.assertGreaterEqual(index, 0, lookup)
+        combo.setCurrentIndex(index)
+
+    def app_places(self, *uuids):
+        with open(os.path.join(self.lib.path, 'CalibReader_positions.json'), 'w', encoding='utf-8') as f:
+            json.dump({'schema': 1, 'updated_at': '2026-11-04T20:00:00.000Z', 'positions': {
+                u: {'chapter': 3, 'page': 0, 'scrollY': 0, 'progress': 0.63, 'textAnchor': 100,
+                    'updated_at': '2026-11-04T20:00:00.000Z', 'deviceId': 'iphone-x'} for u in uuids}}, f)
+
+    def stored(self):
+        from sync_core import SETTINGS_KEY
+        return self.lib.api.pref(SETTINGS_KEY, None)
+
+    # -- B1 ---------------------------------------------------------------------------------
+
+    def test_B1_two_readers_nothing_preselected_nothing_written_into_either_readers_columns(self):
+        # the reviewer's DAL/CES setup (KOBO-UTILITIES.md section 7: one KU column set per person)
+        import kobo_ku
+        import ui
+        self.columns(('dal_location', 'DAL Reading Location', 'comments'), ('dal_percent', 'DAL % Read', 'int'),
+                     ('dal_last_read', 'DAL Last Read', 'datetime'),
+                     ('ces_location', 'CES Reading Location', 'comments'), ('ces_percent', 'CES % Read', 'int'),
+                     ('ces_last_read', 'CES Last Read', 'datetime'))
+        (b1, u1), (b2, u2) = self.lib.books(2)
+        api = self.lib.api
+        api.set_field('#dal_location', {b1: 'OEBPS/ch08.xhtml'})
+        api.set_field('#ces_location', {b1: 'OEBPS/ch02.xhtml'})
+        api.set_field('#ces_percent', {b1: 12})
+        api.set_field('#ces_last_read', {b1: datetime.datetime(2026, 10, 1, 9, 0, tzinfo=UTC)})
+        self.app_places(u1, u2)
+        cols = ('#dal_location', '#dal_percent', '#dal_last_read', '#ces_location', '#ces_percent', '#ces_last_read')
+        before = [[self.v(c, b) for c in cols] for b in (b1, b2)]
+        w = self.widget()
+        self.assertEqual((w.combos['percent'].currentData(), w.combos['last_read'].currentData()), ('', ''))
+        self.pick(w.ku_location, '#dal_location')
+        self.pick(w.ku_percent, '#dal_percent')
+        self.pick(w.ku_last_read, '#dal_last_read')
+        errors = []
+        w._show_ku_error = errors.append
+        self.assertTrue(w.validate())
+        w.save_settings()
+        self.assertEqual(errors, [])
+        stored = self.stored()
+        self.assertEqual((stored['percent_column'], stored['last_read_column']), ('', ''))
+        self.assertEqual(ui.PREFS['kobo_ku'][self.lib.path],
+                         kobo_ku.prefs_entry('#dal_location', '#dal_percent', '#dal_last_read'))
+        self.run_ui()
+        self.assertEqual([[self.v(c, b) for c in cols] for b in (b1, b2)], before)
+
+    def test_B1_a_clash_blocks_the_whole_save_and_nothing_is_written(self):
+        import ui
+        self.columns(('reading_location', 'Reading location', 'text'), ('percent_read', 'Percent read', 'int'),
+                     ('last_read', 'Last read', 'datetime'))
+        (b1, u1), = self.lib.books(1)
+        self.app_places(u1)
+        w = self.widget()
+        self.assertEqual((w.combos['percent'].currentData(), w.combos['last_read'].currentData()), ('', ''))
+        self.pick(w.combos['percent'], '#percent_read')            # picked by hand for CalibReader...
+        self.pick(w.combos['last_read'], '#last_read')
+        self.pick(w.ku_location, '#reading_location')
+        self.pick(w.ku_percent, '#percent_read')                   # ...and the same for Kobo Utilities
+        self.pick(w.ku_last_read, '#last_read')
+        errors = []
+        w._show_ku_error = errors.append
+        self.assertIs(getattr(w, 'validate_before_accept', False), True)
+        self.assertFalse(w.validate())                              # the dialog stays open
+        self.assertTrue(errors and '#percent_read' in errors[0], errors)
+        w.save_settings()                                           # even if called: nothing saved
+        self.assertIsNone(self.stored())
+        self.assertNotIn(self.lib.path, ui.PREFS.get('kobo_ku', {}) or {})
+        self.run_ui()
+        self.assertEqual((self.v('#percent_read', b1), self.v('#last_read', b1)), (None, None))
+
+    # -- S3 ---------------------------------------------------------------------------------
+
+    def test_S3_a_saved_calibreader_column_that_ku_uses_is_flagged_and_not_written(self):
+        import kobo_ku
+        import ui
+        self.columns(('kobo_reading_location', 'Kobo location', 'text'), ('kobo_percent_read', 'Kobo % read', 'int'),
+                     ('kobo_last_read', 'Kobo last read', 'datetime'))
+        (b1, u1), = self.lib.books(1)
+        # saved by 1.2.0-1.6.0's suggestion, and Kobo Utilities' route uses the same % column
+        self.lib.set_settings({'version': 1, 'percent_column': '#kobo_percent_read', 'last_read_column': '',
+                               'progress_threshold': 1, 'auto_sync': True})
+        ui.PREFS['kobo_ku'] = {self.lib.path: kobo_ku.prefs_entry('#kobo_reading_location', '#kobo_percent_read', '')}
+        self.app_places(u1)
+        w = self.widget()
+        warning = w.ku_clash_note.text()
+        self.assertIn('#kobo_percent_read', warning)
+        self.assertIn('pick another', warning)
+        res = self.run_ui()
+        self.assertIsNone(self.v('#kobo_percent_read', b1))        # CalibReader stopped writing it
+        self.assertTrue(any('#kobo_percent_read' in n and 'not written' in n for n in res.notes), res.notes)
+
+    def test_S3_without_saved_ku_settings_the_ku_selection_is_checked(self):
+        self.columns(('reading_location', 'Reading location', 'text'), ('percent_read', 'Percent read', 'int'))
+        self.lib.set_settings({'version': 1, 'percent_column': '#percent_read', 'last_read_column': '',
+                               'progress_threshold': 1, 'auto_sync': True})
+        w = self.widget()
+        self.assertNotIn('#percent_read', w.ku_clash_note.text())
+        self.pick(w.ku_percent, '#percent_read')                   # offered, so the clash is visible
+        self.assertIn('#percent_read', w.ku_clash_note.text())
+
+    def test_S1R2_recheck_numbering_clears_the_foreign_flag(self):
+        import kobo_ku
+        import ui
+        self.columns(('kobo_reading_location', 'Kobo location', 'text'))
+        source = kobo_ku.source_from_prefs(kobo_ku.prefs_entry('#kobo_reading_location', '', ''))
+        ui.PREFS['kobo_ku'] = {self.lib.path: kobo_ku.prefs_entry('#kobo_reading_location', '', '')}
+        mem = kobo_ku.MemoryFile(ui.KU_MEMORY)
+        sig = kobo_ku.source_signature(source)
+        mem.save(self.lib.path, sig, {'.': {'since': '2026-11-01T00:00:00.000Z', 'spans': 9, 'missing': 7,
+                                            'foreign': True, 'decided': False},
+                                      'u1': {'h': 'x', 'status': 'written', 'span': True, 'edited': '2026-11-01T00:00:00.000Z'}})
+        w = self.widget()
+        self.assertIn('another tool', w.ku_status.text())
+        self.assertTrue(w.ku_recheck.isEnabled())
+        w._recheck_numbering()
+        meta = mem.load(self.lib.path, sig)['.']
+        self.assertEqual((meta['foreign'], meta['spans'], meta['missing']), (False, 0, 0))
+        self.assertNotIn('another tool', w.ku_status.text())
+
+    # -- S1 (Kobo Touch Extended) -----------------------------------------------------------
+
+    def test_S1_with_kobo_touch_extended_installed_spans_go_to_their_chapter_start(self):
+        # re-review B1-R1 supersedes round 1's span~
+        import kobo_ku
+        import ui
+        self.columns(('kobo_reading_location', 'Kobo location', 'text'), ('kobo_last_read', 'Kobo last read', 'datetime'))
+        (b1, u1), = self.lib.books(1)
+        self.lib.api.add_format(b1, 'EPUB', os.path.join(TESTS, 'fixtures', 'metamorphosis.epub'))
+        self.lib.api.set_field('#kobo_reading_location', {b1: KU_CH.format(1) + '#kobo.3.2'})
+        self.lib.api.set_field('#kobo_last_read', {b1: datetime.datetime(2026, 11, 1, 10, 0, tzinfo=UTC)})
+        ui.PREFS['kobo_ku'] = {self.lib.path: kobo_ku.prefs_entry('#kobo_reading_location', '', '#kobo_last_read')}
+        with mock.patch('kobo_ku.kte_installed', return_value=True):
+            res = self.run_ui()
+        with open(os.path.join(self.lib.path, 'CalibReader_positions.json'), encoding='utf-8') as f:
+            entry = json.load(f)['positions'][u1]
+        self.assertEqual((entry['chapter'], entry['textAnchor'], entry['kobo']['precision']), (2, 0, 'chapter'))
+        self.assertTrue(any('Kobo Touch Extended' in line and 'start of its chapter' in line
+                            for line in res.kobo_ku_lines), res.kobo_ku_lines)
+
+    # -- NITs 1, 2, 10 ----------------------------------------------------------------------
+
+    def test_NIT1_a_ku_catch_up_follows_after_a_longer_pause(self):
+        import kobo_ku
+        import ui
+        self.columns(('kobo_reading_location', 'Kobo location', 'text'))
+        ui.PREFS['kobo_ku'] = {self.lib.path: kobo_ku.prefs_entry('#kobo_reading_location', '', '')}
+        action = self.action()
+        asked = []
+
+        class Kick(object):
+            def start(self, ms):
+                asked.append(ms)
+        action._kick = Kick()
+        more = kobo_ku.KuImportResult()
+        more.more = True
+        with mock.patch('kobo_ku.import_ku', return_value=more):
+            self.run_ui()
+        self.assertIn(ui.KU_MORE_DELAY_MS, asked)
+        self.assertGreaterEqual(ui.KU_MORE_DELAY_MS, 20000)
+
+    def test_NIT2_our_own_send_holding_the_lock_is_said_plainly(self):
+        import kobo_ku
+        import kobo_service
+        import ui
+        self.columns(('kobo_reading_location', 'Kobo location', 'text'))
+        ui.PREFS['kobo_ku'] = {self.lib.path: kobo_ku.prefs_entry('#kobo_reading_location', '', '')}
+        home = tempfile.mkdtemp(prefix='cr-ku-home-')
+        try:
+            with mock.patch.dict(os.environ, {'CALIBREADER_SYNC_HOME': home}):
+                held = kobo_service.LibraryLock(self.lib.path, 'calibre')
+                self.assertTrue(held.acquire())
+                try:
+                    class Alive(object):
+                        def is_alive(self):
+                            return True
+                    self.action()._kobo_worker = Alive()
+                    res = self.run_ui()
+                finally:
+                    held.release()
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+        notes = ' '.join(res.notes)
+        self.assertIn('calibre\'s own send', notes)
+        self.assertNotIn('running elsewhere', notes)
+
+    def test_NIT10_the_button_shows_the_ku_lines_in_a_library_without_calibreader_files(self):
+        import kobo_ku
+        import ui
+        self.columns(('kobo_reading_location', 'Kobo location', 'text'))
+        (b1, u1), = self.lib.books(1)
+        self.lib.api.set_field('#kobo_reading_location', {b1: 'text/nowhere.xhtml#kobo.1.1'})
+        ui.PREFS['kobo_ku'] = {self.lib.path: kobo_ku.prefs_entry('#kobo_reading_location', '', '')}
+        action = self.action()
+        action.sync_read_status = ui.CalibReaderSyncAction.sync_read_status.__get__(action)
+        shown = []
+        saved = ui.info_dialog, ui.error_dialog
+        ui.info_dialog = ui.error_dialog = lambda parent, title, msg, **kw: shown.append(msg)
+        try:
+            action.sync_read_status()
+        finally:
+            ui.info_dialog, ui.error_dialog = saved
+        self.assertTrue(shown and 'Kobo Utilities' in shown[0] and 'No CalibReader files' not in shown[0], shown)

@@ -1,4 +1,4 @@
-# Last modified: 2026-11-05--0854
+# Last modified: 2026-11-05--1300
 #
 # CalibReader Sync — the toolbar action (GUI only).
 # calibre imports this module only in its main window, through
@@ -46,6 +46,15 @@
 # PREFS['kobo_pushed'] only fills in a library the journal has no part for. When calibre
 # starts, a background job's copy of the Kobo modules that differs from this plugin's is
 # refreshed.
+#
+# v1.7.0 (tester preview): Kobo Utilities (USB) -> CalibReader (kobo_ku.py). With a location
+# column picked in Settings -> Kobo "Kobo Utilities (USB)" (off until then), every run (after the
+# read-status sync, isolated like the Kobo step) reads Kobo Utilities' columns through the db API
+# (read-only), maps the books whose values changed on the KEPUB calibre's Kobo driver sends (the
+# stored KEPUB, else calibre's own kepubify, cached) and merges them into CalibReader_positions.json
+# under the library's Kobo lock, deviceId "kobo-utilities". Not left to the background job (KU's
+# columns change only while calibre runs). The 5-minute poll also watches a hash of those columns;
+# a minute after a Kobo connects (Kobo Utilities' auto-store) a run follows.
 #
 # v1.3.1: one run is sync_core.sync_library (tested under real calibre in
 # tests/test_real_calibre.py). The first sync into a chosen read column waits for
@@ -98,6 +107,10 @@ except ImportError:  # pragma: no cover - standalone / test import
         with_kepub_beside,
     )
     import kobo_service
+try:
+    from calibre_plugins.calibreader_sync import kobo_ku
+except ImportError:  # pragma: no cover - standalone / test import
+    import kobo_ku
 
 # Per-book bookkeeping lives in the plugin's OWN prefs, never in the user's
 # library: adding a column to someone's library to track sync state is not
@@ -131,11 +144,26 @@ PREFS.defaults['kobo_pushed'] = {}
 # after each PUT ({library: {uuid: record}}); PREFS['kobo_pushed'] is a copy saved
 # on the GUI thread when a send is done, read only to fill in.
 KOBO_JOURNAL = os.path.join(config_dir, 'plugins', 'calibreader_sync_kobo_pushed.json')
+# 1.7.0: Kobo Utilities (USB). PREFS['kobo_ku'] = {library path: {'sources': [one source: the
+# location / percent / last-read columns, boundReader]}} (kobo_ku.prefs_entry); what was seen per
+# book in KU_MEMORY (kobo_ku.MemoryFile); PREFS['kobo_ku_device_seen'] = when a Kobo last connected
+# (the staleness hint). KEPUBs regenerated with calibre's kepubify go to calibre's cache folder.
+PREFS.defaults['kobo_ku'] = {}
+PREFS.defaults['kobo_ku_device_seen'] = ''
+KU_MEMORY = kobo_ku.memory_path(config_dir)
+KU_DEVICE_DELAY_MS = 60 * 1000          # Kobo Utilities' auto-store runs when a Kobo's books are read
+KU_MORE_DELAY_MS = 20 * 1000            # review step 4 NIT 1: a KU catch-up chunk every 20 s, not every 4 s
 
 
 def kobo_settings(library_path):
     entry = (PREFS.get('kobo', {}) or {}).get(library_path) or {}
     return entry if entry.get('app_db') else None
+
+
+def ku_source(library_path):
+    '''1.7.0: the library's Kobo Utilities source (its columns), or None while no location
+    column is picked.'''
+    return kobo_ku.source_from_prefs((PREFS.get('kobo_ku', {}) or {}).get(library_path))
 
 
 def resource_reader():
@@ -199,6 +227,15 @@ class CalibReaderSyncAction(InterfaceAction):
         self._poll = QTimer(self.gui)
         self._poll.setInterval(POLL_MS)
         self._poll.timeout.connect(lambda: self.auto_sync('poll'))
+        # 1.7.0: a Kobo's books read by calibre (Kobo Utilities stores its places then): run again soon.
+        self._ku_device_timer = QTimer(self.gui)
+        self._ku_device_timer.setSingleShot(True)
+        self._ku_device_timer.timeout.connect(lambda: self.auto_sync('device'))
+        try:
+            from calibre.gui2.device import device_signals
+            device_signals.device_metadata_available.connect(self._device_metadata_available)
+        except Exception:                       # never break calibre's start over it
+            pass
 
     # -- automatic sync (1.2.5) -----------------------------------------------
 
@@ -215,6 +252,25 @@ class CalibReaderSyncAction(InterfaceAction):
                 kobo_service.install_files(resource_reader())
         except Exception:                       # never break calibre's start over it
             pass
+
+    def _device_metadata_available(self):
+        try:
+            device = self.gui.device_manager.connected_device
+        except Exception:
+            device = None
+        if device is None:
+            return
+        name = '{} {}'.format(type(device).__name__, getattr(device, 'name', '') or '')
+        if 'kobo' in name.lower():
+            self._kobo_connected()
+
+    def _kobo_connected(self):
+        '''1.7.0: a Kobo is connected and calibre has read its books, which is when Kobo
+        Utilities' auto-store runs: remember it (the staleness hint) and run again in a minute.'''
+        PREFS['kobo_ku_device_seen'] = now_iso()
+        timer = getattr(self, '_ku_device_timer', None)
+        if timer is not None:
+            timer.start(KU_DEVICE_DELAY_MS)
 
     def library_changed(self, db):
         self._seen = None
@@ -238,6 +294,14 @@ class CalibReaderSyncAction(InterfaceAction):
                 out.append((name, st.st_mtime_ns, st.st_size))
             except OSError:
                 out.append((name, None, None))
+        source = ku_source(self.gui.library_path)
+        if source:
+            # 1.7.0: Kobo Utilities writes calibre columns, not a file: a hash of them (calibre's cache)
+            try:
+                mark = kobo_ku.fingerprint(kobo_ku.read_columns_db(self.gui.current_db.new_api, source))
+            except Exception as exc:
+                mark = 'unreadable: {}'.format(exc)
+            out.append(('kobo-utilities', mark, None))
         return (self.gui.library_path, tuple(out))
 
     def auto_sync(self, why):
@@ -251,7 +315,8 @@ class CalibReaderSyncAction(InterfaceAction):
         stamps = self._file_stamps()
         if why == 'poll' and stamps == self._seen:
             return                              # nothing new from the app
-        if all(mtime is None for _, mtime, _ in stamps[1]) and not kobo_settings(self.gui.library_path):
+        if (all(mtime is None for _, mtime, _ in stamps[1]) and not kobo_settings(self.gui.library_path)
+                and not ku_source(self.gui.library_path)):
             self._seen = stamps                 # not a CalibReader library: stay silent
             return
         try:
@@ -260,6 +325,8 @@ class CalibReaderSyncAction(InterfaceAction):
             self.gui.status_bar.show_message('CalibReader Sync: automatic sync failed ({}).'.format(exc), 10000)
             return
         self._seen = self._file_stamps()        # after our own write-back, if any
+        if getattr(self, '_ku_busy', False):
+            self._seen = None                   # 1.7.0: the KU part waits for the lock: the next poll runs again
         if res.found_any_file:
             line = res.status_line()
             if line:
@@ -385,6 +452,106 @@ class CalibReaderSyncAction(InterfaceAction):
         if (pres.more or rerun) and library == getattr(self.gui, 'library_path', None):
             self._kick.start(AUTO_DELAY_MS)
 
+    def _run_ku(self, api, manual=False):
+        '''1.7.0 (tester preview): Kobo Utilities' columns -> CalibReader_positions.json, under the
+        library's Kobo lock (the background job, the CLI and calibre's Calibre-Web run take it too).
+        -> kobo_ku.KuImportResult, or None while no location column is picked.'''
+        library = self.gui.library_path
+        self._ku_busy = False
+        source = ku_source(library)
+        if not source:
+            return None
+        res = kobo_ku.KuImportResult()
+        clash = kobo_ku.own_column_clash(source, normalise_settings(api.pref(SETTINGS_KEY, None)))
+        if clash:
+            res.notes.append(kobo_ku.clash_note(clash))
+            return res
+        lock = kobo_service.LibraryLock(library, 'calibre')
+        if not lock.acquire():
+            res.busy = self._ku_busy = True
+            worker = getattr(self, '_kobo_worker', None)
+            if worker is not None and worker.is_alive():
+                self._push_rerun = True         # our own push holds it: run again when it is done
+                res.notes.append('Kobo Utilities: waits for calibre\'s own send to Calibre-Web to finish and runs '
+                                 'right after it (no need to click again).')
+            else:
+                res.notes.append(kobo_service.busy_note(lock.holder()))
+            return res
+        try:
+            try:
+                values = kobo_ku.read_columns_db(api, source)
+            except ValueError as exc:
+                res.notes.append(str(exc))
+                return res
+            memory_file = kobo_ku.MemoryFile(KU_MEMORY)
+            signature = kobo_ku.source_signature(source)
+            memory = memory_file.load(library, signature)
+            ids = api.all_book_ids()
+
+            def lookup(book_id):
+                if book_id not in ids:
+                    return None
+                return (api.field_for('uuid', book_id), api.format_abspath(book_id, 'EPUB'),
+                        api.format_abspath(book_id, 'KEPUB'))
+            cache = kobo_ku.KepubCache()
+            kepub_for = kobo_ku.make_kepub_for(lambda book_id: api.formats(book_id) or (), cache)
+            res = kobo_ku.import_ku(library, source, values, lookup, memory, kepub_for=kepub_for,
+                                    kobo_copies=self._kobo_copies())
+            if res.memory_changed:
+                try:
+                    memory_file.save(library, signature, memory)
+                except OSError as exc:
+                    res.notes.append('Kobo Utilities: what was seen could not be saved ({}); it is looked at '
+                                     'again next run.'.format(exc))
+            res.last_store = kobo_ku.last_store_seen(values, memory)
+            if res.problems:
+                uuids = {(u or '').lower(): i for i, u in api.all_field_for('uuid', ids).items()}
+                for uuid in res.problems:
+                    book_id = uuids.get(uuid.lower())
+                    res.titles[uuid] = api.field_for('title', book_id) if book_id is not None else uuid
+            return res
+        finally:
+            lock.release()
+
+    def _kobo_copies(self):
+        '''Residual (b), re-review round 4: when a Kobo is connected, {calibre book id: when its Kobo copy
+        was made} from calibre's OWN in-memory list of the device's books (Main.booklists(), filled by
+        calibre at connect; calibre 9.0-9.14). Read-only: never device I/O, never KoboReader.sqlite. None
+        when no Kobo is connected or the list is not there (then nothing changes).'''
+        try:
+            device = getattr(getattr(self.gui, 'device_manager', None), 'connected_device', None)
+            if device is None:
+                return None
+            name = '{} {}'.format(type(device).__name__, getattr(device, 'name', '') or '')
+            if 'kobo' not in name.lower():
+                return None
+            booklists = getattr(self.gui, 'booklists', None)
+            return kobo_ku.kobo_copy_times(booklists()) if callable(booklists) else None
+        except Exception:
+            return None
+
+    def _ku_lines(self, ku):
+        lines = []
+        if ku.written:
+            lines.append('Kobo Utilities (USB): {} reading place(s) passed to the app.'.format(len(ku.written)))
+        problems = sorted(ku.problems.items(), key=lambda kv: ku.titles.get(kv[0], kv[0]))
+        for uuid, why in problems[:8]:
+            lines.append('Kobo Utilities (USB), not imported: {}: {}.'.format(ku.titles.get(uuid, uuid), why))
+        if len(problems) > 8:
+            lines.append('Kobo Utilities (USB): {} more not imported.'.format(len(problems) - 8))
+        if ku.uncertain:
+            lines.append('Kobo Utilities (USB): ' + ku.uncertain + '.')
+        if ku.foreign:
+            lines.append('Kobo Utilities (USB): ' + ku.foreign + '.')     # re-review S1-R1
+        if ku.undecided:
+            lines.append('Kobo Utilities (USB): ' + ku.undecided + '.')   # re-review B1-R2
+        if not ku.busy:
+            lines.append('Kobo Utilities (USB): ' + kobo_ku.store_line(ku.last_store))
+            hint = kobo_ku.staleness_hint(ku.last_store, PREFS.get('kobo_ku_device_seen') or None)
+            if hint:
+                lines.append(hint)
+        return lines
+
     def _run(self, api, settings=None, approve=None, manual=False):
         # settings: unused since 1.3.1 (sync_library reads the library's own); kept so
         # callers written for 1.3.0 still work.
@@ -398,9 +565,32 @@ class CalibReaderSyncAction(InterfaceAction):
         # A refused or failing run never sets `more` (N1), so this never loops.
         if kres is not None and kres.more:
             self._kick.start(AUTO_DELAY_MS)
-        res = sync_library(api, self.gui.library_path, PREFS, log_dir=CHANGE_LOGS, approve=approve)
+        # 1.7.0 (review step 4, S3): CalibReader's own progress column that is also one of the saved
+        # Kobo Utilities columns is not written (its writes would go to the Kobo through KU's restore).
+        blocked = ()
+        source = ku_source(self.gui.library_path)
+        if source:
+            own = normalise_settings(api.pref(SETTINGS_KEY, None))
+            blocked = tuple(c for c in kobo_ku.own_column_clash(source, own)
+                            if c in (own['percent_column'], own['last_read_column']))
+        res = sync_library(api, self.gui.library_path, PREFS, log_dir=CHANGE_LOGS, approve=approve, blocked=blocked)
         if res.columns_written:
             self.gui.library_view.model().refresh()
+        # 1.7.0: Kobo Utilities (USB), after the read-status sync; a failure never stops it.
+        try:
+            ku, ku_error = self._run_ku(api, manual=manual), None
+        except Exception as exc:
+            ku, ku_error = None, 'Kobo Utilities sync failed ({}); read status and progress still synced.'.format(exc)
+        if ku is not None:
+            if ku.more and not (kres is not None and kres.more):
+                self._kick.start(KU_MORE_DELAY_MS)  # L1 / NIT 1: the rest of the books, calibre left breathing
+            res.notes.extend(ku.notes)
+            res.kobo_ku_imported = len(ku.written)
+            res.kobo_ku_lines = self._ku_lines(ku)
+            if ku.written:
+                res.found_positions_file = True
+        if ku_error:
+            res.notes.append(ku_error)
         if kres is not None:
             res.notes.extend(kres.notes)
             res.kobo_imported = len(kres.written)
@@ -452,7 +642,7 @@ class CalibReaderSyncAction(InterfaceAction):
             res = self._run(db, settings, approve=res.confirm['column'], manual=True)
         self._seen = self._file_stamps()
 
-        if not res.found_any_file:
+        if not res.found_any_file and not res.kobo_ku_lines:   # NIT 10: the KU lines are always shown
             error_dialog(
                 self.gui,
                 'CalibReader Sync',

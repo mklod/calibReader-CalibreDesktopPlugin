@@ -17,7 +17,7 @@ them and updates `metadata.db`.
 | | |
 |---|---|
 | **Name** | CalibReader Sync |
-| **Version** | 1.6.0 (tester preview) |
+| **Version** | 1.7.0 (tester preview) |
 | **Author** | CalibReader |
 | **Platforms** | Windows, macOS, Linux |
 | **Minimum Calibre** | 9.0.0 |
@@ -416,6 +416,64 @@ keep running; calibre need not.
   job read <folder>. In System Settings > Privacy & Security > Full Disk
   Access, turn on calibre …".
 
+### Kobo reading places from Kobo Utilities, USB (1.7.0, TESTER PREVIEW)
+
+For Kobo owners who connect the Kobo to calibre by USB and use the **Kobo
+Utilities** calibre plugin (not Calibre-Web). Kobo Utilities' "Store current
+reading position" (or its auto-store on connect) copies the Kobo's place into
+calibre columns it was set up with: a reading location (default
+`#kobo_reading_location`), a % read (`#kobo_percent_read`) and a last-read date
+(`#kobo_last_read`). CalibReader Sync reads those columns and puts the place into
+`CalibReader_positions.json`, so CalibReader opens the book where you stopped on
+the Kobo. One way only (Kobo → CalibReader).
+
+- **Off until you pick the location column** in **Settings → Kobo Utilities
+  (USB)**. Nothing is pre-selected. Under the chooser: three of the column's
+  values as they read ("text/titlepage.xhtml#kobo.1.1 -> span"); a column where
+  fewer than half the values read as Kobo locations is refused. The % read and
+  last-read columns are optional; pick the last-read one for the right order
+  between the Kobo and the app (without it, a place is dated when the plugin
+  first sees it), and the % one (the only check that a sentence landed in the
+  right part of the book). None of them may be one of CalibReader's own
+  columns: Settings warns, and OK saves nothing while they clash. Settings
+  never pre-selects any column, CalibReader's own % / last-read included.
+- **Read-only.** Kobo Utilities' columns are only read, through calibre; the
+  Kobo and its `KoboReader.sqlite` are never opened. The place goes into
+  `CalibReader_positions.json`; CalibReader's own % / last-read columns, when
+  set, follow it as they follow any device (a CalibReader column that is also
+  one of the route's Kobo Utilities columns is never written).
+- **Precision.** When the Kobo stored its sentence (`…xhtml#kobo.N.M`), the
+  plugin finds that sentence in the KEPUB calibre's Kobo driver sends for the
+  book: calibre's own kepubify of the EPUB with the driver's settings, made in
+  calibre and kept in calibre's cache folder (`CalibReaderSync/kepub`, at most
+  200 MB in all, temporary files included, least recently used out first; safe
+  to delete); for a book that also has a KEPUB format, both numberings are tried
+  and the earlier place is kept (marked approximate when they disagree), never
+  one after the Kobo's. With the Kobo Touch Extended driver plugin installed,
+  every sentence is passed on as approximate. Without a sentence: the
+  chapter's start (`precision: chapter`), or, with only the Kobo's %, the start
+  of the chapter 2 points before that % (`percent`: never past the Kobo). Device
+  paths (`file:///mnt/onboard/…!…`), URL-encoded names and EPUB CFIs are read
+  too; an unknown fragment is read as its chapter.
+- **When.** At every run of the button and the automatic sync (only books whose
+  values changed are looked at; at most 25 per run), when the columns change (the
+  5-minute check includes them) and a minute after a Kobo connects (when Kobo
+  Utilities' auto-store runs). Under the library's Kobo lock, like the
+  Calibre-Web route; both can be on, newest place wins, and a Calibre-Web place
+  to the sentence is not replaced by a coarser Kobo Utilities place in the same
+  chapter. The background job (1.6.0) does not do this route: Kobo Utilities
+  fills its columns only while calibre runs, and calibre does it then.
+- **What you see.** The button's summary says how many places were passed to
+  the app, which books were not and why, and when Kobo Utilities last stored
+  positions; after 14 days without a store while a Kobo was connected, a hint to
+  run Store or switch on auto-store.
+- **Tester preview** until the app's update with the Kobo Utilities rule is
+  out (a chapter- or %-precise Kobo place in the chapter you are reading never
+  moves you back).
+- Command line: `calibre-debug -e kobo_ku.py -- --library <folder> --location
+  '#kobo_reading_location' [--percent …] [--last-read …]` (metadata.db opened
+  read-only).
+
 ### Testing
 
 The rules live in two modules that import nothing from Calibre, each with its
@@ -434,7 +492,12 @@ tests/run_calibre.sh          # the same under Calibre's own python, real-Calibr
 # run_tests.py also runs tests/test_kobo_position.py + tests/test_kobo_import.py (1.4.0)
 # and tests/test_kobo_push.py (1.5.0; a stand-in Calibre-Web on 127.0.0.1)
 # and tests/test_kobo_service.py (1.6.0; the background job, its lock, log and launchd set-up)
+# and tests/test_kobo_ku.py (1.7.0; Kobo Utilities: the parser table, mapping, stamps, cache)
 ```
+
+The Kobo Utilities span parity run (calibre's own kepubify against the EPUB, on
+copies of books): `calibre-debug -e tests/make_ku_parity_fixture.py -- --books
+<folder> --adversarial --out report.json`.
 
 `tests/test_real_calibre.py` runs against real Calibre (`LibraryDatabase`,
 `set_field`, `metadata.db`, the plugin's `JSONConfig`, the Settings widget, the
@@ -466,6 +529,7 @@ in the `__main__` block, which `unittest.main()` can't find under
    - `kobo_import.py`
    - `kobo_push.py`
    - `kobo_service.py`
+   - `kobo_ku.py`
    - `plugin-import-name-calibreader_sync.txt`
    - `images/icon.png`
    - `LICENSE`
@@ -557,12 +621,13 @@ changed. A library with neither file is left alone. Turn it off in **Settings**
 | `kobo_import.py` | (1.4.0, tester preview) Reads Calibre-Web's app.db read-only and merges Kobo places into `CalibReader_positions.json`; `python3 kobo_import.py --library … --app-db … --user …` runs one import (`--push` also sends CalibReader's places, 1.5.0). |
 | `kobo_push.py` | (1.5.0, tester preview) CalibReader's place to the Kobo through Calibre-Web's Kobo API, forward only, off by default. No Calibre imports. |
 | `kobo_service.py` | (1.6.0, tester preview) The Kobo sync without calibre running: the background job's run (`calibre-debug -e kobo_service.py -- run --library …`), the per-library lock shared with calibre and the CLI, and the macOS launchd set-up. No Calibre imports. |
+| `kobo_ku.py` | (1.7.0, tester preview) Kobo Utilities' columns (USB) into `CalibReader_positions.json`: the location parser, the mapping on the KEPUB calibre sends, the kepub cache. Uses calibre's kepubify when it runs inside calibre. |
 | `plugin-import-name-calibreader_sync.txt` | Required by Calibre's loader; declares the import name `calibreader_sync`. |
 | `images/icon.png` | Toolbar icon (blue circular sync arrows), loaded at runtime via `get_icons('images/icon.png')`. |
 | `LICENSE` | GPL v3. |
 | `make_icon.py` | Standalone script that generates `images/icon.png`. Not part of the shipped plugin. |
 | `sync.png`, `sync.svg` | Reference icon source art. Not shipped. |
-| `CalibReaderSync.zip` | The packaged, installable plugin (12 files at the zip root). |
+| `CalibReaderSync.zip` | The packaged, installable plugin (13 files at the zip root). |
 | `tests/` | `run_tests.py` (all tests, counts per source, VOID on 0), `run_calibre.sh` (the same under Calibre's python), `test_real_calibre.py`, and the 1.2.5 code for the upgrade test. Not shipped. |
 
 ---
@@ -635,6 +700,29 @@ column (1.3.0).
 ---
 
 ## Changelog
+
+### 1.7.0 — 2026-11-05 (tester preview, not published)
+
+- 2026-11-17: integration check against plugin `main` (1.3.1) and the 1.6.0 line
+  (`feat/kobo-service`): both are already ancestors of this branch, so nothing
+  was missing and no code changed. Release-staging build for the beta zip that
+  goes out once CalibReader 1.0.6 is live.
+- Review LOWs fixed: library paths holding `%`, `#`, `?` or spaces open read-only (URI-escaped);
+  the command-line `--cache` refuses a calibre library or a folder holding other things.
+- **Kobo Utilities (USB) → CalibReader** (off until a location column is picked:
+  Settings → Kobo Utilities (USB)): the Kobo place Kobo Utilities stores in
+  calibre columns goes into `CalibReader_positions.json` (`deviceId`
+  `kobo-utilities`, with its precision), to the sentence through the KEPUB
+  calibre's Kobo driver sends (calibre's own kepubify, cached up to 200 MB).
+- The column chooser is never pre-selected, previews three values and refuses a
+  column that does not read as Kobo locations; CalibReader's own % / last-read
+  pickers are never pre-selected any more (review B1), and a clash between
+  them and Kobo Utilities' columns is warned about and saves nothing.
+- Review round 1: never a place after the Kobo's (a stored KEPUB and calibre's
+  own numbering are both tried; Kobo Touch Extended = approximate); no
+  conversion leftovers outside the 200 MB cache.
+- Tests: `tests/test_kobo_ku.py`, more real-Calibre tests, the span parity run
+  `tests/make_ku_parity_fixture.py`.
 
 ### 1.6.0 — 2026-11-05 (tester preview, not published)
 
