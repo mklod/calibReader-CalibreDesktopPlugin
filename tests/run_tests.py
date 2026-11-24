@@ -1,4 +1,4 @@
-# Last modified: 2026-11-02--1416
+# Last modified: 2026-11-05--0710
 #
 # run_tests.py — runs every CalibReader Sync test and REFUSES a run that executed nothing.
 #
@@ -29,7 +29,8 @@ import unittest
 TESTS = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(TESTS)
 IN_FILE = ('sidecar_merge.py', 'sync_core.py')
-MODULES = ('test_real_calibre.py',)
+MODULES = ('test_real_calibre.py', 'test_kobo_position.py', 'test_kobo_import.py', 'test_kobo_push.py',
+           'test_kobo_service.py')
 
 
 def in_file_suite(path):
@@ -92,9 +93,11 @@ def main(argv=None):
         under_calibre = True
     except ImportError:
         under_calibre = False
+    # Under calibre the real-calibre tests must run (none skipped). A platform skip
+    # elsewhere (the POSIX file-mode tests on Windows) does not void the run.
     if under_calibre and code == 0 and any(skipped for label, _, skipped, _ in rows
-                                           if label in MODULES):
-        code = 2                                    # under calibre the real-calibre tests must run
+                                           if label == 'test_real_calibre.py'):
+        code = 2
     total = sum(executed for _, executed, _, _ in rows)
     print('TOTAL executed {}: {}'.format(total, {0: 'PASS', 1: 'FAIL', 2: 'VOID (nothing, or not '
                                                  'everything, was executed)'}[code]))
